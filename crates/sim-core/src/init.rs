@@ -55,6 +55,14 @@ struct GalaxyPotential {
     smbh_mass_msun: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PotentialSoftening {
+    halo_kpc: f64,
+    disk_kpc: f64,
+    bulge_kpc: f64,
+    smbh_kpc: f64,
+}
+
 struct EquilibriumTable {
     radii_kpc: Vec<f64>,
     halo_sigma_sq: Vec<f64>,
@@ -401,6 +409,12 @@ fn build_equilibrium_table(
     gravity: &GravityConfig,
     potential: GalaxyPotential,
 ) -> EquilibriumTable {
+    let softening = PotentialSoftening {
+        halo_kpc: gravity.halo_softening_kpc.max(1.0e-3),
+        disk_kpc: gravity.disk_softening_kpc.max(1.0e-3),
+        bulge_kpc: gravity.bulge_softening_kpc.max(1.0e-3),
+        smbh_kpc: galaxy.smbh.softening_kpc.max(1.0e-4),
+    };
     let max_radius = nfw_virial_radius_kpc(galaxy.halo_scale_radius_kpc)
         .max(galaxy.disk_scale_radius_kpc * 20.0)
         .max(galaxy.bulge_scale_radius_kpc * 40.0)
@@ -440,33 +454,45 @@ fn build_equilibrium_table(
             nfw_enclosed_mass_msun(
                 potential.halo_mass_msun,
                 potential.halo_scale_radius_kpc,
-                radius,
+                effective_softened_radius(radius, softening.halo_kpc),
             ) + hernquist_enclosed_mass_msun(
                 potential.bulge_mass_msun,
                 potential.bulge_scale_radius_kpc,
-                radius,
+                effective_softened_radius(radius, softening.bulge_kpc),
             ) + exponential_disk_enclosed_mass_msun(
                 potential.disk_mass_msun,
                 potential.disk_scale_radius_kpc,
+                effective_softened_radius(radius, softening.disk_kpc),
+            ) + softened_point_mass_enclosed_mass_msun(
+                potential.smbh_mass_msun,
                 radius,
-            ) + potential.smbh_mass_msun,
+                softening.smbh_kpc,
+            ),
         );
         circular_speed_sq.push(
-            nfw_circular_velocity_sq(
+            softened_spherical_circular_velocity_sq(
                 potential.halo_mass_msun,
                 potential.halo_scale_radius_kpc,
                 radius,
-            ) + hernquist_circular_velocity_sq(
+                softening.halo_kpc,
+                nfw_enclosed_mass_msun,
+            ) + softened_spherical_circular_velocity_sq(
                 potential.bulge_mass_msun,
                 potential.bulge_scale_radius_kpc,
                 radius,
-            ) + miyamoto_nagai_circular_velocity_sq(
+                softening.bulge_kpc,
+                hernquist_enclosed_mass_msun,
+            ) + softened_miyamoto_nagai_circular_velocity_sq(
                 potential.disk_mass_msun,
                 potential.disk_scale_radius_kpc,
                 potential.disk_scale_height_kpc,
                 radius,
-                0.0,
-            ) + point_mass_circular_velocity_sq(potential.smbh_mass_msun, radius),
+                softening.disk_kpc,
+            ) + softened_point_mass_circular_velocity_sq(
+                potential.smbh_mass_msun,
+                radius,
+                softening.smbh_kpc,
+            ),
         );
         surface_density.push(exponential_disk_surface_density_msun_per_kpc2(
             potential.disk_mass_msun,
@@ -668,6 +694,68 @@ fn recenter_galaxy(
 
 fn nfw_virial_radius_kpc(scale_radius_kpc: f64) -> f64 {
     scale_radius_kpc * NFW_CONCENTRATION
+}
+
+fn effective_softened_radius(radius_kpc: f64, softening_kpc: f64) -> f64 {
+    (radius_kpc * radius_kpc + softening_kpc * softening_kpc).sqrt()
+}
+
+fn softened_point_mass_enclosed_mass_msun(
+    mass_msun: f64,
+    radius_kpc: f64,
+    softening_kpc: f64,
+) -> f64 {
+    if !(mass_msun > 0.0 && radius_kpc >= 0.0 && softening_kpc > 0.0) {
+        return mass_msun.max(0.0);
+    }
+    let r2 = radius_kpc * radius_kpc;
+    let eps2 = softening_kpc * softening_kpc;
+    mass_msun * r2.powf(1.5) / (r2 + eps2).powf(1.5)
+}
+
+fn softened_point_mass_circular_velocity_sq(
+    mass_msun: f64,
+    radius_kpc: f64,
+    softening_kpc: f64,
+) -> f64 {
+    if !(mass_msun > 0.0 && radius_kpc > 0.0 && softening_kpc > 0.0) {
+        return 0.0;
+    }
+    let r2 = radius_kpc * radius_kpc;
+    let eps2 = softening_kpc * softening_kpc;
+    GRAV_CONST_KPC_KMS2_PER_MSUN * mass_msun * r2 / (r2 + eps2).powf(1.5)
+}
+
+fn softened_spherical_circular_velocity_sq(
+    mass_msun: f64,
+    scale_radius_kpc: f64,
+    radius_kpc: f64,
+    softening_kpc: f64,
+    enclosed_mass_fn: fn(f64, f64, f64) -> f64,
+) -> f64 {
+    if !(mass_msun > 0.0 && scale_radius_kpc > 0.0 && radius_kpc > 0.0) {
+        return 0.0;
+    }
+    let effective_radius = effective_softened_radius(radius_kpc, softening_kpc);
+    let enclosed_mass = enclosed_mass_fn(mass_msun, scale_radius_kpc, effective_radius);
+    GRAV_CONST_KPC_KMS2_PER_MSUN * enclosed_mass * radius_kpc * radius_kpc
+        / effective_radius.powi(3)
+}
+
+fn softened_miyamoto_nagai_circular_velocity_sq(
+    mass_msun: f64,
+    scale_radius_kpc: f64,
+    scale_height_kpc: f64,
+    cylindrical_radius_kpc: f64,
+    softening_kpc: f64,
+) -> f64 {
+    miyamoto_nagai_circular_velocity_sq(
+        mass_msun,
+        scale_radius_kpc,
+        (scale_height_kpc * scale_height_kpc + softening_kpc * softening_kpc).sqrt(),
+        cylindrical_radius_kpc,
+        0.0,
+    )
 }
 
 fn nfw_enclosed_mass_msun(total_mass_msun: f64, scale_radius_kpc: f64, radius_kpc: f64) -> f64 {

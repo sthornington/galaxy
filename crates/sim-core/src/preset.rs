@@ -24,7 +24,7 @@ fn gravity_defaults() -> GravityConfig {
         disk_softening_kpc: 0.03,
         bulge_softening_kpc: 0.02,
         opening_angle: 0.55,
-        mesh_resolution: [256, 256, 128],
+        mesh_resolution: [192, 192, 96],
     }
 }
 
@@ -59,7 +59,7 @@ fn snapshot_defaults() -> SnapshotConfig {
 
 fn integration_defaults() -> TimeIntegrationConfig {
     TimeIntegrationConfig {
-        base_timestep_myr: 0.05,
+        base_timestep_myr: 0.1,
         max_substeps: 8,
         cfl_safety_factor: 0.35,
     }
@@ -102,14 +102,14 @@ fn major_merger() -> MergerPreset {
         label: "Primary".to_string(),
         halo_mass_msun: 1.2e12,
         halo_scale_radius_kpc: 18.0,
-        halo_particle_count: 2_500_000,
+        halo_particle_count: 800_000,
         disk_mass_msun: 6.0e10,
         disk_scale_radius_kpc: 3.8,
         disk_scale_height_kpc: 0.35,
-        disk_particle_count: 1_250_000,
+        disk_particle_count: 320_000,
         bulge_mass_msun: 9.0e9,
         bulge_scale_radius_kpc: 0.8,
-        bulge_particle_count: 200_000,
+        bulge_particle_count: 64_000,
         smbh: SmbhConfig {
             mass_msun: 4.3e6,
             softening_kpc: 0.002,
@@ -124,14 +124,14 @@ fn major_merger() -> MergerPreset {
         label: "Secondary".to_string(),
         halo_mass_msun: 1.05e12,
         halo_scale_radius_kpc: 16.0,
-        halo_particle_count: 2_000_000,
+        halo_particle_count: 720_000,
         disk_mass_msun: 5.5e10,
         disk_scale_radius_kpc: 3.2,
         disk_scale_height_kpc: 0.32,
-        disk_particle_count: 1_150_000,
+        disk_particle_count: 280_000,
         bulge_mass_msun: 8.0e9,
         bulge_scale_radius_kpc: 0.7,
-        bulge_particle_count: 180_000,
+        bulge_particle_count: 56_000,
         smbh: SmbhConfig {
             mass_msun: 3.7e6,
             softening_kpc: 0.002,

@@ -5,7 +5,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sim_core::{
     Diagnostics, InitialConditions, Particle, SimulationConfig, SnapshotChunk, SnapshotManifest,
-    validate_particle_count,
+    Vec3, validate_particle_count,
 };
 use sim_cuda::GpuBackend;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -226,6 +226,147 @@ pub struct SessionRequest {
     pub ack: Option<oneshot::Sender<anyhow::Result<SessionSummary>>>,
 }
 
+fn relax_initial_conditions_if_needed(
+    config: &SimulationConfig,
+    initial_conditions: InitialConditions,
+) -> anyhow::Result<InitialConditions> {
+    if config.galaxies.is_empty() {
+        return Ok(initial_conditions);
+    }
+
+    let relaxation_steps = relaxation_steps_for_config(config);
+    if relaxation_steps == 0 {
+        return Ok(initial_conditions);
+    }
+
+    let mut relaxed_particles = Vec::with_capacity(initial_conditions.particles.len());
+    for (galaxy_index, galaxy) in config.galaxies.iter().enumerate() {
+        let target_origin = Vec3::new(
+            galaxy.position_kpc[0],
+            galaxy.position_kpc[1],
+            galaxy.position_kpc[2],
+        );
+        let target_velocity = Vec3::new(
+            galaxy.velocity_kms[0],
+            galaxy.velocity_kms[1],
+            galaxy.velocity_kms[2],
+        );
+        let mut isolated_particles: Vec<Particle> = initial_conditions
+            .particles
+            .iter()
+            .filter(|particle| particle.galaxy_index == galaxy_index as u32)
+            .cloned()
+            .map(|mut particle| {
+                particle.position_kpc -= target_origin;
+                particle.velocity_kms -= target_velocity;
+                particle.galaxy_index = 0;
+                particle
+            })
+            .collect();
+
+        let isolated_mass = isolated_particles
+            .iter()
+            .map(|particle| particle.mass_msun)
+            .sum::<f64>();
+        if isolated_particles.is_empty() {
+            continue;
+        }
+
+        let mut isolated_config = config.clone();
+        isolated_config.name = format!("{}-relax-{galaxy_index}", config.name);
+        isolated_config.galaxies = vec![{
+            let mut galaxy = galaxy.clone();
+            galaxy.position_kpc = [0.0, 0.0, 0.0];
+            galaxy.velocity_kms = [0.0, 0.0, 0.0];
+            galaxy
+        }];
+        isolated_config.preview.particle_budget = isolated_config.preview.particle_budget.min(64);
+
+        let isolated_initial_conditions = InitialConditions {
+            seed: initial_conditions.seed
+                ^ (galaxy_index as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            particles: std::mem::take(&mut isolated_particles),
+            total_mass_msun: isolated_mass,
+        };
+        let mut backend = GpuBackend::new(&isolated_config, &isolated_initial_conditions)
+            .with_context(|| format!("failed to initialize isolated relaxation backend for galaxy {galaxy_index}"))?;
+        backend
+            .advance(relaxation_steps)
+            .with_context(|| format!("failed to relax galaxy {galaxy_index}"))?;
+        let mut particles = backend
+            .download_particles()
+            .with_context(|| format!("failed to download relaxed particles for galaxy {galaxy_index}"))?;
+        recenter_particles(&mut particles, galaxy_index as u32, target_origin, target_velocity);
+        relaxed_particles.extend(particles.into_iter().map(|mut particle| {
+            particle.galaxy_index = galaxy_index as u32;
+            particle
+        }));
+    }
+
+    Ok(InitialConditions {
+        seed: initial_conditions.seed,
+        particles: relaxed_particles,
+        total_mass_msun: initial_conditions.total_mass_msun,
+    })
+}
+
+fn relaxation_steps_for_config(config: &SimulationConfig) -> u32 {
+    let particle_count = config
+        .galaxies
+        .iter()
+        .map(|galaxy| {
+            u64::from(galaxy.halo_particle_count)
+                + u64::from(galaxy.disk_particle_count)
+                + u64::from(galaxy.bulge_particle_count)
+                + 1
+        })
+        .sum::<u64>()
+        .max(1);
+    let target_particle_updates = 320_000_000_u64;
+    let raw_steps = (target_particle_updates / particle_count).clamp(16, 96);
+    raw_steps as u32
+}
+
+fn recenter_particles(
+    particles: &mut [Particle],
+    galaxy_index: u32,
+    origin: Vec3,
+    bulk_velocity: Vec3,
+) {
+    if particles.is_empty() {
+        return;
+    }
+
+    let mut total_mass = 0.0;
+    let mut center_of_mass = Vec3::ZERO;
+    let mut center_velocity = Vec3::ZERO;
+    for particle in particles.iter() {
+        total_mass += particle.mass_msun;
+        center_of_mass += particle.position_kpc * particle.mass_msun;
+        center_velocity += particle.velocity_kms * particle.mass_msun;
+    }
+    if total_mass > 0.0 {
+        center_of_mass = center_of_mass / total_mass;
+        center_velocity = center_velocity / total_mass;
+    }
+
+    let position_shift = origin - center_of_mass;
+    let velocity_shift = bulk_velocity - center_velocity;
+    for particle in particles.iter_mut() {
+        particle.position_kpc += position_shift;
+        particle.velocity_kms += velocity_shift;
+        particle.galaxy_index = galaxy_index;
+    }
+    if let Some(smbh) = particles
+        .iter_mut()
+        .find(|particle| matches!(particle.component, sim_core::ParticleComponent::Smbh))
+    {
+        smbh.position_kpc = origin;
+        smbh.velocity_kms = bulk_velocity;
+        smbh.galaxy_index = galaxy_index;
+    }
+}
+
 async fn session_task(
     id: Uuid,
     config: SimulationConfig,
@@ -238,6 +379,7 @@ async fn session_task(
 ) {
     let mut preview_budget = preview_budget;
     let mut running = false;
+    let initial_conditions = initial_conditions;
     let particle_count = initial_conditions.particles.len() as u64;
     let mesh_cells = config
         .gravity
@@ -329,7 +471,7 @@ async fn session_task(
                         &latest_frame,
                         &frame_tx,
                     ),
-                    SessionCommand::Snapshot => match backend.download_particles() {
+                    SessionCommand::Snapshot => match tokio::task::block_in_place(|| backend.download_particles()) {
                         Ok(particles) => {
                             let snapshot_summary = summary.read().clone();
                             match write_snapshot(id, &config, &snapshot_summary, &particles) {
@@ -414,7 +556,7 @@ fn advance_and_publish(
     latest_frame: &Arc<RwLock<Option<Vec<u8>>>>,
     frame_tx: &broadcast::Sender<Vec<u8>>,
 ) -> anyhow::Result<()> {
-    let diagnostics = backend.advance(steps.max(1))?;
+    let diagnostics = tokio::task::block_in_place(|| backend.advance(steps.max(1)))?;
     {
         let mut summary = summary.write();
         summary.sim_time_myr = diagnostics.sim_time_myr;
@@ -430,7 +572,7 @@ fn publish_frame(
     latest_frame: &Arc<RwLock<Option<Vec<u8>>>>,
     frame_tx: &broadcast::Sender<Vec<u8>>,
 ) -> anyhow::Result<()> {
-    let preview = backend.preview_frame(preview_budget)?;
+    let preview = tokio::task::block_in_place(|| backend.preview_frame(preview_budget))?;
     let payload = bincode::serialize(&preview).context("failed to serialize preview frame")?;
     *latest_frame.write() = Some(payload.clone());
     summary.write().diagnostics = preview.diagnostics.clone();
@@ -446,7 +588,7 @@ fn step_and_publish(
     latest_frame: &Arc<RwLock<Option<Vec<u8>>>>,
     frame_tx: &broadcast::Sender<Vec<u8>>,
 ) -> anyhow::Result<()> {
-    let diagnostics = backend.step(substeps)?;
+    let diagnostics = tokio::task::block_in_place(|| backend.step(substeps))?;
     {
         let mut summary = summary.write();
         summary.sim_time_myr = diagnostics.sim_time_myr;
