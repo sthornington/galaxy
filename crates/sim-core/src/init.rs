@@ -4,9 +4,12 @@ use rand_distr::{Distribution, StandardNormal};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{SimulationConfig, Vec3};
+use crate::{GravityConfig, SimulationConfig, Vec3};
 
 const GRAV_CONST_KPC_KMS2_PER_MSUN: f64 = 4.300_91e-6;
+const NFW_CONCENTRATION: f64 = 12.0;
+const TOOMRE_Q_TARGET: f64 = 1.7;
+const EQUILIBRIUM_SAMPLES: usize = 320;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ParticleComponent {
@@ -52,6 +55,16 @@ struct GalaxyPotential {
     smbh_mass_msun: f64,
 }
 
+struct EquilibriumTable {
+    radii_kpc: Vec<f64>,
+    halo_sigma_sq: Vec<f64>,
+    bulge_sigma_sq: Vec<f64>,
+    disk_sigma_r_sq: Vec<f64>,
+    disk_sigma_phi_sq: Vec<f64>,
+    disk_sigma_z_sq: Vec<f64>,
+    disk_streaming_speed_sq: Vec<f64>,
+}
+
 impl InitialConditions {
     pub fn generate(config: &SimulationConfig, seed: u64) -> Result<Self, InitialConditionError> {
         if config.galaxies.is_empty() {
@@ -77,6 +90,18 @@ impl InitialConditions {
             );
 
             let rotation = rotation_from_euler_deg(galaxy.disk_tilt_deg);
+            let potential = GalaxyPotential {
+                halo_mass_msun: galaxy.halo_mass_msun,
+                halo_scale_radius_kpc: galaxy.halo_scale_radius_kpc,
+                disk_mass_msun: galaxy.disk_mass_msun,
+                disk_scale_radius_kpc: galaxy.disk_scale_radius_kpc,
+                disk_scale_height_kpc: galaxy.disk_scale_height_kpc,
+                bulge_mass_msun: galaxy.bulge_mass_msun,
+                bulge_scale_radius_kpc: galaxy.bulge_scale_radius_kpc,
+                smbh_mass_msun: galaxy.smbh.mass_msun,
+            };
+            let equilibrium = build_equilibrium_table(galaxy, &config.gravity, potential);
+            let galaxy_start = particles.len();
 
             extend_nfw_halo(
                 &mut particles,
@@ -89,6 +114,7 @@ impl InitialConditions {
                 galaxy.color_rgba,
                 origin,
                 bulk_velocity,
+                &equilibrium,
             )?;
 
             extend_exponential_disk(
@@ -104,16 +130,7 @@ impl InitialConditions {
                 origin,
                 bulk_velocity,
                 rotation,
-                GalaxyPotential {
-                    halo_mass_msun: galaxy.halo_mass_msun,
-                    halo_scale_radius_kpc: galaxy.halo_scale_radius_kpc,
-                    disk_mass_msun: galaxy.disk_mass_msun,
-                    disk_scale_radius_kpc: galaxy.disk_scale_radius_kpc,
-                    disk_scale_height_kpc: galaxy.disk_scale_height_kpc,
-                    bulge_mass_msun: galaxy.bulge_mass_msun,
-                    bulge_scale_radius_kpc: galaxy.bulge_scale_radius_kpc,
-                    smbh_mass_msun: galaxy.smbh.mass_msun,
-                },
+                &equilibrium,
             )?;
 
             extend_hernquist_bulge(
@@ -127,6 +144,7 @@ impl InitialConditions {
                 galaxy.color_rgba,
                 origin,
                 bulk_velocity,
+                &equilibrium,
             )?;
 
             particles.push(Particle {
@@ -143,6 +161,13 @@ impl InitialConditions {
                 + galaxy.disk_mass_msun
                 + galaxy.bulge_mass_msun
                 + galaxy.smbh.mass_msun;
+
+            recenter_galaxy(
+                &mut particles[galaxy_start..],
+                origin,
+                bulk_velocity,
+                galaxy_index as u32,
+            );
         }
 
         Ok(Self {
@@ -164,6 +189,7 @@ fn extend_nfw_halo(
     color_rgba: [f32; 4],
     origin: Vec3,
     bulk_velocity: Vec3,
+    equilibrium: &EquilibriumTable,
 ) -> Result<(), InitialConditionError> {
     if count == 0 {
         return Ok(());
@@ -180,11 +206,10 @@ fn extend_nfw_halo(
         let r = sample_nfw_radius(rng, scale_radius_kpc, virial_radius);
         let direction = sample_unit_vector(rng);
         let position = origin + direction * r;
-        let enclosed_mass = total_mass_msun * (r / (r + scale_radius_kpc)).powi(2);
-        let dispersion = ((GRAV_CONST_KPC_KMS2_PER_MSUN * enclosed_mass
-            / (3.0 * r.max(softening_kpc)))
-        .max(0.0))
-        .sqrt();
+        let dispersion = interpolate_log_grid(&equilibrium.radii_kpc, &equilibrium.halo_sigma_sq, r)
+            .max(0.0)
+            .sqrt()
+            .max(4.0);
         let velocity = bulk_velocity + sample_gaussian3(rng, dispersion);
 
         particles.push(Particle {
@@ -215,7 +240,7 @@ fn extend_exponential_disk(
     origin: Vec3,
     bulk_velocity: Vec3,
     rotation: [[f64; 3]; 3],
-    potential: GalaxyPotential,
+    equilibrium: &EquilibriumTable,
 ) -> Result<(), InitialConditionError> {
     if count == 0 {
         return Ok(());
@@ -235,35 +260,30 @@ fn extend_exponential_disk(
         let local = Vec3::new(radius * phi.cos(), radius * phi.sin(), z);
         let rotated = rotate(rotation, local);
         let position = origin + rotated;
-
-        let spherical_radius = (radius * radius + z * z).sqrt();
-        let v_c = (
-            hernquist_circular_velocity_sq(
-                potential.halo_mass_msun,
-                potential.halo_scale_radius_kpc,
-                spherical_radius,
-            ) + hernquist_circular_velocity_sq(
-                potential.bulge_mass_msun,
-                potential.bulge_scale_radius_kpc,
-                spherical_radius,
-            ) + miyamoto_nagai_circular_velocity_sq(
-                potential.disk_mass_msun,
-                potential.disk_scale_radius_kpc,
-                potential.disk_scale_height_kpc,
-                radius,
-                z,
-            ) + point_mass_circular_velocity_sq(potential.smbh_mass_msun, spherical_radius)
+        let sigma_r = interpolate_log_grid(&equilibrium.radii_kpc, &equilibrium.disk_sigma_r_sq, radius)
+            .max(0.0)
+            .sqrt();
+        let sigma_phi = interpolate_log_grid(
+            &equilibrium.radii_kpc,
+            &equilibrium.disk_sigma_phi_sq,
+            radius,
+        )
+        .max(0.0)
+        .sqrt();
+        let sigma_z = interpolate_log_grid(&equilibrium.radii_kpc, &equilibrium.disk_sigma_z_sq, radius)
+            .max(0.0)
+            .sqrt();
+        let streaming_speed = interpolate_log_grid(
+            &equilibrium.radii_kpc,
+            &equilibrium.disk_streaming_speed_sq,
+            radius,
         )
         .max(0.0)
         .sqrt();
         let radial_direction = rotate(rotation, Vec3::new(phi.cos(), phi.sin(), 0.0));
         let tangent_direction = rotate(rotation, Vec3::new(-phi.sin(), phi.cos(), 0.0));
         let normal_direction = rotate(rotation, Vec3::new(0.0, 0.0, 1.0));
-        let dispersion_decay = (-radius / (2.8 * scale_radius_kpc.max(1.0e-3))).exp();
-        let sigma_r = (0.22 * v_c * dispersion_decay).max(10.0);
-        let sigma_phi = (0.16 * v_c * dispersion_decay).max(8.0);
-        let sigma_z = (0.12 * v_c * dispersion_decay + 8.0).max(8.0);
-        let v_phi = (v_c - 0.35 * sigma_r).max(0.0) + sample_gaussian(rng, sigma_phi);
+        let v_phi = streaming_speed + sample_gaussian(rng, sigma_phi);
         let velocity = bulk_velocity
             + radial_direction * sample_gaussian(rng, sigma_r)
             + tangent_direction * v_phi
@@ -294,6 +314,7 @@ fn extend_hernquist_bulge(
     color_rgba: [f32; 4],
     origin: Vec3,
     bulk_velocity: Vec3,
+    equilibrium: &EquilibriumTable,
 ) -> Result<(), InitialConditionError> {
     if count == 0 {
         return Ok(());
@@ -312,9 +333,10 @@ fn extend_hernquist_bulge(
         let direction = sample_unit_vector(rng);
         let position = origin + direction * radius;
         let dispersion =
-            ((GRAV_CONST_KPC_KMS2_PER_MSUN * total_mass_msun / (6.0 * radius.max(scale_radius_kpc)))
-                .max(0.0))
-            .sqrt();
+            interpolate_log_grid(&equilibrium.radii_kpc, &equilibrium.bulge_sigma_sq, radius)
+                .max(0.0)
+                .sqrt()
+                .max(6.0);
         let velocity = bulk_velocity + sample_gaussian3(rng, dispersion);
 
         particles.push(Particle {
@@ -374,12 +396,360 @@ fn sample_sech2_height(rng: &mut SmallRng, scale_height_kpc: f64) -> f64 {
     0.5 * scale_height_kpc * (u / (1.0 - u)).ln()
 }
 
+fn build_equilibrium_table(
+    galaxy: &crate::GalaxyConfig,
+    gravity: &GravityConfig,
+    potential: GalaxyPotential,
+) -> EquilibriumTable {
+    let max_radius = nfw_virial_radius_kpc(galaxy.halo_scale_radius_kpc)
+        .max(galaxy.disk_scale_radius_kpc * 20.0)
+        .max(galaxy.bulge_scale_radius_kpc * 40.0)
+        .max(galaxy.disk_scale_height_kpc * 50.0)
+        .max(8.0);
+    let min_radius = gravity
+        .bulge_softening_kpc
+        .min(gravity.disk_softening_kpc)
+        .min(gravity.halo_softening_kpc)
+        .min(galaxy.smbh.softening_kpc)
+        .max(1.0e-3);
+
+    let mut radii_kpc = Vec::with_capacity(EQUILIBRIUM_SAMPLES);
+    for i in 0..EQUILIBRIUM_SAMPLES {
+        let t = i as f64 / (EQUILIBRIUM_SAMPLES.saturating_sub(1)) as f64;
+        radii_kpc.push(min_radius * (max_radius / min_radius).powf(t));
+    }
+
+    let mut halo_density = Vec::with_capacity(EQUILIBRIUM_SAMPLES);
+    let mut bulge_density = Vec::with_capacity(EQUILIBRIUM_SAMPLES);
+    let mut enclosed_mass = Vec::with_capacity(EQUILIBRIUM_SAMPLES);
+    let mut circular_speed_sq = Vec::with_capacity(EQUILIBRIUM_SAMPLES);
+    let mut surface_density = Vec::with_capacity(EQUILIBRIUM_SAMPLES);
+
+    for &radius in &radii_kpc {
+        halo_density.push(nfw_density_msun_per_kpc3(
+            potential.halo_mass_msun,
+            potential.halo_scale_radius_kpc,
+            radius,
+        ));
+        bulge_density.push(hernquist_density_msun_per_kpc3(
+            potential.bulge_mass_msun,
+            potential.bulge_scale_radius_kpc,
+            radius,
+        ));
+        enclosed_mass.push(
+            nfw_enclosed_mass_msun(
+                potential.halo_mass_msun,
+                potential.halo_scale_radius_kpc,
+                radius,
+            ) + hernquist_enclosed_mass_msun(
+                potential.bulge_mass_msun,
+                potential.bulge_scale_radius_kpc,
+                radius,
+            ) + exponential_disk_enclosed_mass_msun(
+                potential.disk_mass_msun,
+                potential.disk_scale_radius_kpc,
+                radius,
+            ) + potential.smbh_mass_msun,
+        );
+        circular_speed_sq.push(
+            nfw_circular_velocity_sq(
+                potential.halo_mass_msun,
+                potential.halo_scale_radius_kpc,
+                radius,
+            ) + hernquist_circular_velocity_sq(
+                potential.bulge_mass_msun,
+                potential.bulge_scale_radius_kpc,
+                radius,
+            ) + miyamoto_nagai_circular_velocity_sq(
+                potential.disk_mass_msun,
+                potential.disk_scale_radius_kpc,
+                potential.disk_scale_height_kpc,
+                radius,
+                0.0,
+            ) + point_mass_circular_velocity_sq(potential.smbh_mass_msun, radius),
+        );
+        surface_density.push(exponential_disk_surface_density_msun_per_kpc2(
+            potential.disk_mass_msun,
+            potential.disk_scale_radius_kpc,
+            radius,
+        ));
+    }
+
+    let halo_sigma_sq = isotropic_jeans_sigma_sq(
+        &radii_kpc,
+        &halo_density,
+        &enclosed_mass,
+        gravity.halo_softening_kpc,
+    );
+    let bulge_sigma_sq = isotropic_jeans_sigma_sq(
+        &radii_kpc,
+        &bulge_density,
+        &enclosed_mass,
+        gravity.bulge_softening_kpc,
+    );
+
+    let mut omega_sq = vec![0.0; EQUILIBRIUM_SAMPLES];
+    let mut epicyclic_kappa_sq = vec![0.0; EQUILIBRIUM_SAMPLES];
+    for i in 0..EQUILIBRIUM_SAMPLES {
+        let radius = radii_kpc[i].max(1.0e-4);
+        omega_sq[i] = circular_speed_sq[i].max(0.0) / (radius * radius);
+    }
+    for i in 0..EQUILIBRIUM_SAMPLES {
+        let derivative = derivative_on_grid(&radii_kpc, &omega_sq, i);
+        epicyclic_kappa_sq[i] = (radii_kpc[i] * derivative + 4.0 * omega_sq[i]).max(1.0e-6);
+    }
+
+    let mut disk_sigma_r_sq = vec![0.0; EQUILIBRIUM_SAMPLES];
+    let mut disk_sigma_phi_sq = vec![0.0; EQUILIBRIUM_SAMPLES];
+    let mut disk_sigma_z_sq = vec![0.0; EQUILIBRIUM_SAMPLES];
+    let mut disk_streaming_speed_sq = vec![0.0; EQUILIBRIUM_SAMPLES];
+    let mut tracer_pressure = vec![0.0; EQUILIBRIUM_SAMPLES];
+
+    for i in 0..EQUILIBRIUM_SAMPLES {
+        let radius = radii_kpc[i];
+        let omega = omega_sq[i].sqrt();
+        let kappa = epicyclic_kappa_sq[i].sqrt();
+        let sigma_r = if surface_density[i] > 0.0 {
+            (TOOMRE_Q_TARGET * 3.36 * GRAV_CONST_KPC_KMS2_PER_MSUN * surface_density[i]
+                / kappa.max(1.0e-4))
+                .max(12.0)
+                .min(circular_speed_sq[i].max(0.0).sqrt() * 0.6)
+        } else {
+            0.0
+        };
+        let sigma_phi =
+            (sigma_r * kappa / (2.0 * omega.max(1.0e-4))).max(0.35 * sigma_r).min(0.95 * sigma_r);
+        let sigma_z = (std::f64::consts::PI
+            * GRAV_CONST_KPC_KMS2_PER_MSUN
+            * surface_density[i]
+            * potential.disk_scale_height_kpc.max(1.0e-3))
+        .sqrt()
+        .max(8.0)
+        .min(circular_speed_sq[i].max(0.0).sqrt() * 0.45);
+
+        disk_sigma_r_sq[i] = sigma_r * sigma_r;
+        disk_sigma_phi_sq[i] = sigma_phi * sigma_phi;
+        disk_sigma_z_sq[i] = sigma_z * sigma_z;
+        tracer_pressure[i] = (surface_density[i] * disk_sigma_r_sq[i]).max(1.0e-12);
+
+        let _ = radius;
+    }
+
+    for i in 0..EQUILIBRIUM_SAMPLES {
+        let dln_pressure_dln_r = derivative_ln_on_grid(&radii_kpc, &tracer_pressure, i);
+        let streaming_sq = circular_speed_sq[i]
+            - disk_sigma_phi_sq[i]
+            + disk_sigma_r_sq[i] * (1.0 + dln_pressure_dln_r);
+        disk_streaming_speed_sq[i] = streaming_sq.max(0.0);
+    }
+
+    EquilibriumTable {
+        radii_kpc,
+        halo_sigma_sq,
+        bulge_sigma_sq,
+        disk_sigma_r_sq,
+        disk_sigma_phi_sq,
+        disk_sigma_z_sq,
+        disk_streaming_speed_sq,
+    }
+}
+
+fn isotropic_jeans_sigma_sq(
+    radii_kpc: &[f64],
+    density_profile: &[f64],
+    enclosed_mass_msun: &[f64],
+    softening_kpc: f64,
+) -> Vec<f64> {
+    let mut sigma_sq = vec![0.0; radii_kpc.len()];
+    let mut running_integral = 0.0;
+
+    for i in (0..radii_kpc.len().saturating_sub(1)).rev() {
+        let r0 = radii_kpc[i].max(softening_kpc);
+        let r1 = radii_kpc[i + 1].max(softening_kpc);
+        let integrand0 = density_profile[i] * GRAV_CONST_KPC_KMS2_PER_MSUN * enclosed_mass_msun[i]
+            / (r0 * r0);
+        let integrand1 = density_profile[i + 1]
+            * GRAV_CONST_KPC_KMS2_PER_MSUN
+            * enclosed_mass_msun[i + 1]
+            / (r1 * r1);
+        running_integral += 0.5 * (r1 - r0) * (integrand0 + integrand1);
+        sigma_sq[i] = if density_profile[i] > 1.0e-18 {
+            (running_integral / density_profile[i]).max(0.0)
+        } else {
+            0.0
+        };
+    }
+
+    if sigma_sq.len() > 1 {
+        let last = sigma_sq.len() - 1;
+        sigma_sq[last] = sigma_sq[last - 1];
+    }
+
+    sigma_sq
+}
+
+fn derivative_on_grid(radii_kpc: &[f64], values: &[f64], index: usize) -> f64 {
+    if values.len() <= 1 {
+        return 0.0;
+    }
+    if index == 0 {
+        return (values[1] - values[0]) / (radii_kpc[1] - radii_kpc[0]);
+    }
+    if index + 1 == values.len() {
+        return (values[index] - values[index - 1]) / (radii_kpc[index] - radii_kpc[index - 1]);
+    }
+    (values[index + 1] - values[index - 1]) / (radii_kpc[index + 1] - radii_kpc[index - 1])
+}
+
+fn derivative_ln_on_grid(radii_kpc: &[f64], values: &[f64], index: usize) -> f64 {
+    let radius = radii_kpc[index].max(1.0e-6);
+    let value = values[index].max(1.0e-18);
+    radius * derivative_on_grid(radii_kpc, values, index) / value
+}
+
+fn interpolate_log_grid(radii_kpc: &[f64], values: &[f64], radius_kpc: f64) -> f64 {
+    if radii_kpc.is_empty() || values.is_empty() {
+        return 0.0;
+    }
+    let radius = radius_kpc.max(radii_kpc[0]);
+    if radius <= radii_kpc[0] {
+        return values[0];
+    }
+    let last = radii_kpc.len() - 1;
+    if radius >= radii_kpc[last] {
+        return values[last];
+    }
+
+    let upper = radii_kpc.partition_point(|sample| *sample < radius);
+    let lower = upper.saturating_sub(1);
+    let x0 = radii_kpc[lower].ln();
+    let x1 = radii_kpc[upper].ln();
+    let t = (radius.ln() - x0) / (x1 - x0);
+    values[lower] + (values[upper] - values[lower]) * t
+}
+
+fn recenter_galaxy(
+    particles: &mut [Particle],
+    origin: Vec3,
+    bulk_velocity: Vec3,
+    galaxy_index: u32,
+) {
+    if particles.is_empty() {
+        return;
+    }
+
+    let mut total_mass = 0.0;
+    let mut center_of_mass = Vec3::ZERO;
+    let mut center_velocity = Vec3::ZERO;
+    for particle in particles.iter() {
+        total_mass += particle.mass_msun;
+        center_of_mass += particle.position_kpc * particle.mass_msun;
+        center_velocity += particle.velocity_kms * particle.mass_msun;
+    }
+    if total_mass > 0.0 {
+        center_of_mass = center_of_mass / total_mass;
+        center_velocity = center_velocity / total_mass;
+    }
+
+    let position_shift = origin - center_of_mass;
+    let velocity_shift = bulk_velocity - center_velocity;
+    for particle in particles.iter_mut() {
+        particle.position_kpc += position_shift;
+        particle.velocity_kms += velocity_shift;
+    }
+
+    if let Some(smbh) = particles.iter_mut().find(|particle| {
+        particle.galaxy_index == galaxy_index && matches!(particle.component, ParticleComponent::Smbh)
+    }) {
+        smbh.position_kpc = origin;
+        smbh.velocity_kms = bulk_velocity;
+    }
+}
+
+fn nfw_virial_radius_kpc(scale_radius_kpc: f64) -> f64 {
+    scale_radius_kpc * NFW_CONCENTRATION
+}
+
+fn nfw_enclosed_mass_msun(total_mass_msun: f64, scale_radius_kpc: f64, radius_kpc: f64) -> f64 {
+    if !(total_mass_msun > 0.0 && scale_radius_kpc > 0.0 && radius_kpc > 0.0) {
+        return 0.0;
+    }
+    let concentration = NFW_CONCENTRATION;
+    let norm = (1.0 + concentration).ln() - concentration / (1.0 + concentration);
+    let x = (radius_kpc / scale_radius_kpc).clamp(0.0, concentration);
+    total_mass_msun * (((1.0 + x).ln() - x / (1.0 + x)) / norm)
+}
+
+fn nfw_density_msun_per_kpc3(total_mass_msun: f64, scale_radius_kpc: f64, radius_kpc: f64) -> f64 {
+    if !(total_mass_msun > 0.0 && scale_radius_kpc > 0.0 && radius_kpc > 0.0) {
+        return 0.0;
+    }
+    let concentration = NFW_CONCENTRATION;
+    let norm = (1.0 + concentration).ln() - concentration / (1.0 + concentration);
+    let rho0 = total_mass_msun / (4.0 * std::f64::consts::PI * scale_radius_kpc.powi(3) * norm);
+    let x = radius_kpc / scale_radius_kpc;
+    rho0 / (x * (1.0 + x).powi(2))
+}
+
+fn nfw_circular_velocity_sq(mass_msun: f64, scale_radius_kpc: f64, radius_kpc: f64) -> f64 {
+    if !(mass_msun > 0.0 && scale_radius_kpc > 0.0 && radius_kpc > 0.0) {
+        return 0.0;
+    }
+    GRAV_CONST_KPC_KMS2_PER_MSUN * nfw_enclosed_mass_msun(mass_msun, scale_radius_kpc, radius_kpc)
+        / radius_kpc
+}
+
+fn hernquist_enclosed_mass_msun(mass_msun: f64, scale_radius_kpc: f64, radius_kpc: f64) -> f64 {
+    if !(mass_msun > 0.0 && scale_radius_kpc > 0.0 && radius_kpc > 0.0) {
+        return 0.0;
+    }
+    mass_msun * (radius_kpc / (radius_kpc + scale_radius_kpc)).powi(2)
+}
+
+fn hernquist_density_msun_per_kpc3(
+    mass_msun: f64,
+    scale_radius_kpc: f64,
+    radius_kpc: f64,
+) -> f64 {
+    if !(mass_msun > 0.0 && scale_radius_kpc > 0.0 && radius_kpc > 0.0) {
+        return 0.0;
+    }
+    mass_msun * scale_radius_kpc
+        / (2.0 * std::f64::consts::PI * radius_kpc * (radius_kpc + scale_radius_kpc).powi(3))
+}
+
+fn exponential_disk_surface_density_msun_per_kpc2(
+    mass_msun: f64,
+    scale_radius_kpc: f64,
+    radius_kpc: f64,
+) -> f64 {
+    if !(mass_msun > 0.0 && scale_radius_kpc > 0.0 && radius_kpc >= 0.0) {
+        return 0.0;
+    }
+    mass_msun / (2.0 * std::f64::consts::PI * scale_radius_kpc.powi(2))
+        * (-radius_kpc / scale_radius_kpc).exp()
+}
+
+fn exponential_disk_enclosed_mass_msun(
+    mass_msun: f64,
+    scale_radius_kpc: f64,
+    radius_kpc: f64,
+) -> f64 {
+    if !(mass_msun > 0.0 && scale_radius_kpc > 0.0 && radius_kpc >= 0.0) {
+        return 0.0;
+    }
+    let x = radius_kpc / scale_radius_kpc;
+    mass_msun * (1.0 - (-x).exp() * (1.0 + x))
+}
+
 fn hernquist_circular_velocity_sq(mass_msun: f64, scale_radius_kpc: f64, radius_kpc: f64) -> f64 {
     if !(mass_msun > 0.0 && scale_radius_kpc > 0.0 && radius_kpc > 0.0) {
         return 0.0;
     }
 
-    GRAV_CONST_KPC_KMS2_PER_MSUN * mass_msun * radius_kpc / (radius_kpc + scale_radius_kpc).powi(2)
+    GRAV_CONST_KPC_KMS2_PER_MSUN
+        * hernquist_enclosed_mass_msun(mass_msun, scale_radius_kpc, radius_kpc)
+        / radius_kpc
 }
 
 fn miyamoto_nagai_circular_velocity_sq(

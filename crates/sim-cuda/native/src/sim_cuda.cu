@@ -17,6 +17,44 @@ constexpr double kKpcPerKmPerMyr = 0.001022712165045695;
 constexpr double kSpeedOfLightKms = 299792.458;
 constexpr double kFourPi = 12.566370614359172;
 constexpr double kPi = 3.14159265358979323846;
+constexpr double kGlobalDomainPadding = 2.25;
+constexpr double kMinGlobalBoxLengthKpc = 64.0;
+constexpr int kLocalFineNx = 128;
+constexpr int kLocalFineNy = 128;
+constexpr int kLocalFineNz = 64;
+constexpr int kLocalCoarseNx = 32;
+constexpr int kLocalCoarseNy = 32;
+constexpr int kLocalCoarseNz = 16;
+constexpr double kLocalCorrectionBlendExtent = 0.78;
+
+struct MeshBuffers {
+  int nx = 0;
+  int ny = 0;
+  int nz = 0;
+  int nz_complex = 0;
+  std::size_t real_count = 0;
+  std::size_t complex_count = 0;
+
+  cufftReal* density_grid = nullptr;
+  cufftComplex* density_k = nullptr;
+  cufftComplex* force_k = nullptr;
+  cufftReal* force_x = nullptr;
+  cufftReal* force_y = nullptr;
+  cufftReal* force_z = nullptr;
+
+  cufftHandle forward_plan = 0;
+  cufftHandle inverse_plan = 0;
+};
+
+struct LocalMeshState {
+  std::uint32_t galaxy_index = 0;
+  double box_length[3] = {1.0, 1.0, 1.0};
+  double domain_origin[3] = {0.0, 0.0, 0.0};
+  double cell_size_fine[3] = {1.0, 1.0, 1.0};
+  double cell_size_coarse[3] = {1.0, 1.0, 1.0};
+  MeshBuffers fine;
+  MeshBuffers coarse;
+};
 
 struct DeviceState {
   std::uint64_t particle_count = 0;
@@ -41,6 +79,8 @@ struct DeviceState {
   SimCudaParticle* particles = nullptr;
   int* galaxy_smbh_indices = nullptr;
   std::vector<int> galaxy_smbh_indices_host;
+  std::vector<SimCudaGalaxy> galaxies_host;
+  std::vector<LocalMeshState> local_meshes;
 
   cufftReal* density_grid = nullptr;
   cufftComplex* density_k = nullptr;
@@ -118,11 +158,107 @@ void fill_cufft_error(char* buffer,
   std::snprintf(buffer, len, "%s: %s", context, cufft_error_string(err));
 }
 
+void destroy_mesh_buffers(MeshBuffers& mesh) {
+  if (mesh.forward_plan != 0) {
+    cufftDestroy(mesh.forward_plan);
+    mesh.forward_plan = 0;
+  }
+  if (mesh.inverse_plan != 0) {
+    cufftDestroy(mesh.inverse_plan);
+    mesh.inverse_plan = 0;
+  }
+  cudaFree(mesh.force_z);
+  cudaFree(mesh.force_y);
+  cudaFree(mesh.force_x);
+  cudaFree(mesh.force_k);
+  cudaFree(mesh.density_k);
+  cudaFree(mesh.density_grid);
+  mesh.force_z = nullptr;
+  mesh.force_y = nullptr;
+  mesh.force_x = nullptr;
+  mesh.force_k = nullptr;
+  mesh.density_k = nullptr;
+  mesh.density_grid = nullptr;
+}
+
+int create_mesh_buffers(MeshBuffers& mesh,
+                        const int nx,
+                        const int ny,
+                        const int nz,
+                        char* error_buffer,
+                        const std::size_t error_buffer_len) {
+  mesh.nx = nx;
+  mesh.ny = ny;
+  mesh.nz = nz;
+  mesh.nz_complex = nz / 2 + 1;
+  mesh.real_count = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) *
+                    static_cast<std::size_t>(nz);
+  mesh.complex_count = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) *
+                       static_cast<std::size_t>(mesh.nz_complex);
+
+  cudaError_t cuda_status =
+      cudaMalloc(reinterpret_cast<void**>(&mesh.density_grid), sizeof(cufftReal) * mesh.real_count);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for local density grid failed", cuda_status);
+    return 1;
+  }
+
+  cuda_status =
+      cudaMalloc(reinterpret_cast<void**>(&mesh.density_k), sizeof(cufftComplex) * mesh.complex_count);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for local density spectrum failed", cuda_status);
+    return 1;
+  }
+
+  cuda_status =
+      cudaMalloc(reinterpret_cast<void**>(&mesh.force_k), sizeof(cufftComplex) * mesh.complex_count);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for local force spectrum failed", cuda_status);
+    return 1;
+  }
+
+  cuda_status = cudaMalloc(reinterpret_cast<void**>(&mesh.force_x), sizeof(cufftReal) * mesh.real_count);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for local force_x failed", cuda_status);
+    return 1;
+  }
+
+  cuda_status = cudaMalloc(reinterpret_cast<void**>(&mesh.force_y), sizeof(cufftReal) * mesh.real_count);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for local force_y failed", cuda_status);
+    return 1;
+  }
+
+  cuda_status = cudaMalloc(reinterpret_cast<void**>(&mesh.force_z), sizeof(cufftReal) * mesh.real_count);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for local force_z failed", cuda_status);
+    return 1;
+  }
+
+  cufftResult fft_status = cufftPlan3d(&mesh.forward_plan, nx, ny, nz, CUFFT_R2C);
+  if (fft_status != CUFFT_SUCCESS) {
+    fill_cufft_error(error_buffer, error_buffer_len, "local forward FFT plan creation failed", fft_status);
+    return 1;
+  }
+
+  fft_status = cufftPlan3d(&mesh.inverse_plan, nx, ny, nz, CUFFT_C2R);
+  if (fft_status != CUFFT_SUCCESS) {
+    fill_cufft_error(error_buffer, error_buffer_len, "local inverse FFT plan creation failed", fft_status);
+    return 1;
+  }
+
+  return 0;
+}
+
 void destroy_state(DeviceState* state) {
   if (state == nullptr) {
     return;
   }
 
+  for (auto& local_mesh : state->local_meshes) {
+    destroy_mesh_buffers(local_mesh.fine);
+    destroy_mesh_buffers(local_mesh.coarse);
+  }
   if (state->forward_plan != 0) {
     cufftDestroy(state->forward_plan);
   }
@@ -201,18 +337,12 @@ void compute_simulation_domain(DeviceState* state, const SimCudaParticle* partic
     }
   }
 
-  double max_range = 64.0;
-  double center[3] = {0.0, 0.0, 0.0};
   for (int axis = 0; axis < 3; ++axis) {
     const double range = std::max(1.0, max_pos[axis] - min_pos[axis]);
-    max_range = std::max(max_range, range);
-    center[axis] = 0.5 * (min_pos[axis] + max_pos[axis]);
-  }
-
-  const double padded_length = max_range * 3.0;
-  for (int axis = 0; axis < 3; ++axis) {
+    const double center = 0.5 * (min_pos[axis] + max_pos[axis]);
+    const double padded_length = std::max(kMinGlobalBoxLengthKpc, range * kGlobalDomainPadding);
     state->box_length[axis] = padded_length;
-    state->domain_origin[axis] = center[axis] - 0.5 * padded_length;
+    state->domain_origin[axis] = center - 0.5 * padded_length;
   }
 
   state->cell_size[0] = state->box_length[0] / static_cast<double>(state->nx);
@@ -227,6 +357,10 @@ __device__ __forceinline__ int wrap_index(int index, const int dim) {
     index += dim;
   }
   return index;
+}
+
+__device__ __forceinline__ int clamp_index(int index, const int dim) {
+  return max(0, min(dim - 1, index));
 }
 
 __device__ __forceinline__ std::size_t real_grid_index(
@@ -250,6 +384,22 @@ __device__ __forceinline__ double wrap_position(
   double shifted = value - origin;
   shifted -= floor(shifted / length) * length;
   return shifted;
+}
+
+void initialize_local_mesh_geometry(const SimCudaGalaxy& galaxy, LocalMeshState& local_mesh) {
+  const double radial_half_length =
+      std::max({12.0, galaxy.disk_scale_radius_kpc * 10.0, galaxy.bulge_scale_radius_kpc * 18.0});
+  const double vertical_half_length =
+      std::max({4.0, galaxy.disk_scale_height_kpc * 18.0, galaxy.bulge_scale_radius_kpc * 10.0});
+  local_mesh.box_length[0] = radial_half_length * 2.0;
+  local_mesh.box_length[1] = radial_half_length * 2.0;
+  local_mesh.box_length[2] = vertical_half_length * 2.0;
+  local_mesh.cell_size_fine[0] = local_mesh.box_length[0] / static_cast<double>(local_mesh.fine.nx);
+  local_mesh.cell_size_fine[1] = local_mesh.box_length[1] / static_cast<double>(local_mesh.fine.ny);
+  local_mesh.cell_size_fine[2] = local_mesh.box_length[2] / static_cast<double>(local_mesh.fine.nz);
+  local_mesh.cell_size_coarse[0] = local_mesh.box_length[0] / static_cast<double>(local_mesh.coarse.nx);
+  local_mesh.cell_size_coarse[1] = local_mesh.box_length[1] / static_cast<double>(local_mesh.coarse.ny);
+  local_mesh.cell_size_coarse[2] = local_mesh.box_length[2] / static_cast<double>(local_mesh.coarse.nz);
 }
 
 __device__ __forceinline__ float sinc_pi(const float x) {
@@ -385,6 +535,66 @@ __device__ __forceinline__ double sample_grid_trilinear(const cufftReal* grid,
   return c000 + c001 + c010 + c011 + c100 + c101 + c110 + c111;
 }
 
+__device__ __forceinline__ double sample_grid_trilinear_local(const cufftReal* grid,
+                                                              const int nx,
+                                                              const int ny,
+                                                              const int nz,
+                                                              const double origin_x,
+                                                              const double origin_y,
+                                                              const double origin_z,
+                                                              const double cell_x,
+                                                              const double cell_y,
+                                                              const double cell_z,
+                                                              const double px,
+                                                              const double py,
+                                                              const double pz) {
+  const double gx = (px - origin_x) / cell_x;
+  const double gy = (py - origin_y) / cell_y;
+  const double gz = (pz - origin_z) / cell_z;
+  if (gx < 0.0 || gy < 0.0 || gz < 0.0 ||
+      gx >= static_cast<double>(nx - 1) ||
+      gy >= static_cast<double>(ny - 1) ||
+      gz >= static_cast<double>(nz - 1)) {
+    return 0.0;
+  }
+
+  const int i0 = static_cast<int>(floor(gx));
+  const int j0 = static_cast<int>(floor(gy));
+  const int k0 = static_cast<int>(floor(gz));
+  const int i1 = i0 + 1;
+  const int j1 = j0 + 1;
+  const int k1 = k0 + 1;
+
+  const double tx = gx - floor(gx);
+  const double ty = gy - floor(gy);
+  const double tz = gz - floor(gz);
+  const double wx0 = 1.0 - tx;
+  const double wy0 = 1.0 - ty;
+  const double wz0 = 1.0 - tz;
+  const double wx1 = tx;
+  const double wy1 = ty;
+  const double wz1 = tz;
+
+  const double c000 =
+      grid[real_grid_index(i0, j0, k0, ny, nz)] * wx0 * wy0 * wz0;
+  const double c001 =
+      grid[real_grid_index(i0, j0, k1, ny, nz)] * wx0 * wy0 * wz1;
+  const double c010 =
+      grid[real_grid_index(i0, j1, k0, ny, nz)] * wx0 * wy1 * wz0;
+  const double c011 =
+      grid[real_grid_index(i0, j1, k1, ny, nz)] * wx0 * wy1 * wz1;
+  const double c100 =
+      grid[real_grid_index(i1, j0, k0, ny, nz)] * wx1 * wy0 * wz0;
+  const double c101 =
+      grid[real_grid_index(i1, j0, k1, ny, nz)] * wx1 * wy0 * wz1;
+  const double c110 =
+      grid[real_grid_index(i1, j1, k0, ny, nz)] * wx1 * wy1 * wz0;
+  const double c111 =
+      grid[real_grid_index(i1, j1, k1, ny, nz)] * wx1 * wy1 * wz1;
+
+  return c000 + c001 + c010 + c011 + c100 + c101 + c110 + c111;
+}
+
 __global__ void deposit_mass_cic(const SimCudaParticle* particles,
                                  const std::uint64_t particle_count,
                                  cufftReal* density_grid,
@@ -461,6 +671,86 @@ __global__ void deposit_mass_cic(const SimCudaParticle* particles,
       mass_density * wx1 * wy0 * wz1);
   atomicAdd(
       &density_grid[real_grid_index(i1, j1, wk0, ny, nz)],
+      mass_density * wx1 * wy1 * wz0);
+  atomicAdd(
+      &density_grid[real_grid_index(i1, j1, k1, ny, nz)],
+      mass_density * wx1 * wy1 * wz1);
+}
+
+__global__ void deposit_mass_cic_local(const SimCudaParticle* particles,
+                                       const std::uint64_t particle_count,
+                                       cufftReal* density_grid,
+                                       const std::uint32_t galaxy_index_filter,
+                                       const int nx,
+                                       const int ny,
+                                       const int nz,
+                                       const double origin_x,
+                                       const double origin_y,
+                                       const double origin_z,
+                                       const double cell_x,
+                                       const double cell_y,
+                                       const double cell_z,
+                                       const float inv_cell_volume) {
+  const std::uint64_t index =
+      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= particle_count) {
+    return;
+  }
+
+  const SimCudaParticle& particle = particles[index];
+  if (particle.component == 3u || particle.mass_msun <= 0.0 ||
+      particle.galaxy_index != galaxy_index_filter) {
+    return;
+  }
+
+  const double gx = (particle.position_kpc[0] - origin_x) / cell_x;
+  const double gy = (particle.position_kpc[1] - origin_y) / cell_y;
+  const double gz = (particle.position_kpc[2] - origin_z) / cell_z;
+  if (gx < 0.0 || gy < 0.0 || gz < 0.0 ||
+      gx >= static_cast<double>(nx - 1) ||
+      gy >= static_cast<double>(ny - 1) ||
+      gz >= static_cast<double>(nz - 1)) {
+    return;
+  }
+
+  const int i0 = static_cast<int>(floor(gx));
+  const int j0 = static_cast<int>(floor(gy));
+  const int k0 = static_cast<int>(floor(gz));
+  const int i1 = i0 + 1;
+  const int j1 = j0 + 1;
+  const int k1 = k0 + 1;
+
+  const float tx = static_cast<float>(gx - floor(gx));
+  const float ty = static_cast<float>(gy - floor(gy));
+  const float tz = static_cast<float>(gz - floor(gz));
+  const float wx0 = 1.0f - tx;
+  const float wy0 = 1.0f - ty;
+  const float wz0 = 1.0f - tz;
+  const float wx1 = tx;
+  const float wy1 = ty;
+  const float wz1 = tz;
+  const float mass_density = static_cast<float>(particle.mass_msun) * inv_cell_volume;
+
+  atomicAdd(
+      &density_grid[real_grid_index(i0, j0, k0, ny, nz)],
+      mass_density * wx0 * wy0 * wz0);
+  atomicAdd(
+      &density_grid[real_grid_index(i0, j0, k1, ny, nz)],
+      mass_density * wx0 * wy0 * wz1);
+  atomicAdd(
+      &density_grid[real_grid_index(i0, j1, k0, ny, nz)],
+      mass_density * wx0 * wy1 * wz0);
+  atomicAdd(
+      &density_grid[real_grid_index(i0, j1, k1, ny, nz)],
+      mass_density * wx0 * wy1 * wz1);
+  atomicAdd(
+      &density_grid[real_grid_index(i1, j0, k0, ny, nz)],
+      mass_density * wx1 * wy0 * wz0);
+  atomicAdd(
+      &density_grid[real_grid_index(i1, j0, k1, ny, nz)],
+      mass_density * wx1 * wy0 * wz1);
+  atomicAdd(
+      &density_grid[real_grid_index(i1, j1, k0, ny, nz)],
       mass_density * wx1 * wy1 * wz0);
   atomicAdd(
       &density_grid[real_grid_index(i1, j1, k1, ny, nz)],
@@ -563,29 +853,74 @@ __global__ void compute_force_from_potential(const cufftReal* potential_grid,
   force_z[index] = -(phi_zp - phi_zm) / static_cast<float>(2.0 * cell_z);
 }
 
-__global__ void integrate_particles(SimCudaParticle* particles,
-                                    const std::uint64_t particle_count,
-                                    const cufftReal* force_x,
-                                    const cufftReal* force_y,
-                                    const cufftReal* force_z,
-                                    const int nx,
-                                    const int ny,
-                                    const int nz,
-                                    const double origin_x,
-                                    const double origin_y,
-                                    const double origin_z,
-                                    const double length_x,
-                                    const double length_y,
-                                    const double length_z,
-                                    const double cell_x,
-                                    const double cell_y,
-                                    const double cell_z,
-                                    const double inv_fft_cells,
-                                    const int* galaxy_smbh_indices,
-                                    const std::uint32_t galaxy_count,
-                                    const double grav_const,
-                                    const int enable_smbh_post_newtonian,
-                                    const double dt_myr) {
+__global__ void compute_force_from_potential_clamped(const cufftReal* potential_grid,
+                                                     cufftReal* force_x,
+                                                     cufftReal* force_y,
+                                                     cufftReal* force_z,
+                                                     const int nx,
+                                                     const int ny,
+                                                     const int nz,
+                                                     const double cell_x,
+                                                     const double cell_y,
+                                                     const double cell_z) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t real_count =
+      static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
+  if (index >= real_count) {
+    return;
+  }
+
+  const int iz = static_cast<int>(index % static_cast<std::size_t>(nz));
+  const std::size_t xy = index / static_cast<std::size_t>(nz);
+  const int iy = static_cast<int>(xy % static_cast<std::size_t>(ny));
+  const int ix = static_cast<int>(xy / static_cast<std::size_t>(ny));
+
+  const int ixm = clamp_index(ix - 1, nx);
+  const int ixp = clamp_index(ix + 1, nx);
+  const int iym = clamp_index(iy - 1, ny);
+  const int iyp = clamp_index(iy + 1, ny);
+  const int izm = clamp_index(iz - 1, nz);
+  const int izp = clamp_index(iz + 1, nz);
+
+  const float phi_xm = potential_grid[real_grid_index(ixm, iy, iz, ny, nz)];
+  const float phi_xp = potential_grid[real_grid_index(ixp, iy, iz, ny, nz)];
+  const float phi_ym = potential_grid[real_grid_index(ix, iym, iz, ny, nz)];
+  const float phi_yp = potential_grid[real_grid_index(ix, iyp, iz, ny, nz)];
+  const float phi_zm = potential_grid[real_grid_index(ix, iy, izm, ny, nz)];
+  const float phi_zp = potential_grid[real_grid_index(ix, iy, izp, ny, nz)];
+
+  const float dx = static_cast<float>((ixp == ixm) ? cell_x : (ixp - ixm) * cell_x);
+  const float dy = static_cast<float>((iyp == iym) ? cell_y : (iyp - iym) * cell_y);
+  const float dz = static_cast<float>((izp == izm) ? cell_z : (izp - izm) * cell_z);
+  force_x[index] = -(phi_xp - phi_xm) / fmaxf(dx, 1.0e-6f);
+  force_y[index] = -(phi_yp - phi_ym) / fmaxf(dy, 1.0e-6f);
+  force_z[index] = -(phi_zp - phi_zm) / fmaxf(dz, 1.0e-6f);
+}
+
+__global__ void kick_particles_global(SimCudaParticle* particles,
+                                      const std::uint64_t particle_count,
+                                      const cufftReal* force_x,
+                                      const cufftReal* force_y,
+                                      const cufftReal* force_z,
+                                      const int nx,
+                                      const int ny,
+                                      const int nz,
+                                      const double origin_x,
+                                      const double origin_y,
+                                      const double origin_z,
+                                      const double length_x,
+                                      const double length_y,
+                                      const double length_z,
+                                      const double cell_x,
+                                      const double cell_y,
+                                      const double cell_z,
+                                      const double inv_fft_cells,
+                                      const int* galaxy_smbh_indices,
+                                      const std::uint32_t galaxy_count,
+                                      const double grav_const,
+                                      const int enable_smbh_post_newtonian,
+                                      const double dt_myr) {
   const std::uint64_t index =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index >= particle_count) {
@@ -673,7 +1008,175 @@ __global__ void integrate_particles(SimCudaParticle* particles,
   particle.velocity_kms[0] += ax * dt_myr * kKpcPerKmPerMyr;
   particle.velocity_kms[1] += ay * dt_myr * kKpcPerKmPerMyr;
   particle.velocity_kms[2] += az * dt_myr * kKpcPerKmPerMyr;
+}
 
+__global__ void apply_local_mesh_correction(SimCudaParticle* particles,
+                                            const std::uint64_t particle_count,
+                                            const std::uint32_t galaxy_index_filter,
+                                            const cufftReal* fine_force_x,
+                                            const cufftReal* fine_force_y,
+                                            const cufftReal* fine_force_z,
+                                            const int fine_nx,
+                                            const int fine_ny,
+                                            const int fine_nz,
+                                            const double fine_origin_x,
+                                            const double fine_origin_y,
+                                            const double fine_origin_z,
+                                            const double fine_cell_x,
+                                            const double fine_cell_y,
+                                            const double fine_cell_z,
+                                            const double fine_inv_fft_cells,
+                                            const cufftReal* coarse_force_x,
+                                            const cufftReal* coarse_force_y,
+                                            const cufftReal* coarse_force_z,
+                                            const int coarse_nx,
+                                            const int coarse_ny,
+                                            const int coarse_nz,
+                                            const double coarse_origin_x,
+                                            const double coarse_origin_y,
+                                            const double coarse_origin_z,
+                                            const double coarse_cell_x,
+                                            const double coarse_cell_y,
+                                            const double coarse_cell_z,
+                                            const double coarse_inv_fft_cells,
+                                            const double center_x,
+                                            const double center_y,
+                                            const double center_z,
+                                            const double half_x,
+                                            const double half_y,
+                                            const double half_z,
+                                            const double dt_myr) {
+  const std::uint64_t index =
+      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= particle_count) {
+    return;
+  }
+
+  SimCudaParticle& particle = particles[index];
+  if (particle.galaxy_index != galaxy_index_filter || particle.component == 3u) {
+    return;
+  }
+
+  const double dx = particle.position_kpc[0] - center_x;
+  const double dy = particle.position_kpc[1] - center_y;
+  const double dz = particle.position_kpc[2] - center_z;
+  const double qx = fabs(dx) / fmax(half_x, 1.0e-6);
+  const double qy = fabs(dy) / fmax(half_y, 1.0e-6);
+  const double qz = fabs(dz) / fmax(half_z, 1.0e-6);
+  const double q = fmax(qx, fmax(qy, qz));
+  if (q >= 1.0) {
+    return;
+  }
+
+  const double t = fmin(1.0, q / kLocalCorrectionBlendExtent);
+  const double weight = 1.0 - t * t * (3.0 - 2.0 * t);
+
+  const double ax_fine = sample_grid_trilinear_local(
+                             fine_force_x,
+                             fine_nx,
+                             fine_ny,
+                             fine_nz,
+                             fine_origin_x,
+                             fine_origin_y,
+                             fine_origin_z,
+                             fine_cell_x,
+                             fine_cell_y,
+                             fine_cell_z,
+                             particle.position_kpc[0],
+                             particle.position_kpc[1],
+                             particle.position_kpc[2]) *
+                         fine_inv_fft_cells;
+  const double ay_fine = sample_grid_trilinear_local(
+                             fine_force_y,
+                             fine_nx,
+                             fine_ny,
+                             fine_nz,
+                             fine_origin_x,
+                             fine_origin_y,
+                             fine_origin_z,
+                             fine_cell_x,
+                             fine_cell_y,
+                             fine_cell_z,
+                             particle.position_kpc[0],
+                             particle.position_kpc[1],
+                             particle.position_kpc[2]) *
+                         fine_inv_fft_cells;
+  const double az_fine = sample_grid_trilinear_local(
+                             fine_force_z,
+                             fine_nx,
+                             fine_ny,
+                             fine_nz,
+                             fine_origin_x,
+                             fine_origin_y,
+                             fine_origin_z,
+                             fine_cell_x,
+                             fine_cell_y,
+                             fine_cell_z,
+                             particle.position_kpc[0],
+                             particle.position_kpc[1],
+                             particle.position_kpc[2]) *
+                         fine_inv_fft_cells;
+  const double ax_coarse = sample_grid_trilinear_local(
+                               coarse_force_x,
+                               coarse_nx,
+                               coarse_ny,
+                               coarse_nz,
+                               coarse_origin_x,
+                               coarse_origin_y,
+                               coarse_origin_z,
+                               coarse_cell_x,
+                               coarse_cell_y,
+                               coarse_cell_z,
+                               particle.position_kpc[0],
+                               particle.position_kpc[1],
+                               particle.position_kpc[2]) *
+                           coarse_inv_fft_cells;
+  const double ay_coarse = sample_grid_trilinear_local(
+                               coarse_force_y,
+                               coarse_nx,
+                               coarse_ny,
+                               coarse_nz,
+                               coarse_origin_x,
+                               coarse_origin_y,
+                               coarse_origin_z,
+                               coarse_cell_x,
+                               coarse_cell_y,
+                               coarse_cell_z,
+                               particle.position_kpc[0],
+                               particle.position_kpc[1],
+                               particle.position_kpc[2]) *
+                           coarse_inv_fft_cells;
+  const double az_coarse = sample_grid_trilinear_local(
+                               coarse_force_z,
+                               coarse_nx,
+                               coarse_ny,
+                               coarse_nz,
+                               coarse_origin_x,
+                               coarse_origin_y,
+                               coarse_origin_z,
+                               coarse_cell_x,
+                               coarse_cell_y,
+                               coarse_cell_z,
+                               particle.position_kpc[0],
+                               particle.position_kpc[1],
+                               particle.position_kpc[2]) *
+                           coarse_inv_fft_cells;
+
+  particle.velocity_kms[0] += (ax_fine - ax_coarse) * weight * dt_myr * kKpcPerKmPerMyr;
+  particle.velocity_kms[1] += (ay_fine - ay_coarse) * weight * dt_myr * kKpcPerKmPerMyr;
+  particle.velocity_kms[2] += (az_fine - az_coarse) * weight * dt_myr * kKpcPerKmPerMyr;
+}
+
+__global__ void drift_particles(SimCudaParticle* particles,
+                                const std::uint64_t particle_count,
+                                const double dt_myr) {
+  const std::uint64_t index =
+      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= particle_count) {
+    return;
+  }
+
+  SimCudaParticle& particle = particles[index];
   particle.position_kpc[0] += particle.velocity_kms[0] * dt_myr * kKpcPerKmPerMyr;
   particle.position_kpc[1] += particle.velocity_kms[1] * dt_myr * kKpcPerKmPerMyr;
   particle.position_kpc[2] += particle.velocity_kms[2] * dt_myr * kKpcPerKmPerMyr;
@@ -731,6 +1234,33 @@ SimCudaPreviewParticle preview_particle_from_host_particle(const SimCudaParticle
   preview.color_rgba[3] = particle.color_rgba[3];
   preview.intensity = intensity;
   return preview;
+}
+
+int update_local_mesh_origins(DeviceState* state,
+                              char* error_buffer,
+                              const std::size_t error_buffer_len) {
+  for (auto& local_mesh : state->local_meshes) {
+    if (local_mesh.galaxy_index >= state->galaxy_smbh_indices_host.size()) {
+      continue;
+    }
+    const int source_index = state->galaxy_smbh_indices_host[local_mesh.galaxy_index];
+    if (source_index < 0 || static_cast<std::uint64_t>(source_index) >= state->particle_count) {
+      continue;
+    }
+
+    SimCudaParticle smbh{};
+    const cudaError_t cuda_status =
+        cudaMemcpy(&smbh, state->particles + source_index, sizeof(SimCudaParticle), cudaMemcpyDeviceToHost);
+    if (cuda_status != cudaSuccess) {
+      fill_cuda_error(error_buffer, error_buffer_len, "SMBH position download failed", cuda_status);
+      return 1;
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+      local_mesh.domain_origin[axis] = smbh.position_kpc[axis] - 0.5 * local_mesh.box_length[axis];
+    }
+  }
+
+  return 0;
 }
 
 int build_force_mesh(DeviceState* state, char* error_buffer, const std::size_t error_buffer_len) {
@@ -826,6 +1356,107 @@ int build_force_mesh(DeviceState* state, char* error_buffer, const std::size_t e
   return 0;
 }
 
+int build_local_force_mesh(DeviceState* state,
+                           LocalMeshState& local_mesh,
+                           char* error_buffer,
+                           const std::size_t error_buffer_len) {
+  const int threads_per_block = 256;
+  const int particle_blocks =
+      static_cast<int>((state->particle_count + threads_per_block - 1) / threads_per_block);
+
+  auto build_mesh = [&](MeshBuffers& mesh, const double cell_size[3]) -> int {
+    cudaError_t cuda_status = cudaMemset(mesh.density_grid, 0, sizeof(cufftReal) * mesh.real_count);
+    if (cuda_status != cudaSuccess) {
+      fill_cuda_error(error_buffer, error_buffer_len, "local density grid clear failed", cuda_status);
+      return 1;
+    }
+
+    deposit_mass_cic_local<<<particle_blocks, threads_per_block>>>(
+        state->particles,
+        state->particle_count,
+        mesh.density_grid,
+        local_mesh.galaxy_index,
+        mesh.nx,
+        mesh.ny,
+        mesh.nz,
+        local_mesh.domain_origin[0],
+        local_mesh.domain_origin[1],
+        local_mesh.domain_origin[2],
+        cell_size[0],
+        cell_size[1],
+        cell_size[2],
+        static_cast<float>(1.0 / (cell_size[0] * cell_size[1] * cell_size[2])));
+    cuda_status = cudaGetLastError();
+    if (cuda_status != cudaSuccess) {
+      fill_cuda_error(error_buffer, error_buffer_len, "local mass deposit kernel failed", cuda_status);
+      return 1;
+    }
+
+    const cufftResult forward_status = cufftExecR2C(mesh.forward_plan, mesh.density_grid, mesh.density_k);
+    if (forward_status != CUFFT_SUCCESS) {
+      fill_cufft_error(error_buffer, error_buffer_len, "local forward density FFT failed", forward_status);
+      return 1;
+    }
+
+    const int complex_blocks =
+        static_cast<int>((mesh.complex_count + threads_per_block - 1) / threads_per_block);
+    apply_potential_spectrum<<<complex_blocks, threads_per_block>>>(
+        mesh.density_k,
+        mesh.force_k,
+        mesh.nx,
+        mesh.ny,
+        mesh.nz,
+        mesh.nz_complex,
+        local_mesh.box_length[0],
+        local_mesh.box_length[1],
+        local_mesh.box_length[2],
+        cell_size[0],
+        cell_size[1],
+        cell_size[2],
+        static_cast<float>(state->grav_const));
+    cuda_status = cudaGetLastError();
+    if (cuda_status != cudaSuccess) {
+      fill_cuda_error(error_buffer, error_buffer_len, "local potential spectrum kernel failed", cuda_status);
+      return 1;
+    }
+
+    const cufftResult inverse_status = cufftExecC2R(mesh.inverse_plan, mesh.force_k, mesh.density_grid);
+    if (inverse_status != CUFFT_SUCCESS) {
+      fill_cufft_error(error_buffer, error_buffer_len, "local inverse potential FFT failed", inverse_status);
+      return 1;
+    }
+
+    const int real_blocks =
+        static_cast<int>((mesh.real_count + threads_per_block - 1) / threads_per_block);
+    compute_force_from_potential_clamped<<<real_blocks, threads_per_block>>>(
+        mesh.density_grid,
+        mesh.force_x,
+        mesh.force_y,
+        mesh.force_z,
+        mesh.nx,
+        mesh.ny,
+        mesh.nz,
+        cell_size[0],
+        cell_size[1],
+        cell_size[2]);
+    cuda_status = cudaGetLastError();
+    if (cuda_status != cudaSuccess) {
+      fill_cuda_error(error_buffer, error_buffer_len, "local force gradient kernel failed", cuda_status);
+      return 1;
+    }
+
+    return 0;
+  };
+
+  if (build_mesh(local_mesh.fine, local_mesh.cell_size_fine) != 0) {
+    return 1;
+  }
+  if (build_mesh(local_mesh.coarse, local_mesh.cell_size_coarse) != 0) {
+    return 1;
+  }
+  return 0;
+}
+
 int run_steps(DeviceState* state,
               const std::uint32_t step_count,
               const double dt_myr,
@@ -848,7 +1479,17 @@ int run_steps(DeviceState* state,
       return 1;
     }
 
-    integrate_particles<<<particle_blocks, threads_per_block>>>(
+    if (!state->local_meshes.empty() &&
+        update_local_mesh_origins(state, error_buffer, error_buffer_len) != 0) {
+      return 1;
+    }
+    for (auto& local_mesh : state->local_meshes) {
+      if (build_local_force_mesh(state, local_mesh, error_buffer, error_buffer_len) != 0) {
+        return 1;
+      }
+    }
+
+    kick_particles_global<<<particle_blocks, threads_per_block>>>(
         state->particles,
         state->particle_count,
         state->force_x,
@@ -873,9 +1514,61 @@ int run_steps(DeviceState* state,
         state->enable_smbh_post_newtonian ? 1 : 0,
         dt_myr);
 
-    const cudaError_t cuda_status = cudaGetLastError();
+    cudaError_t cuda_status = cudaGetLastError();
     if (cuda_status != cudaSuccess) {
-      fill_cuda_error(error_buffer, error_buffer_len, "particle integration kernel failed", cuda_status);
+      fill_cuda_error(error_buffer, error_buffer_len, "global particle kick kernel failed", cuda_status);
+      return 1;
+    }
+
+    for (const auto& local_mesh : state->local_meshes) {
+      apply_local_mesh_correction<<<particle_blocks, threads_per_block>>>(
+          state->particles,
+          state->particle_count,
+          local_mesh.galaxy_index,
+          local_mesh.fine.force_x,
+          local_mesh.fine.force_y,
+          local_mesh.fine.force_z,
+          local_mesh.fine.nx,
+          local_mesh.fine.ny,
+          local_mesh.fine.nz,
+          local_mesh.domain_origin[0],
+          local_mesh.domain_origin[1],
+          local_mesh.domain_origin[2],
+          local_mesh.cell_size_fine[0],
+          local_mesh.cell_size_fine[1],
+          local_mesh.cell_size_fine[2],
+          1.0 / static_cast<double>(local_mesh.fine.real_count),
+          local_mesh.coarse.force_x,
+          local_mesh.coarse.force_y,
+          local_mesh.coarse.force_z,
+          local_mesh.coarse.nx,
+          local_mesh.coarse.ny,
+          local_mesh.coarse.nz,
+          local_mesh.domain_origin[0],
+          local_mesh.domain_origin[1],
+          local_mesh.domain_origin[2],
+          local_mesh.cell_size_coarse[0],
+          local_mesh.cell_size_coarse[1],
+          local_mesh.cell_size_coarse[2],
+          1.0 / static_cast<double>(local_mesh.coarse.real_count),
+          local_mesh.domain_origin[0] + 0.5 * local_mesh.box_length[0],
+          local_mesh.domain_origin[1] + 0.5 * local_mesh.box_length[1],
+          local_mesh.domain_origin[2] + 0.5 * local_mesh.box_length[2],
+          0.5 * local_mesh.box_length[0],
+          0.5 * local_mesh.box_length[1],
+          0.5 * local_mesh.box_length[2],
+          dt_myr);
+      cuda_status = cudaGetLastError();
+      if (cuda_status != cudaSuccess) {
+        fill_cuda_error(error_buffer, error_buffer_len, "local correction kernel failed", cuda_status);
+        return 1;
+      }
+    }
+
+    drift_particles<<<particle_blocks, threads_per_block>>>(state->particles, state->particle_count, dt_myr);
+    cuda_status = cudaGetLastError();
+    if (cuda_status != cudaSuccess) {
+      fill_cuda_error(error_buffer, error_buffer_len, "particle drift kernel failed", cuda_status);
       return 1;
     }
   }
@@ -899,9 +1592,7 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
                                void** out_handle,
                                char* error_buffer,
                                std::size_t error_buffer_len) {
-  (void)galaxies;
-
-  if (params == nullptr || particles == nullptr || out_handle == nullptr) {
+  if (params == nullptr || particles == nullptr || galaxies == nullptr || out_handle == nullptr) {
     fill_error(error_buffer, error_buffer_len, "invalid create parameters");
     return 1;
   }
@@ -925,6 +1616,7 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
   state->nx = static_cast<int>(params->mesh_resolution[0]);
   state->ny = static_cast<int>(params->mesh_resolution[1]);
   state->nz = static_cast<int>(params->mesh_resolution[2]);
+  state->galaxies_host.assign(galaxies, galaxies + params->galaxy_count);
   state->nz_complex = state->nz / 2 + 1;
   state->real_count = static_cast<std::size_t>(state->nx) * static_cast<std::size_t>(state->ny) *
                       static_cast<std::size_t>(state->nz);
@@ -964,6 +1656,32 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
   }
 
   state->galaxy_smbh_indices_host = galaxy_smbh_indices;
+  state->local_meshes.reserve(params->galaxy_count);
+  for (std::uint32_t galaxy_index = 0; galaxy_index < params->galaxy_count; ++galaxy_index) {
+    state->local_meshes.emplace_back();
+    auto& local_mesh = state->local_meshes.back();
+    local_mesh.galaxy_index = galaxy_index;
+    if (create_mesh_buffers(local_mesh.fine,
+                            kLocalFineNx,
+                            kLocalFineNy,
+                            kLocalFineNz,
+                            error_buffer,
+                            error_buffer_len) != 0) {
+      destroy_state(state);
+      return 1;
+    }
+    if (create_mesh_buffers(local_mesh.coarse,
+                            kLocalCoarseNx,
+                            kLocalCoarseNy,
+                            kLocalCoarseNz,
+                            error_buffer,
+                            error_buffer_len) != 0) {
+      destroy_state(state);
+      return 1;
+    }
+    initialize_local_mesh_geometry(state->galaxies_host[galaxy_index], local_mesh);
+  }
+
   cuda_status = cudaMalloc(
       reinterpret_cast<void**>(&state->galaxy_smbh_indices),
       sizeof(int) * params->galaxy_count);

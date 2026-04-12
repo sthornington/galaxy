@@ -491,6 +491,37 @@ mod tests {
 
     #[test]
     #[ignore = "requires NVIDIA GPU"]
+    fn isolated_primary_galaxy_retains_core_and_spin() {
+        let mut config = small_test_config();
+        config.galaxies.truncate(1);
+        config.name = "isolated-primary-core-spin".to_string();
+        config.gravity.mesh_resolution = [128, 128, 64];
+
+        let initial_conditions = InitialConditions::generate(&config, 29).unwrap();
+        let initial_spin = disk_angular_momentum_magnitude(&initial_conditions.particles);
+        let initial_inner_radius = disk_quantile_radius(&initial_conditions.particles, 0.25);
+
+        let mut backend = GpuBackend::new(&config, &initial_conditions).unwrap();
+        let diagnostics = backend.advance(192).unwrap();
+        assert!(diagnostics.sim_time_myr > 0.0);
+
+        let particles = backend.download_particles().unwrap();
+        let final_spin = disk_angular_momentum_magnitude(&particles);
+        let final_inner_radius = disk_quantile_radius(&particles, 0.25);
+
+        assert!(
+            final_spin > initial_spin * 0.55,
+            "disk lost too much angular momentum: initial={initial_spin:.3e}, final={final_spin:.3e}"
+        );
+        let inner_radius_ratio = final_inner_radius / initial_inner_radius.max(1.0e-6);
+        assert!(
+            (0.65..=1.45).contains(&inner_radius_ratio),
+            "disk inner radius drifted too far: initial={initial_inner_radius:.3}, final={final_inner_radius:.3}, ratio={inner_radius_ratio:.3}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA GPU"]
     fn self_gravity_moves_particles_without_analytic_galaxy_masses() {
         let config = self_gravity_only_config();
         let initial_conditions = InitialConditions {
@@ -574,6 +605,52 @@ mod tests {
         }
 
         total / count.max(1) as f64
+    }
+
+    fn disk_quantile_radius(particles: &[sim_core::Particle], quantile: f64) -> f64 {
+        let center = particles
+            .iter()
+            .find(|particle| matches!(particle.component, ParticleComponent::Smbh))
+            .map(|particle| particle.position_kpc)
+            .unwrap_or(Vec3::ZERO);
+        let mut radii: Vec<f64> = particles
+            .iter()
+            .filter(|particle| matches!(particle.component, ParticleComponent::Disk))
+            .map(|particle| (particle.position_kpc - center).length())
+            .collect();
+        if radii.is_empty() {
+            return 0.0;
+        }
+        radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let index = ((radii.len() - 1) as f64 * quantile.clamp(0.0, 1.0)).round() as usize;
+        radii[index]
+    }
+
+    fn disk_angular_momentum_magnitude(particles: &[sim_core::Particle]) -> f64 {
+        let center = particles
+            .iter()
+            .find(|particle| matches!(particle.component, ParticleComponent::Smbh))
+            .map(|particle| particle.position_kpc)
+            .unwrap_or(Vec3::ZERO);
+        let bulk_velocity = particles
+            .iter()
+            .find(|particle| matches!(particle.component, ParticleComponent::Smbh))
+            .map(|particle| particle.velocity_kms)
+            .unwrap_or(Vec3::ZERO);
+        particles
+            .iter()
+            .filter(|particle| matches!(particle.component, ParticleComponent::Disk))
+            .fold(Vec3::ZERO, |accum, particle| {
+                let radius = particle.position_kpc - center;
+                let velocity = particle.velocity_kms - bulk_velocity;
+                let angular_momentum = Vec3::new(
+                    radius.y * velocity.z - radius.z * velocity.y,
+                    radius.z * velocity.x - radius.x * velocity.z,
+                    radius.x * velocity.y - radius.y * velocity.x,
+                ) * particle.mass_msun;
+                accum + angular_momentum
+            })
+            .length()
     }
 
     fn small_test_config() -> SimulationConfig {

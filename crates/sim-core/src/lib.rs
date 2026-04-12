@@ -157,4 +157,86 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn galaxies_are_recentred_to_configured_origin_and_bulk_velocity() {
+        let preset = built_in_presets()
+            .into_iter()
+            .find(|preset| preset.id == "major-merger")
+            .unwrap();
+        let initial_conditions = InitialConditions::generate(&preset.config, 42).unwrap();
+
+        for (galaxy_index, galaxy) in preset.config.galaxies.iter().enumerate() {
+            let mut total_mass = 0.0;
+            let mut center_of_mass = Vec3::ZERO;
+            let mut center_velocity = Vec3::ZERO;
+
+            for particle in initial_conditions
+                .particles
+                .iter()
+                .filter(|particle| particle.galaxy_index == galaxy_index as u32)
+            {
+                total_mass += particle.mass_msun;
+                center_of_mass += particle.position_kpc * particle.mass_msun;
+                center_velocity += particle.velocity_kms * particle.mass_msun;
+            }
+
+            center_of_mass = center_of_mass / total_mass.max(1.0);
+            center_velocity = center_velocity / total_mass.max(1.0);
+            let target_position =
+                Vec3::new(galaxy.position_kpc[0], galaxy.position_kpc[1], galaxy.position_kpc[2]);
+            let target_velocity =
+                Vec3::new(galaxy.velocity_kms[0], galaxy.velocity_kms[1], galaxy.velocity_kms[2]);
+
+            assert!(
+                (center_of_mass - target_position).length() < 1.0e-2,
+                "galaxy {galaxy_index} COM drifted from configured origin"
+            );
+            assert!(
+                (center_velocity - target_velocity).length() < 1.0e-2,
+                "galaxy {galaxy_index} bulk velocity drifted from configured orbit"
+            );
+        }
+    }
+
+    #[test]
+    fn major_merger_orbit_is_bound_and_mass_weighted() {
+        let preset = built_in_presets()
+            .into_iter()
+            .find(|preset| preset.id == "major-merger")
+            .unwrap();
+        let galaxies = &preset.config.galaxies;
+        let m1 = galaxies[0].halo_mass_msun
+            + galaxies[0].disk_mass_msun
+            + galaxies[0].bulge_mass_msun
+            + galaxies[0].smbh.mass_msun;
+        let m2 = galaxies[1].halo_mass_msun
+            + galaxies[1].disk_mass_msun
+            + galaxies[1].bulge_mass_msun
+            + galaxies[1].smbh.mass_msun;
+        let total_mass = m1 + m2;
+
+        let position1 =
+            Vec3::new(galaxies[0].position_kpc[0], galaxies[0].position_kpc[1], galaxies[0].position_kpc[2]);
+        let position2 =
+            Vec3::new(galaxies[1].position_kpc[0], galaxies[1].position_kpc[1], galaxies[1].position_kpc[2]);
+        let velocity1 =
+            Vec3::new(galaxies[0].velocity_kms[0], galaxies[0].velocity_kms[1], galaxies[0].velocity_kms[2]);
+        let velocity2 =
+            Vec3::new(galaxies[1].velocity_kms[0], galaxies[1].velocity_kms[1], galaxies[1].velocity_kms[2]);
+
+        let barycenter = (position1 * m1 + position2 * m2) / total_mass;
+        let baryvelocity = (velocity1 * m1 + velocity2 * m2) / total_mass;
+        let separation = (position2 - position1).length();
+        let relative_speed = (velocity2 - velocity1).length();
+        let specific_orbital_energy =
+            0.5 * relative_speed * relative_speed - 4.300_91e-6 * total_mass / separation;
+
+        assert!(barycenter.length() < 1.0e-6, "orbit should be centered on the barycenter");
+        assert!(
+            baryvelocity.length() < 1.0e-6,
+            "orbit should start with zero net linear momentum"
+        );
+        assert!(specific_orbital_energy < 0.0, "major merger should start on a bound orbit");
+    }
 }
