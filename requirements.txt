@@ -1,0 +1,90 @@
+jupyterlab>3.0
+#duckduckgo_search
+plum-dispatch
+cloudpickle
+fastdownload
+fastprogress
+fasttransform
+spacy
+ddgs
+fastkaggle
+gradio
+graphviz
+ipywidgets
+jupyterlab==4.5.0rc1
+kaggle
+nbdev
+plotly
+seaborn
+statsmodels
+sympy
+transformers==4.44.2
+datasets
+sentencepiece
+wandb
+polars
+bokeh
+jupyter_bokeh
+
+# Data & Analysis
+yfinance
+tqdm
+pyarrow
+scikit-learn
+scipy
+requests
+joblib              # Parallel processing (used by sklearn, good to have explicit)
+pdfminer.six        # PDF text extraction (used for risk.pdf analysis)
+
+# ClickHouse Python client
+clickhouse-connect
+
+# Portfolio Optimization & Risk
+cvxpy               # Convex optimization (mean-variance, risk parity, constraints)
+osqp                # Fast QP solver (mean-variance optimization)
+ecos                # SOCP solver (cvxpy default, reliable fallback)
+clarabel            # Modern Rust-based conic solver (faster than ECOS/SCS)
+scs                 # Splitting Conic Solver (large-scale, first-order method)
+highspy             # HiGHS LP/QP solver (scipy default, very fast for LP)
+piqp                # Proximal Interior Point QP solver (new, fast)
+proxsuite           # ProxQP from INRIA (often faster than OSQP)
+cvxpylayers         # Differentiable convex optimization (learn constraints with PyTorch)
+jaxopt              # GPU-accelerated optimization (projected gradient, LBFGS) - uses JAX
+jax[cuda12]         # JAX with CUDA support for GPU optimization
+
+# Trading Calendars
+exchange-calendars  # NYSE, NASDAQ, CME calendars - critical for proper date handling
+
+# Time Series & Volatility
+arch                # GARCH, EGARCH volatility modeling
+
+# Hyperparameter Tuning
+optuna              # Bayesian optimization for model hyperparameters
+
+# Data Validation
+pydantic            # Data validation (useful for configs, API responses)
+
+# Async Support (for future ClickHouse async queries)
+aiohttp             # Async HTTP client
+asyncio-throttle    # Rate limiting for API calls
+
+# Testing
+pytest
+pytest-cov
+pytest-asyncio      # For testing async code
+hypothesis          # Property-based testing (great for financial data)
+
+# Visualization (explicit - may be in container but ensure available)
+matplotlib          # Core plotting
+
+# Numeric/Array (should be in container, but pin for compatibility)
+numpy
+pandas
+
+# Jupyter Extensions
+ipykernel           # Jupyter kernel
+jupyterlab-widgets  # Widget support in jupyterlab
+
+# Caching & Serialization
+diskcache           # Persistent caching (useful for expensive computations)
+orjson              # Fast JSON (10x faster than stdlib)

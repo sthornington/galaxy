@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Galaxy Engine</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">DGX Spark / GB10</p>
+        <h1>Galaxy Evolution Control Room</h1>
+        <p class="lede">
+          Browser-connected control plane for the Rust + CUDA galactic evolution
+          engine. This shell works today with JSON preview frames and upgrades to
+          the Rust/WASM viewer when the bundle is built.
+        </p>
+      </section>
+
+      <section class="panel panel-presets">
+        <div class="panel-header">
+          <h2>Presets</h2>
+          <button id="refresh-presets" class="secondary">Refresh</button>
+        </div>
+        <div id="preset-list" class="preset-grid"></div>
+      </section>
+
+      <section class="panel panel-session">
+        <div class="panel-header">
+          <h2>Session</h2>
+          <div class="controls">
+            <button id="pause-btn" class="secondary">Pause</button>
+            <button id="resume-btn">Resume</button>
+            <button id="step-btn" class="secondary">Single Step</button>
+            <button id="snapshot-btn" class="secondary">Snapshot</button>
+          </div>
+        </div>
+        <div class="stats">
+          <div><span>Session</span><strong id="session-id">none</strong></div>
+          <div><span>State</span><strong id="session-state">idle</strong></div>
+          <div><span>Sim Time</span><strong id="sim-time">0.00 Myr</strong></div>
+          <div><span>Particles</span><strong id="particle-count">0</strong></div>
+          <div><span>Preview</span><strong id="preview-count">0</strong></div>
+        </div>
+      </section>
+
+      <section class="panel panel-view">
+        <div class="panel-header">
+          <h2>Preview</h2>
+          <p id="viewer-status">Awaiting session creation.</p>
+        </div>
+        <canvas id="preview-canvas" width="1280" height="720"></canvas>
+      </section>
+    </main>
+
+    <script type="module" src="/fallback.js"></script>
+  </body>
+</html>
