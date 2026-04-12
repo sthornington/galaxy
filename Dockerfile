@@ -28,10 +28,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   nano \
   nodejs \
   npm \
+  pkg-config \
   vim \
   nvtop \
   ninja-build \
   cmake \
+  ffmpeg \
   apt-transport-https \
   ca-certificates
 
@@ -80,6 +82,11 @@ RUN curl https://sh.rustup.rs -sSf | sh -s -- -y && \
     . "$HOME/.cargo/env" && \
     rustc --version
 
+RUN . "$HOME/.cargo/env" && \
+    rustup target add wasm32-unknown-unknown && \
+    cargo install --locked wasm-pack && \
+    cargo install --locked trunk
+
 COPY --chown=sthornington:sthornington ["requirements.txt", "/opt/project/build/"]
 
 RUN pip install --user fastai==2.8.5 --no-deps
@@ -102,6 +109,8 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # Install codex
 RUN npm i -g @openai/codex
+
+EXPOSE 8080 8889
 
 CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8889", "--no-browser", "--ServerApp.token=", "--ServerApp.password="]
 #CMD ["tail", "-f", "/dev/null"]

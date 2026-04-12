@@ -216,6 +216,7 @@ async fn session_task(
 ) {
     let mut preview_budget = preview_budget;
     let mut running = false;
+    let steps_per_tick = 8_u32;
     let mut backend = match GpuBackend::new(&config, &initial_conditions) {
         Ok(backend) => backend,
         Err(error) => {
@@ -244,9 +245,9 @@ async fn session_task(
                 if !running {
                     continue;
                 }
-                if let Err(error) = step_and_publish(
+                if let Err(error) = advance_and_publish(
                     &mut backend,
-                    1,
+                    steps_per_tick,
                     preview_budget,
                     &summary,
                     &latest_frame,
@@ -348,6 +349,27 @@ async fn session_task(
             }
         }
     }
+}
+
+fn advance_and_publish(
+    backend: &mut GpuBackend,
+    steps: u32,
+    preview_budget: u32,
+    summary: &Arc<RwLock<SessionSummary>>,
+    latest_frame: &Arc<RwLock<Option<Vec<u8>>>>,
+    frame_tx: &broadcast::Sender<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let mut diagnostics = None;
+    for _ in 0..steps.max(1) {
+        diagnostics = Some(backend.step(1)?);
+    }
+    let diagnostics = diagnostics.expect("steps.max(1) guarantees at least one iteration");
+    {
+        let mut summary = summary.write();
+        summary.sim_time_myr = diagnostics.sim_time_myr;
+        summary.diagnostics = diagnostics;
+    }
+    publish_frame(backend, preview_budget, summary, latest_frame, frame_tx)
 }
 
 fn publish_frame(

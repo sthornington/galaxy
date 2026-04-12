@@ -29,7 +29,20 @@ cargo check
 cargo run -p sim-server
 ```
 
-The WASM toolchain is not present in the current container, so the viewer build
-is staged but not included in the default workspace checks. Install
-`wasm-pack` and the `wasm32-unknown-unknown` target before building the browser
-bundle.
+The current container image includes the WASM toolchain needed for
+`sim-viewer`. If you build in an older image, install `wasm-pack` and the
+`wasm32-unknown-unknown` target before building the browser bundle.
+
+## Viewer build and smoke tests
+
+```bash
+./scripts/build-viewer.sh
+node --test /galaxy/tests/ui-headless.test.mjs
+```
+
+For a live end-to-end check without opening a browser, start `sim-server` and
+run:
+
+```bash
+python ./scripts/live_headless_smoke.py
+```
