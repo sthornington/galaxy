@@ -26,6 +26,13 @@ constexpr int kLocalCoarseNx = 32;
 constexpr int kLocalCoarseNy = 32;
 constexpr int kLocalCoarseNz = 16;
 constexpr double kLocalCorrectionBlendExtent = 0.78;
+constexpr int kMaxRefinementPatches = 8;
+constexpr int kMaxDensityTreeDepth = 5;
+constexpr int kMinRefineCellsXY = 8;
+constexpr int kMinRefineCellsZ = 4;
+constexpr double kRefineSplitDensityRatio = 0.12;
+constexpr double kRefineLeafDensityRatio = 0.045;
+constexpr double kRefineMinMassFraction = 2.0e-4;
 
 struct MeshBuffers {
   int nx = 0;
@@ -46,14 +53,30 @@ struct MeshBuffers {
   cufftHandle inverse_plan = 0;
 };
 
-struct LocalMeshState {
-  std::uint32_t galaxy_index = 0;
+struct RefinementPatchState {
+  bool active = false;
+  int grid_min[3] = {0, 0, 0};
+  int grid_max[3] = {0, 0, 0};
   double box_length[3] = {1.0, 1.0, 1.0};
   double domain_origin[3] = {0.0, 0.0, 0.0};
   double cell_size_fine[3] = {1.0, 1.0, 1.0};
   double cell_size_coarse[3] = {1.0, 1.0, 1.0};
   MeshBuffers fine;
   MeshBuffers coarse;
+};
+
+struct DensityRegionSummary {
+  double mass_msun = 0.0;
+  double max_density = 0.0;
+};
+
+struct DensityTreeCandidate {
+  int grid_min[3] = {0, 0, 0};
+  int grid_max[3] = {0, 0, 0};
+  double mass_msun = 0.0;
+  double max_density = 0.0;
+  int depth = 0;
+  double score = 0.0;
 };
 
 struct DeviceState {
@@ -79,8 +102,8 @@ struct DeviceState {
   SimCudaParticle* particles = nullptr;
   int* galaxy_smbh_indices = nullptr;
   std::vector<int> galaxy_smbh_indices_host;
-  std::vector<SimCudaGalaxy> galaxies_host;
-  std::vector<LocalMeshState> local_meshes;
+  std::vector<cufftReal> density_host;
+  std::vector<RefinementPatchState> refinement_patches;
 
   cufftReal* density_grid = nullptr;
   cufftComplex* density_k = nullptr;
@@ -255,9 +278,9 @@ void destroy_state(DeviceState* state) {
     return;
   }
 
-  for (auto& local_mesh : state->local_meshes) {
-    destroy_mesh_buffers(local_mesh.fine);
-    destroy_mesh_buffers(local_mesh.coarse);
+  for (auto& patch : state->refinement_patches) {
+    destroy_mesh_buffers(patch.fine);
+    destroy_mesh_buffers(patch.coarse);
   }
   if (state->forward_plan != 0) {
     cufftDestroy(state->forward_plan);
@@ -363,7 +386,7 @@ __device__ __forceinline__ int clamp_index(int index, const int dim) {
   return max(0, min(dim - 1, index));
 }
 
-__device__ __forceinline__ std::size_t real_grid_index(
+__host__ __device__ __forceinline__ std::size_t real_grid_index(
     const int x, const int y, const int z, const int ny, const int nz) {
   return (static_cast<std::size_t>(x) * static_cast<std::size_t>(ny) +
           static_cast<std::size_t>(y)) *
@@ -371,7 +394,7 @@ __device__ __forceinline__ std::size_t real_grid_index(
          static_cast<std::size_t>(z);
 }
 
-__device__ __forceinline__ std::size_t complex_grid_index(
+__host__ __device__ __forceinline__ std::size_t complex_grid_index(
     const int x, const int y, const int z, const int ny, const int nz_complex) {
   return (static_cast<std::size_t>(x) * static_cast<std::size_t>(ny) +
           static_cast<std::size_t>(y)) *
@@ -386,20 +409,230 @@ __device__ __forceinline__ double wrap_position(
   return shifted;
 }
 
-void initialize_local_mesh_geometry(const SimCudaGalaxy& galaxy, LocalMeshState& local_mesh) {
-  const double radial_half_length =
-      std::max({12.0, galaxy.disk_scale_radius_kpc * 10.0, galaxy.bulge_scale_radius_kpc * 18.0});
-  const double vertical_half_length =
-      std::max({4.0, galaxy.disk_scale_height_kpc * 18.0, galaxy.bulge_scale_radius_kpc * 10.0});
-  local_mesh.box_length[0] = radial_half_length * 2.0;
-  local_mesh.box_length[1] = radial_half_length * 2.0;
-  local_mesh.box_length[2] = vertical_half_length * 2.0;
-  local_mesh.cell_size_fine[0] = local_mesh.box_length[0] / static_cast<double>(local_mesh.fine.nx);
-  local_mesh.cell_size_fine[1] = local_mesh.box_length[1] / static_cast<double>(local_mesh.fine.ny);
-  local_mesh.cell_size_fine[2] = local_mesh.box_length[2] / static_cast<double>(local_mesh.fine.nz);
-  local_mesh.cell_size_coarse[0] = local_mesh.box_length[0] / static_cast<double>(local_mesh.coarse.nx);
-  local_mesh.cell_size_coarse[1] = local_mesh.box_length[1] / static_cast<double>(local_mesh.coarse.ny);
-  local_mesh.cell_size_coarse[2] = local_mesh.box_length[2] / static_cast<double>(local_mesh.coarse.nz);
+bool region_has_refinement_extent(const int grid_min[3], const int grid_max[3]) {
+  return (grid_max[0] - grid_min[0] > kMinRefineCellsXY) &&
+         (grid_max[1] - grid_min[1] > kMinRefineCellsXY) &&
+         (grid_max[2] - grid_min[2] > kMinRefineCellsZ);
+}
+
+DensityRegionSummary summarize_density_region(const DeviceState& state,
+                                              const int grid_min[3],
+                                              const int grid_max[3]) {
+  DensityRegionSummary summary;
+  for (int ix = grid_min[0]; ix < grid_max[0]; ++ix) {
+    for (int iy = grid_min[1]; iy < grid_max[1]; ++iy) {
+      for (int iz = grid_min[2]; iz < grid_max[2]; ++iz) {
+        const double density = state.density_host[real_grid_index(ix, iy, iz, state.ny, state.nz)];
+        if (density <= 0.0) {
+          continue;
+        }
+        summary.mass_msun += density * state.cell_volume;
+        summary.max_density = std::max(summary.max_density, density);
+      }
+    }
+  }
+  return summary;
+}
+
+void collect_density_tree_candidates(const DeviceState& state,
+                                     const int grid_min[3],
+                                     const int grid_max[3],
+                                     const DensityRegionSummary& summary,
+                                     const double root_mass_msun,
+                                     const double root_max_density,
+                                     const int depth,
+                                     std::vector<DensityTreeCandidate>& out_candidates) {
+  if (summary.mass_msun <= root_mass_msun * kRefineMinMassFraction ||
+      summary.max_density <= root_max_density * kRefineLeafDensityRatio) {
+    return;
+  }
+
+  const bool can_split = depth < kMaxDensityTreeDepth && region_has_refinement_extent(grid_min, grid_max) &&
+                         summary.max_density > root_max_density * kRefineSplitDensityRatio;
+  if (!can_split) {
+    if (depth == 0) {
+      return;
+    }
+    DensityTreeCandidate candidate;
+    for (int axis = 0; axis < 3; ++axis) {
+      candidate.grid_min[axis] = grid_min[axis];
+      candidate.grid_max[axis] = grid_max[axis];
+    }
+    candidate.mass_msun = summary.mass_msun;
+    candidate.max_density = summary.max_density;
+    candidate.depth = depth;
+    candidate.score = candidate.max_density * std::sqrt(std::max(candidate.mass_msun, 1.0));
+    out_candidates.push_back(candidate);
+    return;
+  }
+
+  const int mid[3] = {
+      (grid_min[0] + grid_max[0]) / 2,
+      (grid_min[1] + grid_max[1]) / 2,
+      (grid_min[2] + grid_max[2]) / 2,
+  };
+  bool emitted_child = false;
+  for (int octant = 0; octant < 8; ++octant) {
+    const int child_min[3] = {
+        (octant & 1) == 0 ? grid_min[0] : mid[0],
+        (octant & 2) == 0 ? grid_min[1] : mid[1],
+        (octant & 4) == 0 ? grid_min[2] : mid[2],
+    };
+    const int child_max[3] = {
+        (octant & 1) == 0 ? mid[0] : grid_max[0],
+        (octant & 2) == 0 ? mid[1] : grid_max[1],
+        (octant & 4) == 0 ? mid[2] : grid_max[2],
+    };
+    if (child_min[0] >= child_max[0] || child_min[1] >= child_max[1] || child_min[2] >= child_max[2]) {
+      continue;
+    }
+    const DensityRegionSummary child_summary = summarize_density_region(state, child_min, child_max);
+    if (child_summary.mass_msun <= 0.0) {
+      continue;
+    }
+    emitted_child = true;
+    collect_density_tree_candidates(
+        state,
+        child_min,
+        child_max,
+        child_summary,
+        root_mass_msun,
+        root_max_density,
+        depth + 1,
+        out_candidates);
+  }
+
+  if (!emitted_child && depth > 0) {
+    DensityTreeCandidate candidate;
+    for (int axis = 0; axis < 3; ++axis) {
+      candidate.grid_min[axis] = grid_min[axis];
+      candidate.grid_max[axis] = grid_max[axis];
+    }
+    candidate.mass_msun = summary.mass_msun;
+    candidate.max_density = summary.max_density;
+    candidate.depth = depth;
+    candidate.score = candidate.max_density * std::sqrt(std::max(candidate.mass_msun, 1.0));
+    out_candidates.push_back(candidate);
+  }
+}
+
+bool grid_regions_overlap(const int a_min[3], const int a_max[3], const int b_min[3], const int b_max[3]) {
+  for (int axis = 0; axis < 3; ++axis) {
+    if (a_max[axis] <= b_min[axis] || b_max[axis] <= a_min[axis]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void initialize_refinement_patch_geometry(const DeviceState& state,
+                                          RefinementPatchState& patch,
+                                          const DensityTreeCandidate& candidate) {
+  patch.active = true;
+  for (int axis = 0; axis < 3; ++axis) {
+    const int width = candidate.grid_max[axis] - candidate.grid_min[axis];
+    const int pad = std::max(2, width / 2);
+    patch.grid_min[axis] = std::max(0, candidate.grid_min[axis] - pad);
+    const int limit = axis == 0 ? state.nx : (axis == 1 ? state.ny : state.nz);
+    patch.grid_max[axis] = std::min(limit, candidate.grid_max[axis] + pad);
+    patch.domain_origin[axis] =
+        state.domain_origin[axis] + static_cast<double>(patch.grid_min[axis]) * state.cell_size[axis];
+    patch.box_length[axis] =
+        static_cast<double>(patch.grid_max[axis] - patch.grid_min[axis]) * state.cell_size[axis];
+  }
+  patch.cell_size_fine[0] = patch.box_length[0] / static_cast<double>(patch.fine.nx);
+  patch.cell_size_fine[1] = patch.box_length[1] / static_cast<double>(patch.fine.ny);
+  patch.cell_size_fine[2] = patch.box_length[2] / static_cast<double>(patch.fine.nz);
+  patch.cell_size_coarse[0] = patch.box_length[0] / static_cast<double>(patch.coarse.nx);
+  patch.cell_size_coarse[1] = patch.box_length[1] / static_cast<double>(patch.coarse.ny);
+  patch.cell_size_coarse[2] = patch.box_length[2] / static_cast<double>(patch.coarse.nz);
+}
+
+int update_refinement_patches(DeviceState* state,
+                              char* error_buffer,
+                              const std::size_t error_buffer_len) {
+  if (state->density_host.size() != state->real_count) {
+    state->density_host.resize(state->real_count);
+  }
+  const cudaError_t cuda_status = cudaMemcpy(state->density_host.data(),
+                                             state->density_grid,
+                                             sizeof(cufftReal) * state->real_count,
+                                             cudaMemcpyDeviceToHost);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "density download for refinement failed", cuda_status);
+    return 1;
+  }
+
+  const int root_min[3] = {0, 0, 0};
+  const int root_max[3] = {state->nx, state->ny, state->nz};
+  const DensityRegionSummary root_summary = summarize_density_region(*state, root_min, root_max);
+
+  for (auto& patch : state->refinement_patches) {
+    patch.active = false;
+  }
+  if (root_summary.mass_msun <= 0.0 || root_summary.max_density <= 0.0) {
+    return 0;
+  }
+
+  std::vector<DensityTreeCandidate> candidates;
+  candidates.reserve(64);
+  collect_density_tree_candidates(
+      *state,
+      root_min,
+      root_max,
+      root_summary,
+      root_summary.mass_msun,
+      root_summary.max_density,
+      0,
+      candidates);
+  std::sort(candidates.begin(), candidates.end(), [](const DensityTreeCandidate& lhs, const DensityTreeCandidate& rhs) {
+    if (lhs.depth != rhs.depth) {
+      return lhs.depth > rhs.depth;
+    }
+    return lhs.score > rhs.score;
+  });
+
+  std::vector<DensityTreeCandidate> selected;
+  selected.reserve(state->refinement_patches.size());
+  for (const auto& candidate : candidates) {
+    int padded_min[3];
+    int padded_max[3];
+    for (int axis = 0; axis < 3; ++axis) {
+      const int width = candidate.grid_max[axis] - candidate.grid_min[axis];
+      const int pad = std::max(2, width / 2);
+      const int limit = axis == 0 ? state->nx : (axis == 1 ? state->ny : state->nz);
+      padded_min[axis] = std::max(0, candidate.grid_min[axis] - pad);
+      padded_max[axis] = std::min(limit, candidate.grid_max[axis] + pad);
+    }
+    bool overlaps = false;
+    for (const auto& prior : selected) {
+      int prior_min[3];
+      int prior_max[3];
+      for (int axis = 0; axis < 3; ++axis) {
+        const int width = prior.grid_max[axis] - prior.grid_min[axis];
+        const int pad = std::max(2, width / 2);
+        const int limit = axis == 0 ? state->nx : (axis == 1 ? state->ny : state->nz);
+        prior_min[axis] = std::max(0, prior.grid_min[axis] - pad);
+        prior_max[axis] = std::min(limit, prior.grid_max[axis] + pad);
+      }
+      if (grid_regions_overlap(padded_min, padded_max, prior_min, prior_max)) {
+        overlaps = true;
+        break;
+      }
+    }
+    if (overlaps) {
+      continue;
+    }
+    selected.push_back(candidate);
+    if (selected.size() >= state->refinement_patches.size()) {
+      break;
+    }
+  }
+
+  for (std::size_t i = 0; i < selected.size(); ++i) {
+    initialize_refinement_patch_geometry(*state, state->refinement_patches[i], selected[i]);
+  }
+  return 0;
 }
 
 __device__ __forceinline__ float sinc_pi(const float x) {
@@ -680,7 +913,6 @@ __global__ void deposit_mass_cic(const SimCudaParticle* particles,
 __global__ void deposit_mass_cic_local(const SimCudaParticle* particles,
                                        const std::uint64_t particle_count,
                                        cufftReal* density_grid,
-                                       const std::uint32_t galaxy_index_filter,
                                        const int nx,
                                        const int ny,
                                        const int nz,
@@ -698,8 +930,7 @@ __global__ void deposit_mass_cic_local(const SimCudaParticle* particles,
   }
 
   const SimCudaParticle& particle = particles[index];
-  if (particle.component == 3u || particle.mass_msun <= 0.0 ||
-      particle.galaxy_index != galaxy_index_filter) {
+  if (particle.component == 3u || particle.mass_msun <= 0.0) {
     return;
   }
 
@@ -1012,7 +1243,6 @@ __global__ void kick_particles_global(SimCudaParticle* particles,
 
 __global__ void apply_local_mesh_correction(SimCudaParticle* particles,
                                             const std::uint64_t particle_count,
-                                            const std::uint32_t galaxy_index_filter,
                                             const cufftReal* fine_force_x,
                                             const cufftReal* fine_force_y,
                                             const cufftReal* fine_force_z,
@@ -1053,7 +1283,7 @@ __global__ void apply_local_mesh_correction(SimCudaParticle* particles,
   }
 
   SimCudaParticle& particle = particles[index];
-  if (particle.galaxy_index != galaxy_index_filter || particle.component == 3u) {
+  if (particle.component == 3u) {
     return;
   }
 
@@ -1236,33 +1466,6 @@ SimCudaPreviewParticle preview_particle_from_host_particle(const SimCudaParticle
   return preview;
 }
 
-int update_local_mesh_origins(DeviceState* state,
-                              char* error_buffer,
-                              const std::size_t error_buffer_len) {
-  for (auto& local_mesh : state->local_meshes) {
-    if (local_mesh.galaxy_index >= state->galaxy_smbh_indices_host.size()) {
-      continue;
-    }
-    const int source_index = state->galaxy_smbh_indices_host[local_mesh.galaxy_index];
-    if (source_index < 0 || static_cast<std::uint64_t>(source_index) >= state->particle_count) {
-      continue;
-    }
-
-    SimCudaParticle smbh{};
-    const cudaError_t cuda_status =
-        cudaMemcpy(&smbh, state->particles + source_index, sizeof(SimCudaParticle), cudaMemcpyDeviceToHost);
-    if (cuda_status != cudaSuccess) {
-      fill_cuda_error(error_buffer, error_buffer_len, "SMBH position download failed", cuda_status);
-      return 1;
-    }
-    for (int axis = 0; axis < 3; ++axis) {
-      local_mesh.domain_origin[axis] = smbh.position_kpc[axis] - 0.5 * local_mesh.box_length[axis];
-    }
-  }
-
-  return 0;
-}
-
 int build_force_mesh(DeviceState* state, char* error_buffer, const std::size_t error_buffer_len) {
   const cudaError_t clear_status =
       cudaMemset(state->density_grid, 0, sizeof(cufftReal) * state->real_count);
@@ -1294,6 +1497,11 @@ int build_force_mesh(DeviceState* state, char* error_buffer, const std::size_t e
   cudaError_t cuda_status = cudaGetLastError();
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer, error_buffer_len, "mass deposit kernel failed", cuda_status);
+    return 1;
+  }
+
+  if (!state->refinement_patches.empty() &&
+      update_refinement_patches(state, error_buffer, error_buffer_len) != 0) {
     return 1;
   }
 
@@ -1357,9 +1565,12 @@ int build_force_mesh(DeviceState* state, char* error_buffer, const std::size_t e
 }
 
 int build_local_force_mesh(DeviceState* state,
-                           LocalMeshState& local_mesh,
+                           RefinementPatchState& patch,
                            char* error_buffer,
                            const std::size_t error_buffer_len) {
+  if (!patch.active) {
+    return 0;
+  }
   const int threads_per_block = 256;
   const int particle_blocks =
       static_cast<int>((state->particle_count + threads_per_block - 1) / threads_per_block);
@@ -1375,13 +1586,12 @@ int build_local_force_mesh(DeviceState* state,
         state->particles,
         state->particle_count,
         mesh.density_grid,
-        local_mesh.galaxy_index,
         mesh.nx,
         mesh.ny,
         mesh.nz,
-        local_mesh.domain_origin[0],
-        local_mesh.domain_origin[1],
-        local_mesh.domain_origin[2],
+        patch.domain_origin[0],
+        patch.domain_origin[1],
+        patch.domain_origin[2],
         cell_size[0],
         cell_size[1],
         cell_size[2],
@@ -1407,9 +1617,9 @@ int build_local_force_mesh(DeviceState* state,
         mesh.ny,
         mesh.nz,
         mesh.nz_complex,
-        local_mesh.box_length[0],
-        local_mesh.box_length[1],
-        local_mesh.box_length[2],
+        patch.box_length[0],
+        patch.box_length[1],
+        patch.box_length[2],
         cell_size[0],
         cell_size[1],
         cell_size[2],
@@ -1448,10 +1658,10 @@ int build_local_force_mesh(DeviceState* state,
     return 0;
   };
 
-  if (build_mesh(local_mesh.fine, local_mesh.cell_size_fine) != 0) {
+  if (build_mesh(patch.fine, patch.cell_size_fine) != 0) {
     return 1;
   }
-  if (build_mesh(local_mesh.coarse, local_mesh.cell_size_coarse) != 0) {
+  if (build_mesh(patch.coarse, patch.cell_size_coarse) != 0) {
     return 1;
   }
   return 0;
@@ -1479,12 +1689,8 @@ int run_steps(DeviceState* state,
       return 1;
     }
 
-    if (!state->local_meshes.empty() &&
-        update_local_mesh_origins(state, error_buffer, error_buffer_len) != 0) {
-      return 1;
-    }
-    for (auto& local_mesh : state->local_meshes) {
-      if (build_local_force_mesh(state, local_mesh, error_buffer, error_buffer_len) != 0) {
+    for (auto& patch : state->refinement_patches) {
+      if (build_local_force_mesh(state, patch, error_buffer, error_buffer_len) != 0) {
         return 1;
       }
     }
@@ -1520,43 +1726,45 @@ int run_steps(DeviceState* state,
       return 1;
     }
 
-    for (const auto& local_mesh : state->local_meshes) {
+    for (const auto& patch : state->refinement_patches) {
+      if (!patch.active) {
+        continue;
+      }
       apply_local_mesh_correction<<<particle_blocks, threads_per_block>>>(
           state->particles,
           state->particle_count,
-          local_mesh.galaxy_index,
-          local_mesh.fine.force_x,
-          local_mesh.fine.force_y,
-          local_mesh.fine.force_z,
-          local_mesh.fine.nx,
-          local_mesh.fine.ny,
-          local_mesh.fine.nz,
-          local_mesh.domain_origin[0],
-          local_mesh.domain_origin[1],
-          local_mesh.domain_origin[2],
-          local_mesh.cell_size_fine[0],
-          local_mesh.cell_size_fine[1],
-          local_mesh.cell_size_fine[2],
-          1.0 / static_cast<double>(local_mesh.fine.real_count),
-          local_mesh.coarse.force_x,
-          local_mesh.coarse.force_y,
-          local_mesh.coarse.force_z,
-          local_mesh.coarse.nx,
-          local_mesh.coarse.ny,
-          local_mesh.coarse.nz,
-          local_mesh.domain_origin[0],
-          local_mesh.domain_origin[1],
-          local_mesh.domain_origin[2],
-          local_mesh.cell_size_coarse[0],
-          local_mesh.cell_size_coarse[1],
-          local_mesh.cell_size_coarse[2],
-          1.0 / static_cast<double>(local_mesh.coarse.real_count),
-          local_mesh.domain_origin[0] + 0.5 * local_mesh.box_length[0],
-          local_mesh.domain_origin[1] + 0.5 * local_mesh.box_length[1],
-          local_mesh.domain_origin[2] + 0.5 * local_mesh.box_length[2],
-          0.5 * local_mesh.box_length[0],
-          0.5 * local_mesh.box_length[1],
-          0.5 * local_mesh.box_length[2],
+          patch.fine.force_x,
+          patch.fine.force_y,
+          patch.fine.force_z,
+          patch.fine.nx,
+          patch.fine.ny,
+          patch.fine.nz,
+          patch.domain_origin[0],
+          patch.domain_origin[1],
+          patch.domain_origin[2],
+          patch.cell_size_fine[0],
+          patch.cell_size_fine[1],
+          patch.cell_size_fine[2],
+          1.0 / static_cast<double>(patch.fine.real_count),
+          patch.coarse.force_x,
+          patch.coarse.force_y,
+          patch.coarse.force_z,
+          patch.coarse.nx,
+          patch.coarse.ny,
+          patch.coarse.nz,
+          patch.domain_origin[0],
+          patch.domain_origin[1],
+          patch.domain_origin[2],
+          patch.cell_size_coarse[0],
+          patch.cell_size_coarse[1],
+          patch.cell_size_coarse[2],
+          1.0 / static_cast<double>(patch.coarse.real_count),
+          patch.domain_origin[0] + 0.5 * patch.box_length[0],
+          patch.domain_origin[1] + 0.5 * patch.box_length[1],
+          patch.domain_origin[2] + 0.5 * patch.box_length[2],
+          0.5 * patch.box_length[0],
+          0.5 * patch.box_length[1],
+          0.5 * patch.box_length[2],
           dt_myr);
       cuda_status = cudaGetLastError();
       if (cuda_status != cudaSuccess) {
@@ -1616,7 +1824,6 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
   state->nx = static_cast<int>(params->mesh_resolution[0]);
   state->ny = static_cast<int>(params->mesh_resolution[1]);
   state->nz = static_cast<int>(params->mesh_resolution[2]);
-  state->galaxies_host.assign(galaxies, galaxies + params->galaxy_count);
   state->nz_complex = state->nz / 2 + 1;
   state->real_count = static_cast<std::size_t>(state->nx) * static_cast<std::size_t>(state->ny) *
                       static_cast<std::size_t>(state->nz);
@@ -1656,12 +1863,9 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
   }
 
   state->galaxy_smbh_indices_host = galaxy_smbh_indices;
-  state->local_meshes.reserve(params->galaxy_count);
-  for (std::uint32_t galaxy_index = 0; galaxy_index < params->galaxy_count; ++galaxy_index) {
-    state->local_meshes.emplace_back();
-    auto& local_mesh = state->local_meshes.back();
-    local_mesh.galaxy_index = galaxy_index;
-    if (create_mesh_buffers(local_mesh.fine,
+  state->refinement_patches.resize(kMaxRefinementPatches);
+  for (auto& patch : state->refinement_patches) {
+    if (create_mesh_buffers(patch.fine,
                             kLocalFineNx,
                             kLocalFineNy,
                             kLocalFineNz,
@@ -1670,7 +1874,7 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
       destroy_state(state);
       return 1;
     }
-    if (create_mesh_buffers(local_mesh.coarse,
+    if (create_mesh_buffers(patch.coarse,
                             kLocalCoarseNx,
                             kLocalCoarseNy,
                             kLocalCoarseNz,
@@ -1679,7 +1883,6 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
       destroy_state(state);
       return 1;
     }
-    initialize_local_mesh_geometry(state->galaxies_host[galaxy_index], local_mesh);
   }
 
   cuda_status = cudaMalloc(
