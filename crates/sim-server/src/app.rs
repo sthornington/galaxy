@@ -47,6 +47,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/session/{id}", get(get_session))
         .route("/api/session/{id}/pause", post(pause_session))
         .route("/api/session/{id}/resume", post(resume_session))
+        .route("/api/session/{id}/stop", post(stop_session))
         .route("/api/session/{id}/step", post(step_session))
         .route("/api/session/{id}/snapshot", post(snapshot_session))
         .route("/ws/frames/{id}", get(ws_frames))
@@ -154,6 +155,13 @@ async fn resume_session(
             .command_wait(id, SessionCommand::Resume)
             .await?,
     ))
+}
+
+async fn stop_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<SessionSummary>, AppError> {
+    Ok(Json(state.sessions.stop(id).await?))
 }
 
 #[derive(Debug, Deserialize)]

@@ -16,12 +16,15 @@ web-sys = { workspace = true, features = [
     "BinaryType",
     "CanvasRenderingContext2d",
     "Document",
+    "DomRect",
     "Element",
     "Event",
     "HtmlCanvasElement",
     "Location",
     "MessageEvent",
+    "MouseEvent",
     "WebSocket",
+    "WheelEvent",
     "Window",
 ] }
 

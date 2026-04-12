@@ -23,8 +23,24 @@ struct FfiParticle {
 struct FfiPreviewParticle {
     position_kpc: [f32; 3],
     velocity_kms: [f32; 3],
+    mass_msun: f32,
+    galaxy_index: u32,
+    component: u32,
     color_rgba: [f32; 4],
     intensity: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FfiGalaxy {
+    halo_mass_msun: f64,
+    halo_scale_radius_kpc: f64,
+    disk_mass_msun: f64,
+    disk_scale_radius_kpc: f64,
+    disk_scale_height_kpc: f64,
+    bulge_mass_msun: f64,
+    bulge_scale_radius_kpc: f64,
+    disk_rotation: [f64; 9],
 }
 
 #[repr(C)]
@@ -42,6 +58,7 @@ struct FfiDiagnostics {
 #[repr(C)]
 struct FfiCreateParams {
     particle_count: u64,
+    galaxy_count: u32,
     grav_const_kpc_kms2_per_msun: f64,
     base_timestep_myr: f64,
 }
@@ -50,6 +67,7 @@ unsafe extern "C" {
     fn sim_cuda_create(
         params: *const FfiCreateParams,
         particles: *const FfiParticle,
+        galaxies: *const FfiGalaxy,
         out_handle: *mut *mut c_void,
         error_buffer: *mut i8,
         error_buffer_len: usize,
@@ -58,6 +76,13 @@ unsafe extern "C" {
     fn sim_cuda_step(
         handle: *mut c_void,
         requested_substeps: u32,
+        diagnostics: *mut FfiDiagnostics,
+        error_buffer: *mut i8,
+        error_buffer_len: usize,
+    ) -> i32;
+    fn sim_cuda_advance(
+        handle: *mut c_void,
+        steps: u32,
         diagnostics: *mut FfiDiagnostics,
         error_buffer: *mut i8,
         error_buffer_len: usize,
@@ -83,6 +108,7 @@ pub struct GpuBackend {
     handle: *mut c_void,
     particle_count: u64,
     last_diagnostics: Diagnostics,
+    preview_scratch: Vec<FfiPreviewParticle>,
 }
 
 unsafe impl Send for GpuBackend {}
@@ -94,6 +120,7 @@ impl GpuBackend {
     ) -> anyhow::Result<Self> {
         let params = FfiCreateParams {
             particle_count: initial_conditions.particles.len() as u64,
+            galaxy_count: config.galaxies.len() as u32,
             grav_const_kpc_kms2_per_msun: config.gravity.grav_const_kpc_kms2_per_msun,
             base_timestep_myr: config.integration.base_timestep_myr,
         };
@@ -102,6 +129,11 @@ impl GpuBackend {
             .iter()
             .map(ffi_particle_from_particle)
             .collect();
+        let ffi_galaxies: Vec<FfiGalaxy> = config
+            .galaxies
+            .iter()
+            .map(ffi_galaxy_from_config)
+            .collect();
 
         let mut handle = std::ptr::null_mut();
         let mut error_buffer = [0_i8; 512];
@@ -109,6 +141,7 @@ impl GpuBackend {
             sim_cuda_create(
                 &params,
                 ffi_particles.as_ptr(),
+                ffi_galaxies.as_ptr(),
                 &mut handle,
                 error_buffer.as_mut_ptr(),
                 error_buffer.len(),
@@ -126,6 +159,7 @@ impl GpuBackend {
                 particle_count: initial_conditions.particles.len() as u64,
                 ..Diagnostics::default()
             },
+            preview_scratch: Vec::new(),
         })
     }
 
@@ -150,24 +184,48 @@ impl GpuBackend {
         Ok(diagnostics)
     }
 
+    pub fn advance(&mut self, steps: u32) -> anyhow::Result<Diagnostics> {
+        let mut ffi = MaybeUninit::<FfiDiagnostics>::uninit();
+        let mut error_buffer = [0_i8; 512];
+        let code = unsafe {
+            sim_cuda_advance(
+                self.handle,
+                steps,
+                ffi.as_mut_ptr(),
+                error_buffer.as_mut_ptr(),
+                error_buffer.len(),
+            )
+        };
+        if code != 0 {
+            return Err(anyhow!(decode_error(&error_buffer))).context("CUDA advance failed");
+        }
+
+        let diagnostics = diagnostics_from_ffi(unsafe { ffi.assume_init() });
+        self.last_diagnostics = diagnostics.clone();
+        Ok(diagnostics)
+    }
+
     pub fn preview_frame(&mut self, budget: u32) -> anyhow::Result<PreviewFrame> {
         let max_particles = budget.min(self.particle_count.min(u64::from(u32::MAX)) as u32);
-        let mut particles = vec![
+        self.preview_scratch.resize(
+            max_particles as usize,
             FfiPreviewParticle {
                 position_kpc: [0.0; 3],
                 velocity_kms: [0.0; 3],
+                mass_msun: 0.0,
+                galaxy_index: 0,
+                component: 0,
                 color_rgba: [0.0; 4],
                 intensity: 0.0,
-            };
-            max_particles as usize
-        ];
+            },
+        );
         let mut out_count = 0_u32;
         let mut error_buffer = [0_i8; 512];
         let code = unsafe {
             sim_cuda_fill_preview(
                 self.handle,
                 max_particles,
-                particles.as_mut_ptr(),
+                self.preview_scratch.as_mut_ptr(),
                 &mut out_count,
                 error_buffer.as_mut_ptr(),
                 error_buffer.len(),
@@ -177,18 +235,20 @@ impl GpuBackend {
             return Err(anyhow!(decode_error(&error_buffer))).context("preview extraction failed");
         }
 
-        particles.truncate(out_count as usize);
         Ok(PreviewFrame {
             sim_time_myr: self.last_diagnostics.sim_time_myr,
             diagnostics: Diagnostics {
                 preview_count: out_count,
                 ..self.last_diagnostics.clone()
             },
-            particles: particles
+            particles: self.preview_scratch[..out_count as usize]
                 .into_iter()
                 .map(|particle| PreviewParticle {
                     position_kpc: particle.position_kpc,
                     velocity_kms: particle.velocity_kms,
+                    mass_msun: particle.mass_msun,
+                    galaxy_index: particle.galaxy_index,
+                    component: particle.component,
                     color_rgba: particle.color_rgba,
                     intensity: particle.intensity,
                 })
@@ -261,6 +321,43 @@ fn ffi_particle_from_particle(particle: &Particle) -> FfiParticle {
     }
 }
 
+fn ffi_galaxy_from_config(galaxy: &sim_core::GalaxyConfig) -> FfiGalaxy {
+    let rotation = rotation_from_euler_deg(galaxy.disk_tilt_deg);
+    FfiGalaxy {
+        halo_mass_msun: galaxy.halo_mass_msun,
+        halo_scale_radius_kpc: galaxy.halo_scale_radius_kpc,
+        disk_mass_msun: galaxy.disk_mass_msun,
+        disk_scale_radius_kpc: galaxy.disk_scale_radius_kpc,
+        disk_scale_height_kpc: galaxy.disk_scale_height_kpc,
+        bulge_mass_msun: galaxy.bulge_mass_msun,
+        bulge_scale_radius_kpc: galaxy.bulge_scale_radius_kpc,
+        disk_rotation: [
+            rotation[0][0],
+            rotation[0][1],
+            rotation[0][2],
+            rotation[1][0],
+            rotation[1][1],
+            rotation[1][2],
+            rotation[2][0],
+            rotation[2][1],
+            rotation[2][2],
+        ],
+    }
+}
+
+fn rotation_from_euler_deg(angles_deg: [f64; 3]) -> [[f64; 3]; 3] {
+    let [ax, ay, az] = angles_deg.map(f64::to_radians);
+    let (sx, cx) = ax.sin_cos();
+    let (sy, cy) = ay.sin_cos();
+    let (sz, cz) = az.sin_cos();
+
+    [
+        [cy * cz, cz * sx * sy - cx * sz, sx * sz + cx * cz * sy],
+        [cy * sz, cx * cz + sx * sy * sz, cx * sy * sz - cz * sx],
+        [-sy, cy * sx, cx * cy],
+    ]
+}
+
 fn diagnostics_from_ffi(ffi: FfiDiagnostics) -> Diagnostics {
     Diagnostics {
         particle_count: ffi.particle_count,
@@ -315,7 +412,7 @@ fn decode_error(bytes: &[i8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use sim_core::{InitialConditions, SimulationConfig, Vec3, built_in_presets};
+    use sim_core::{InitialConditions, ParticleComponent, SimulationConfig, Vec3, built_in_presets};
     use uuid::Uuid;
 
     use super::GpuBackend;
@@ -356,6 +453,50 @@ mod tests {
                     (particle.position_kpc - *before).length_squared() > 0.0
                 })
         );
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA GPU"]
+    fn isolated_primary_galaxy_stays_compact_over_short_horizon() {
+        let mut config = small_test_config();
+        config.galaxies.truncate(1);
+        config.name = "isolated-primary-stability".to_string();
+
+        let initial_conditions = InitialConditions::generate(&config, 13).unwrap();
+        let initial_disk_radius = mean_disk_radius(&initial_conditions.particles);
+
+        let mut backend = GpuBackend::new(&config, &initial_conditions).unwrap();
+        let diagnostics = backend.advance(256).unwrap();
+        assert!(diagnostics.sim_time_myr > 0.0);
+
+        let particles = backend.download_particles().unwrap();
+        let final_disk_radius = mean_disk_radius(&particles);
+        let ratio = final_disk_radius / initial_disk_radius;
+
+        assert!(
+            (0.6..=1.4).contains(&ratio),
+            "disk radius drifted too far: initial={initial_disk_radius:.3}, final={final_disk_radius:.3}, ratio={ratio:.3}"
+        );
+    }
+
+    fn mean_disk_radius(particles: &[sim_core::Particle]) -> f64 {
+        let center = particles
+            .iter()
+            .find(|particle| matches!(particle.component, ParticleComponent::Smbh))
+            .map(|particle| particle.position_kpc)
+            .unwrap_or(Vec3::ZERO);
+
+        let mut total = 0.0;
+        let mut count = 0_u64;
+        for particle in particles {
+            if !matches!(particle.component, ParticleComponent::Disk) {
+                continue;
+            }
+            total += (particle.position_kpc - center).length();
+            count += 1;
+        }
+
+        total / count.max(1) as f64
     }
 
     fn small_test_config() -> SimulationConfig {

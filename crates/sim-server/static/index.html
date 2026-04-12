@@ -32,6 +32,7 @@
           <div class="controls">
             <button id="pause-btn" class="secondary">Pause</button>
             <button id="resume-btn">Resume</button>
+            <button id="stop-btn" class="secondary">Stop</button>
             <button id="step-btn" class="secondary">Single Step</button>
             <button id="snapshot-btn" class="secondary">Snapshot</button>
           </div>
@@ -51,6 +52,14 @@
           <p id="viewer-status">Awaiting session creation.</p>
         </div>
         <canvas id="preview-canvas" width="1280" height="720"></canvas>
+        <p class="viewer-help">
+          Left-drag orbits around the current focus. Shift-drag or right-drag pans
+          the focus plane. The scroll wheel dollies in and out, and double-click
+          resets the camera. The axis marker shows the simulation origin:
+          <span class="axis-x">+X</span>,
+          <span class="axis-y">+Y</span>,
+          <span class="axis-z">+Z</span>.
+        </p>
       </section>
     </main>
 

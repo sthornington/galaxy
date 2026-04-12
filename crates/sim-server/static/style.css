@@ -167,12 +167,36 @@ button.secondary {
   width: 100%;
   height: auto;
   aspect-ratio: 16 / 9;
+  cursor: grab;
   border-radius: 18px;
   background:
     radial-gradient(circle at 20% 20%, rgba(76, 201, 240, 0.1), transparent 35%),
     radial-gradient(circle at 70% 30%, rgba(242, 193, 75, 0.12), transparent 30%),
     #020810;
   border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.panel-view canvas:active {
+  cursor: grabbing;
+}
+
+.viewer-help {
+  margin: 14px 4px 0;
+  color: var(--muted);
+  line-height: 1.55;
+  max-width: 90ch;
+}
+
+.viewer-help .axis-x {
+  color: #ff7b7b;
+}
+
+.viewer-help .axis-y {
+  color: #79ffb0;
+}
+
+.viewer-help .axis-z {
+  color: #7eb2ff;
 }
 
 @media (max-width: 720px) {

@@ -41,9 +41,9 @@ fn relativity_defaults() -> RelativityConfig {
 
 fn preview_defaults() -> PreviewConfig {
     PreviewConfig {
-        particle_budget: 300_000,
+        particle_budget: 500_000,
         density_grid: [960, 540],
-        target_fps: 60,
+        target_fps: 120,
     }
 }
 
@@ -75,8 +75,8 @@ fn major_merger() -> MergerPreset {
             preview: preview_defaults(),
             snapshots: snapshot_defaults(),
             integration: integration_defaults(),
-            initial_separation_kpc: 180.0,
-            initial_relative_velocity_kms: 180.0,
+            initial_separation_kpc: 100.0,
+            initial_relative_velocity_kms: 160.0,
             output_directory: "output/major-merger".to_string(),
             galaxies: vec![
                 GalaxyConfig {
@@ -96,8 +96,8 @@ fn major_merger() -> MergerPreset {
                         softening_kpc: 0.002,
                         substeps: 16,
                     },
-                    position_kpc: [-90.0, 0.0, 0.0],
-                    velocity_kms: [0.0, -90.0, 0.0],
+                    position_kpc: [-50.0, 0.0, 0.0],
+                    velocity_kms: [0.0, -80.0, 0.0],
                     disk_tilt_deg: [10.0, 25.0, 0.0],
                     color_rgba: [0.96, 0.76, 0.42, 1.0],
                 },
@@ -118,8 +118,8 @@ fn major_merger() -> MergerPreset {
                         softening_kpc: 0.002,
                         substeps: 16,
                     },
-                    position_kpc: [90.0, 0.0, 0.0],
-                    velocity_kms: [0.0, 90.0, 0.0],
+                    position_kpc: [50.0, 0.0, 0.0],
+                    velocity_kms: [0.0, 80.0, 0.0],
                     disk_tilt_deg: [-35.0, 70.0, 18.0],
                     color_rgba: [0.45, 0.76, 1.0, 1.0],
                 },
@@ -132,7 +132,12 @@ fn polar_flyby() -> MergerPreset {
     let mut config = major_merger().config;
     config.name = "polar-flyby".to_string();
     config.output_directory = "output/polar-flyby".to_string();
+    config.initial_separation_kpc = 140.0;
     config.initial_relative_velocity_kms = 260.0;
+    config.galaxies[0].position_kpc = [-70.0, 0.0, 0.0];
+    config.galaxies[0].velocity_kms = [0.0, -90.0, 0.0];
+    config.galaxies[1].position_kpc = [70.0, 0.0, 0.0];
+    config.galaxies[1].velocity_kms = [0.0, 90.0, 0.0];
     config.galaxies[1].disk_tilt_deg = [88.0, 10.0, 12.0];
     config.galaxies[1].color_rgba = [0.78, 0.54, 1.0, 1.0];
     MergerPreset {
@@ -147,6 +152,12 @@ fn minor_merger() -> MergerPreset {
     let mut config = major_merger().config;
     config.name = "minor-merger".to_string();
     config.output_directory = "output/minor-merger".to_string();
+    config.initial_separation_kpc = 140.0;
+    config.initial_relative_velocity_kms = 180.0;
+    config.galaxies[0].position_kpc = [-70.0, 0.0, 0.0];
+    config.galaxies[0].velocity_kms = [0.0, -90.0, 0.0];
+    config.galaxies[1].position_kpc = [70.0, 0.0, 0.0];
+    config.galaxies[1].velocity_kms = [0.0, 90.0, 0.0];
     config.galaxies[1].halo_mass_msun = 2.8e11;
     config.galaxies[1].halo_particle_count = 950_000;
     config.galaxies[1].disk_mass_msun = 1.4e10;

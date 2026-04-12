@@ -6,6 +6,8 @@ use thiserror::Error;
 
 use crate::{SimulationConfig, Vec3};
 
+const GRAV_CONST_KPC_KMS2_PER_MSUN: f64 = 4.300_91e-6;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ParticleComponent {
     Halo,
@@ -36,6 +38,18 @@ pub struct InitialConditions {
 pub enum InitialConditionError {
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GalaxyPotential {
+    halo_mass_msun: f64,
+    halo_scale_radius_kpc: f64,
+    disk_mass_msun: f64,
+    disk_scale_radius_kpc: f64,
+    disk_scale_height_kpc: f64,
+    bulge_mass_msun: f64,
+    bulge_scale_radius_kpc: f64,
+    smbh_mass_msun: f64,
 }
 
 impl InitialConditions {
@@ -90,7 +104,16 @@ impl InitialConditions {
                 origin,
                 bulk_velocity,
                 rotation,
-                galaxy.halo_mass_msun + galaxy.disk_mass_msun + galaxy.bulge_mass_msun,
+                GalaxyPotential {
+                    halo_mass_msun: galaxy.halo_mass_msun,
+                    halo_scale_radius_kpc: galaxy.halo_scale_radius_kpc,
+                    disk_mass_msun: galaxy.disk_mass_msun,
+                    disk_scale_radius_kpc: galaxy.disk_scale_radius_kpc,
+                    disk_scale_height_kpc: galaxy.disk_scale_height_kpc,
+                    bulge_mass_msun: galaxy.bulge_mass_msun,
+                    bulge_scale_radius_kpc: galaxy.bulge_scale_radius_kpc,
+                    smbh_mass_msun: galaxy.smbh.mass_msun,
+                },
             )?;
 
             extend_hernquist_bulge(
@@ -158,8 +181,10 @@ fn extend_nfw_halo(
         let direction = sample_unit_vector(rng);
         let position = origin + direction * r;
         let enclosed_mass = total_mass_msun * (r / (r + scale_radius_kpc)).powi(2);
-        let dispersion =
-            ((4.300_91e-6 * enclosed_mass / (3.0 * r.max(softening_kpc))).max(0.0)).sqrt();
+        let dispersion = ((GRAV_CONST_KPC_KMS2_PER_MSUN * enclosed_mass
+            / (3.0 * r.max(softening_kpc)))
+        .max(0.0))
+        .sqrt();
         let velocity = bulk_velocity + sample_gaussian3(rng, dispersion);
 
         particles.push(Particle {
@@ -190,7 +215,7 @@ fn extend_exponential_disk(
     origin: Vec3,
     bulk_velocity: Vec3,
     rotation: [[f64; 3]; 3],
-    enclosed_mass_reference: f64,
+    potential: GalaxyPotential,
 ) -> Result<(), InitialConditionError> {
     if count == 0 {
         return Ok(());
@@ -206,17 +231,43 @@ fn extend_exponential_disk(
         let u: f64 = rng.random::<f64>().clamp(1.0e-8, 1.0 - 1.0e-8);
         let radius = -scale_radius_kpc * (1.0 - u).ln();
         let phi = rng.random::<f64>() * std::f64::consts::TAU;
-        let z = 0.5 * scale_height_kpc * ((rng.random::<f64>() - 0.5) * 1.8).tanh();
+        let z = sample_sech2_height(rng, scale_height_kpc);
         let local = Vec3::new(radius * phi.cos(), radius * phi.sin(), z);
         let rotated = rotate(rotation, local);
         let position = origin + rotated;
 
-        let enclosed_mass = enclosed_mass_reference * radius / (radius + scale_radius_kpc);
-        let v_c =
-            ((4.300_91e-6 * enclosed_mass / radius.max(scale_radius_kpc * 0.25)).max(0.0)).sqrt();
-        let tangent = rotate(rotation, Vec3::new(-phi.sin(), phi.cos(), 0.0));
-        let dispersion = 0.08 * v_c;
-        let velocity = bulk_velocity + tangent * v_c + sample_gaussian3(rng, dispersion);
+        let spherical_radius = (radius * radius + z * z).sqrt();
+        let v_c = (
+            hernquist_circular_velocity_sq(
+                potential.halo_mass_msun,
+                potential.halo_scale_radius_kpc,
+                spherical_radius,
+            ) + hernquist_circular_velocity_sq(
+                potential.bulge_mass_msun,
+                potential.bulge_scale_radius_kpc,
+                spherical_radius,
+            ) + miyamoto_nagai_circular_velocity_sq(
+                potential.disk_mass_msun,
+                potential.disk_scale_radius_kpc,
+                potential.disk_scale_height_kpc,
+                radius,
+                z,
+            ) + point_mass_circular_velocity_sq(potential.smbh_mass_msun, spherical_radius)
+        )
+        .max(0.0)
+        .sqrt();
+        let radial_direction = rotate(rotation, Vec3::new(phi.cos(), phi.sin(), 0.0));
+        let tangent_direction = rotate(rotation, Vec3::new(-phi.sin(), phi.cos(), 0.0));
+        let normal_direction = rotate(rotation, Vec3::new(0.0, 0.0, 1.0));
+        let dispersion_decay = (-radius / (2.8 * scale_radius_kpc.max(1.0e-3))).exp();
+        let sigma_r = (0.22 * v_c * dispersion_decay).max(10.0);
+        let sigma_phi = (0.16 * v_c * dispersion_decay).max(8.0);
+        let sigma_z = (0.12 * v_c * dispersion_decay + 8.0).max(8.0);
+        let v_phi = (v_c - 0.35 * sigma_r).max(0.0) + sample_gaussian(rng, sigma_phi);
+        let velocity = bulk_velocity
+            + radial_direction * sample_gaussian(rng, sigma_r)
+            + tangent_direction * v_phi
+            + normal_direction * sample_gaussian(rng, sigma_z);
 
         particles.push(Particle {
             galaxy_index,
@@ -260,9 +311,10 @@ fn extend_hernquist_bulge(
         let radius = scale_radius_kpc * root_u / (1.0 - root_u);
         let direction = sample_unit_vector(rng);
         let position = origin + direction * radius;
-        let dispersion = ((4.300_91e-6 * total_mass_msun / (6.0 * radius.max(scale_radius_kpc)))
-            .max(0.0))
-        .sqrt();
+        let dispersion =
+            ((GRAV_CONST_KPC_KMS2_PER_MSUN * total_mass_msun / (6.0 * radius.max(scale_radius_kpc)))
+                .max(0.0))
+            .sqrt();
         let velocity = bulk_velocity + sample_gaussian3(rng, dispersion);
 
         particles.push(Particle {
@@ -299,6 +351,14 @@ fn sample_unit_vector(rng: &mut SmallRng) -> Vec3 {
     Vec3::new(r * phi.cos(), r * phi.sin(), z)
 }
 
+fn sample_gaussian(rng: &mut SmallRng, sigma: f64) -> f64 {
+    if sigma <= f64::EPSILON {
+        return 0.0;
+    }
+    let n: f64 = StandardNormal.sample(rng);
+    n * sigma
+}
+
 fn sample_gaussian3(rng: &mut SmallRng, sigma: f64) -> Vec3 {
     if sigma <= f64::EPSILON {
         return Vec3::ZERO;
@@ -307,6 +367,51 @@ fn sample_gaussian3(rng: &mut SmallRng, sigma: f64) -> Vec3 {
     let ny: f64 = StandardNormal.sample(rng);
     let nz: f64 = StandardNormal.sample(rng);
     Vec3::new(nx * sigma, ny * sigma, nz * sigma)
+}
+
+fn sample_sech2_height(rng: &mut SmallRng, scale_height_kpc: f64) -> f64 {
+    let u = rng.random::<f64>().clamp(1.0e-6, 1.0 - 1.0e-6);
+    0.5 * scale_height_kpc * (u / (1.0 - u)).ln()
+}
+
+fn hernquist_circular_velocity_sq(mass_msun: f64, scale_radius_kpc: f64, radius_kpc: f64) -> f64 {
+    if !(mass_msun > 0.0 && scale_radius_kpc > 0.0 && radius_kpc > 0.0) {
+        return 0.0;
+    }
+
+    GRAV_CONST_KPC_KMS2_PER_MSUN * mass_msun * radius_kpc / (radius_kpc + scale_radius_kpc).powi(2)
+}
+
+fn miyamoto_nagai_circular_velocity_sq(
+    mass_msun: f64,
+    scale_radius_kpc: f64,
+    scale_height_kpc: f64,
+    cylindrical_radius_kpc: f64,
+    z_kpc: f64,
+) -> f64 {
+    if !(mass_msun > 0.0
+        && scale_radius_kpc > 0.0
+        && scale_height_kpc > 0.0
+        && cylindrical_radius_kpc > 0.0)
+    {
+        return 0.0;
+    }
+
+    let b = scale_height_kpc.max(1.0e-4);
+    let b_term = (z_kpc * z_kpc + b * b).sqrt();
+    let sum = scale_radius_kpc.max(1.0e-4) + b_term;
+    let denom = (cylindrical_radius_kpc * cylindrical_radius_kpc + sum * sum).powf(1.5);
+
+    GRAV_CONST_KPC_KMS2_PER_MSUN * mass_msun * cylindrical_radius_kpc * cylindrical_radius_kpc
+        / denom
+}
+
+fn point_mass_circular_velocity_sq(mass_msun: f64, radius_kpc: f64) -> f64 {
+    if !(mass_msun > 0.0 && radius_kpc > 0.0) {
+        return 0.0;
+    }
+
+    GRAV_CONST_KPC_KMS2_PER_MSUN * mass_msun / radius_kpc
 }
 
 fn rotation_from_euler_deg(angles_deg: [f64; 3]) -> [[f64; 3]; 3] {

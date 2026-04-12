@@ -60,6 +60,11 @@ class FakeCanvasContext {
   constructor() {
     this.calls = [];
     this.fillStyle = null;
+    this.strokeStyle = null;
+    this.lineWidth = 1;
+    this.font = "";
+    this.textAlign = "start";
+    this.textBaseline = "alphabetic";
   }
 
   clearRect(...args) {
@@ -79,12 +84,40 @@ class FakeCanvasContext {
     this.calls.push({ kind: "beginPath" });
   }
 
+  moveTo(...args) {
+    this.calls.push({ kind: "moveTo", args });
+  }
+
+  lineTo(...args) {
+    this.calls.push({ kind: "lineTo", args });
+  }
+
   arc(...args) {
     this.calls.push({ kind: "arc", args, fillStyle: this.fillStyle });
   }
 
   fill() {
     this.calls.push({ kind: "fill", fillStyle: this.fillStyle });
+  }
+
+  stroke() {
+    this.calls.push({
+      kind: "stroke",
+      strokeStyle: this.strokeStyle,
+      lineWidth: this.lineWidth,
+    });
+  }
+
+  fillText(...args) {
+    this.calls.push({ kind: "fillText", args, fillStyle: this.fillStyle });
+  }
+
+  save() {
+    this.calls.push({ kind: "save" });
+  }
+
+  restore() {
+    this.calls.push({ kind: "restore" });
   }
 }
 
@@ -116,6 +149,7 @@ class FakeDocument {
     this.register(new FakeElement("button", "refresh-presets"));
     this.register(new FakeElement("button", "pause-btn"));
     this.register(new FakeElement("button", "resume-btn"));
+    this.register(new FakeElement("button", "stop-btn"));
     this.register(new FakeElement("button", "snapshot-btn"));
     this.register(new FakeElement("button", "step-btn"));
   }
@@ -165,14 +199,24 @@ class FakeWebSocket {
   }
 }
 
-function createHarness({ useRustViewer = false } = {}) {
+function createHarness({ useRustViewer = false, existingSessions = [] } = {}) {
   FakeWebSocket.instances = [];
   const document = new FakeDocument();
   const fetchCalls = [];
+  const intervals = new Map();
+  let nextIntervalId = 1;
   const window = {
     location: {
       protocol: "http:",
       host: "127.0.0.1:8080",
+    },
+    setInterval(handler) {
+      const id = nextIntervalId++;
+      intervals.set(id, handler);
+      return id;
+    },
+    clearInterval(id) {
+      intervals.delete(id);
     },
   };
 
@@ -197,6 +241,9 @@ function createHarness({ useRustViewer = false } = {}) {
         diagnostics: { preview_count: 0 },
       });
     }
+    if (path === "/api/sessions") {
+      return okJson(existingSessions);
+    }
     if (path === "/api/session/session-1/step") {
       return okJson({
         id: "session-1",
@@ -204,6 +251,24 @@ function createHarness({ useRustViewer = false } = {}) {
         sim_time_myr: 0.05,
         particle_count: 208,
         diagnostics: { preview_count: 32 },
+      });
+    }
+    if (path === "/api/session/session-1") {
+      return okJson({
+        id: "session-1",
+        state: "running",
+        sim_time_myr: 2.5,
+        particle_count: 208,
+        diagnostics: { preview_count: 64 },
+      });
+    }
+    if (path === "/api/session/session-1/stop") {
+      return okJson({
+        id: "session-1",
+        state: "paused",
+        sim_time_myr: 2.5,
+        particle_count: 208,
+        diagnostics: { preview_count: 64 },
       });
     }
     throw new Error(`unexpected fetch path: ${path}`);
@@ -215,9 +280,11 @@ function createHarness({ useRustViewer = false } = {}) {
     fetchImpl,
     WebSocketImpl: FakeWebSocket,
     tryBootRustViewer: async () => useRustViewer,
+    setIntervalImpl: window.setInterval.bind(window),
+    clearIntervalImpl: window.clearInterval.bind(window),
   });
 
-  return { app, document, fetchCalls };
+  return { app, document, fetchCalls, intervals };
 }
 
 function okJson(value) {
@@ -242,8 +309,13 @@ test("headless UI renders presets and falls back to JSON websocket streaming", a
 
   assert.deepEqual(
     fetchCalls.map((call) => call.path),
-    ["/api/presets", "/api/session"]
+    ["/api/presets", "/api/sessions", "/api/session"]
   );
+  assert.deepEqual(JSON.parse(fetchCalls[2].options.body), {
+    preset_id: "minor-merger",
+    seed: 42,
+    preview_particle_budget: 32768,
+  });
   assert.equal(document.getElementById("session-id").textContent, "session-1");
   assert.equal(FakeWebSocket.instances.length, 1);
   assert.equal(
@@ -278,16 +350,66 @@ test("headless UI renders presets and falls back to JSON websocket streaming", a
 });
 
 test("headless UI prefers the Rust viewer path when it is available", async () => {
-  const { app, document } = createHarness({ useRustViewer: true });
+  const { app, document, intervals, fetchCalls } = createHarness({
+    useRustViewer: true,
+  });
   await app.boot();
   const launchButton = document.getElementById("preset-list").children[0].children[3];
   launchButton.click();
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(FakeWebSocket.instances.length, 0);
+  assert.deepEqual(JSON.parse(fetchCalls[2].options.body), {
+    preset_id: "minor-merger",
+    seed: 42,
+    preview_particle_budget: 32768,
+  });
+  assert.equal(intervals.size, 1);
   assert.equal(
     document.getElementById("viewer-status").textContent,
     "Streaming binary preview frames into the Rust/WASM viewer."
+  );
+
+  const poll = [...intervals.values()][0];
+  poll();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(document.getElementById("sim-time").textContent, "2.50 Myr");
+  assert.equal(document.getElementById("preview-count").textContent, "64");
+});
+
+test("headless UI reattaches to an existing session and can stop it", async () => {
+  const existingSession = {
+    id: "session-1",
+    state: "running",
+    sim_time_myr: 1.75,
+    particle_count: 208,
+    diagnostics: { preview_count: 32 },
+  };
+  const { app, document, fetchCalls } = createHarness({
+    existingSessions: [existingSession],
+  });
+
+  await app.boot();
+
+  assert.equal(document.getElementById("session-id").textContent, "session-1");
+  assert.equal(FakeWebSocket.instances.length, 1);
+  assert.deepEqual(
+    fetchCalls.map((call) => call.path),
+    ["/api/presets", "/api/sessions"]
+  );
+
+  document.getElementById("stop-btn").click();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(
+    fetchCalls.map((call) => call.path).at(-1),
+    "/api/session/session-1/stop"
+  );
+  assert.equal(document.getElementById("session-state").textContent, "stopped");
+  assert.equal(
+    document.getElementById("viewer-status").textContent,
+    "Stopped session session-1."
   );
 });
 
@@ -298,4 +420,6 @@ test("index shell references the module entrypoint expected by the headless test
   );
   assert.match(html, /<script type="module" src="\/fallback\.mjs"><\/script>/);
   assert.match(html, /id="preview-canvas"/);
+  assert.match(html, /Left-drag orbits around the current focus/);
+  assert.match(html, /The axis marker shows the simulation origin/);
 });

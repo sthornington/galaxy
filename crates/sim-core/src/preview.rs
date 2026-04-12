@@ -13,6 +13,9 @@ pub struct PreviewFrame {
 pub struct PreviewParticle {
     pub position_kpc: [f32; 3],
     pub velocity_kms: [f32; 3],
+    pub mass_msun: f32,
+    pub galaxy_index: u32,
+    pub component: u32,
     pub color_rgba: [f32; 4],
     pub intensity: f32,
 }

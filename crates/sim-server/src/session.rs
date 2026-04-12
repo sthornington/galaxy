@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{cmp::Ordering, collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, anyhow};
 use parking_lot::RwLock;
@@ -19,11 +19,23 @@ pub struct SessionRegistry {
 
 impl SessionRegistry {
     pub fn list(&self) -> Vec<SessionSummary> {
-        self.sessions
+        let mut sessions: Vec<_> = self
+            .sessions
             .read()
             .values()
             .map(SessionHandle::summary)
-            .collect()
+            .collect();
+        sessions.sort_by(|left, right| {
+            session_rank(left.state)
+                .cmp(&session_rank(right.state))
+                .then_with(|| {
+                    right
+                        .sim_time_myr
+                        .partial_cmp(&left.sim_time_myr)
+                        .unwrap_or(Ordering::Equal)
+                })
+        });
+        sessions
     }
 
     pub fn get(&self, id: Uuid) -> Option<SessionSummary> {
@@ -104,6 +116,15 @@ impl SessionRegistry {
             return Err(anyhow!("unknown session `{id}`"));
         };
         handle.send_command_wait(command).await
+    }
+
+    pub async fn stop(&self, id: Uuid) -> anyhow::Result<SessionSummary> {
+        let Some(handle) = self.sessions.read().get(&id).cloned() else {
+            return Err(anyhow!("unknown session `{id}`"));
+        };
+        let summary = handle.send_command_wait(SessionCommand::Stop).await?;
+        self.sessions.write().remove(&id);
+        Ok(summary)
     }
 }
 
@@ -195,6 +216,7 @@ pub enum SessionCommand {
     Resume,
     Step(u32),
     Snapshot,
+    Stop,
     Control(ControlCommand),
 }
 
@@ -216,7 +238,12 @@ async fn session_task(
 ) {
     let mut preview_budget = preview_budget;
     let mut running = false;
-    let steps_per_tick = 8_u32;
+    let particle_count = initial_conditions.particles.len() as u64;
+    // Keep the browser fed with frames even for multi-million-particle presets
+    // by scaling the simulation work budget to the particle count.
+    let target_particle_updates_per_tick = 96_000_000_u64;
+    let steps_per_tick = ((target_particle_updates_per_tick / particle_count.max(1)) as u32)
+        .clamp(4, config.integration.max_substeps.saturating_mul(4).max(1));
     let mut backend = match GpuBackend::new(&config, &initial_conditions) {
         Ok(backend) => backend,
         Err(error) => {
@@ -226,7 +253,8 @@ async fn session_task(
         }
     };
 
-    let mut ticker = tokio::time::interval(Duration::from_millis(16));
+    let frame_interval = Duration::from_secs_f64(1.0 / f64::from(config.preview.target_fps.max(1)));
+    let mut ticker = tokio::time::interval(frame_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     if let Err(error) = publish_frame(
@@ -264,6 +292,14 @@ async fn session_task(
                 };
                 let SessionRequest { command, ack } = request;
 
+                if matches!(command, SessionCommand::Stop) {
+                    summary.write().state = SessionState::Paused;
+                    if let Some(ack) = ack {
+                        let _ = ack.send(Ok(summary.read().clone()));
+                    }
+                    return;
+                }
+
                 let result = match command {
                     SessionCommand::Pause => {
                         running = false;
@@ -298,6 +334,7 @@ async fn session_task(
                             Err(error.context("failed to download particles for snapshot"))
                         }
                     },
+                    SessionCommand::Stop => unreachable!("stop is handled before command dispatch"),
                     SessionCommand::Control(control) => match control {
                         ControlCommand::Pause => {
                             running = false;
@@ -351,6 +388,14 @@ async fn session_task(
     }
 }
 
+fn session_rank(state: SessionState) -> u8 {
+    match state {
+        SessionState::Running => 0,
+        SessionState::Paused => 1,
+        SessionState::Failed => 2,
+    }
+}
+
 fn advance_and_publish(
     backend: &mut GpuBackend,
     steps: u32,
@@ -359,11 +404,7 @@ fn advance_and_publish(
     latest_frame: &Arc<RwLock<Option<Vec<u8>>>>,
     frame_tx: &broadcast::Sender<Vec<u8>>,
 ) -> anyhow::Result<()> {
-    let mut diagnostics = None;
-    for _ in 0..steps.max(1) {
-        diagnostics = Some(backend.step(1)?);
-    }
-    let diagnostics = diagnostics.expect("steps.max(1) guarantees at least one iteration");
+    let diagnostics = backend.advance(steps.max(1))?;
     {
         let mut summary = summary.write();
         summary.sim_time_myr = diagnostics.sim_time_myr;
