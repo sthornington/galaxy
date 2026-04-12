@@ -312,3 +312,67 @@ fn decode_error(bytes: &[i8]) -> String {
         .collect();
     String::from_utf8_lossy(&bytes).trim().to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use sim_core::{InitialConditions, SimulationConfig, Vec3, built_in_presets};
+    use uuid::Uuid;
+
+    use super::GpuBackend;
+
+    #[test]
+    #[ignore = "requires NVIDIA GPU"]
+    fn gpu_backend_steps_emits_preview_and_downloads_particles() {
+        let config = small_test_config();
+        let initial_conditions = InitialConditions::generate(&config, 7).unwrap();
+        let before_positions: Vec<Vec3> = initial_conditions
+            .particles
+            .iter()
+            .map(|particle| particle.position_kpc)
+            .collect();
+
+        let mut backend = GpuBackend::new(&config, &initial_conditions).unwrap();
+        let initial_preview = backend.preview_frame(64).unwrap();
+        assert!(!initial_preview.particles.is_empty());
+        assert!(initial_preview.particles.len() <= 64);
+
+        let diagnostics = backend.step(2).unwrap();
+        assert!(diagnostics.sim_time_myr > 0.0);
+        assert_eq!(
+            diagnostics.particle_count,
+            initial_conditions.particles.len() as u64
+        );
+
+        let stepped_preview = backend.preview_frame(64).unwrap();
+        assert!(stepped_preview.diagnostics.preview_count > 0);
+
+        let particles = backend.download_particles().unwrap();
+        assert_eq!(particles.len(), initial_conditions.particles.len());
+        assert!(
+            particles
+                .iter()
+                .zip(before_positions.iter())
+                .any(|(particle, before)| {
+                    (particle.position_kpc - *before).length_squared() > 0.0
+                })
+        );
+    }
+
+    fn small_test_config() -> SimulationConfig {
+        let mut config = built_in_presets()
+            .into_iter()
+            .find(|preset| preset.id == "minor-merger")
+            .unwrap()
+            .config;
+        config.name = "gpu-backend-smoke".to_string();
+        config.output_directory = format!("/tmp/galaxy-cuda-smoke-{}", Uuid::new_v4());
+        config.snapshots.directory = config.output_directory.clone();
+        config.preview.particle_budget = 64;
+        for galaxy in &mut config.galaxies {
+            galaxy.halo_particle_count = 96;
+            galaxy.disk_particle_count = 48;
+            galaxy.bulge_particle_count = 12;
+        }
+        config
+    }
+}

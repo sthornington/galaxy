@@ -1,12 +1,8 @@
-mod app;
-mod session;
-
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
+use sim_server::app::{self, AppState};
 use tracing::info;
-
-use crate::app::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

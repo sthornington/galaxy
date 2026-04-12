@@ -8,7 +8,7 @@ use sim_core::{
     validate_particle_count,
 };
 use sim_cuda::GpuBackend;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -94,6 +94,17 @@ impl SessionRegistry {
         };
         handle.send_command(command)
     }
+
+    pub async fn command_wait(
+        &self,
+        id: Uuid,
+        command: SessionCommand,
+    ) -> anyhow::Result<SessionSummary> {
+        let Some(handle) = self.sessions.read().get(&id).cloned() else {
+            return Err(anyhow!("unknown session `{id}`"));
+        };
+        handle.send_command_wait(command).await
+    }
 }
 
 #[derive(Clone)]
@@ -102,7 +113,7 @@ pub struct SessionHandle {
     pub summary: Arc<RwLock<SessionSummary>>,
     pub latest_frame: Arc<RwLock<Option<Vec<u8>>>>,
     pub frame_tx: broadcast::Sender<Vec<u8>>,
-    pub command_tx: mpsc::UnboundedSender<SessionCommand>,
+    pub command_tx: mpsc::UnboundedSender<SessionRequest>,
 }
 
 impl SessionHandle {
@@ -120,8 +131,23 @@ impl SessionHandle {
 
     pub fn send_command(&self, command: SessionCommand) -> anyhow::Result<()> {
         self.command_tx
-            .send(command)
+            .send(SessionRequest { command, ack: None })
             .map_err(|_| anyhow!("session {} is no longer accepting commands", self.id))
+    }
+
+    pub async fn send_command_wait(
+        &self,
+        command: SessionCommand,
+    ) -> anyhow::Result<SessionSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(SessionRequest {
+                command,
+                ack: Some(tx),
+            })
+            .map_err(|_| anyhow!("session {} is no longer accepting commands", self.id))?;
+        rx.await
+            .map_err(|_| anyhow!("session {} command acknowledgement dropped", self.id))?
     }
 }
 
@@ -133,7 +159,7 @@ pub struct CreateSessionParams {
     pub preview_particle_budget: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: Uuid,
     pub preset_id: String,
@@ -146,7 +172,7 @@ pub struct SessionSummary {
     pub diagnostics: Diagnostics,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {
     Paused,
@@ -172,6 +198,12 @@ pub enum SessionCommand {
     Control(ControlCommand),
 }
 
+#[derive(Debug)]
+pub struct SessionRequest {
+    pub command: SessionCommand,
+    pub ack: Option<oneshot::Sender<anyhow::Result<SessionSummary>>>,
+}
+
 async fn session_task(
     id: Uuid,
     config: SimulationConfig,
@@ -180,7 +212,7 @@ async fn session_task(
     summary: Arc<RwLock<SessionSummary>>,
     latest_frame: Arc<RwLock<Option<Vec<u8>>>>,
     frame_tx: broadcast::Sender<Vec<u8>>,
-    mut command_rx: mpsc::UnboundedReceiver<SessionCommand>,
+    mut command_rx: mpsc::UnboundedReceiver<SessionRequest>,
 ) {
     let mut preview_budget = preview_budget;
     let mut running = false;
@@ -226,83 +258,92 @@ async fn session_task(
                 }
             }
             maybe_command = command_rx.recv() => {
-                let Some(command) = maybe_command else {
+                let Some(request) = maybe_command else {
                     return;
                 };
+                let SessionRequest { command, ack } = request;
 
-                match command {
+                let result = match command {
                     SessionCommand::Pause => {
                         running = false;
                         summary.write().state = SessionState::Paused;
+                        Ok(())
                     }
                     SessionCommand::Resume => {
                         running = true;
                         summary.write().state = SessionState::Running;
+                        Ok(())
                     }
-                    SessionCommand::Step(substeps) => {
-                        if let Err(error) = step_and_publish(
-                            &mut backend,
-                            substeps.max(1),
-                            preview_budget,
-                            &summary,
-                            &latest_frame,
-                            &frame_tx,
-                        ) {
-                            error!("session {id} step command failed: {error:#}");
-                            summary.write().state = SessionState::Failed;
-                            return;
-                        }
-                    }
-                    SessionCommand::Snapshot => {
-                        match backend.download_particles() {
-                            Ok(particles) => match write_snapshot(id, &config, &summary.read(), &particles) {
+                    SessionCommand::Step(substeps) => step_and_publish(
+                        &mut backend,
+                        substeps.max(1),
+                        preview_budget,
+                        &summary,
+                        &latest_frame,
+                        &frame_tx,
+                    ),
+                    SessionCommand::Snapshot => match backend.download_particles() {
+                        Ok(particles) => {
+                            let snapshot_summary = summary.read().clone();
+                            match write_snapshot(id, &config, &snapshot_summary, &particles) {
                                 Ok(path) => {
                                     summary.write().latest_snapshot = Some(path);
+                                    Ok(())
                                 }
-                                Err(error) => error!("session {id} snapshot failed: {error:#}"),
-                            },
-                            Err(error) => {
-                                error!("session {id} failed to download particles for snapshot: {error:#}");
+                                Err(error) => Err(error),
                             }
                         }
-                    }
+                        Err(error) => {
+                            Err(error.context("failed to download particles for snapshot"))
+                        }
+                    },
                     SessionCommand::Control(control) => match control {
                         ControlCommand::Pause => {
                             running = false;
                             summary.write().state = SessionState::Paused;
+                            Ok(())
                         }
                         ControlCommand::Resume => {
                             running = true;
                             summary.write().state = SessionState::Running;
+                            Ok(())
                         }
-                        ControlCommand::Step { substeps } => {
-                            if let Err(error) = step_and_publish(
-                                &mut backend,
-                                substeps.unwrap_or(1).max(1),
-                                preview_budget,
-                                &summary,
-                                &latest_frame,
-                                &frame_tx,
-                            ) {
-                                error!("session {id} control-step failed: {error:#}");
-                                summary.write().state = SessionState::Failed;
-                                return;
-                            }
-                        }
+                        ControlCommand::Step { substeps } => step_and_publish(
+                            &mut backend,
+                            substeps.unwrap_or(1).max(1),
+                            preview_budget,
+                            &summary,
+                            &latest_frame,
+                            &frame_tx,
+                        ),
                         ControlCommand::SetPreviewBudget { particle_budget } => {
                             preview_budget = particle_budget.max(1);
                             summary.write().preview_particle_budget = preview_budget;
-                            if let Err(error) = publish_frame(
+                            publish_frame(
                                 &mut backend,
                                 preview_budget,
                                 &summary,
                                 &latest_frame,
                                 &frame_tx,
-                            ) {
-                                error!("session {id} failed to refresh preview budget: {error:#}");
-                            }
+                            )
                         }
                     },
+                };
+
+                match result {
+                    Ok(()) => {
+                        if let Some(ack) = ack {
+                            let _ = ack.send(Ok(summary.read().clone()));
+                        }
+                    }
+                    Err(error) => {
+                        error!("session {id} command failed: {error:#}");
+                        summary.write().state = SessionState::Failed;
+                        if let Some(ack) = ack {
+                            let _ = ack.send(Err(error));
+                        }
+                        return;
+                    }
                 }
             }
         }

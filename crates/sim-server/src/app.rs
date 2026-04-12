@@ -136,20 +136,24 @@ async fn pause_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<SessionSummary>, AppError> {
-    state.sessions.command(id, SessionCommand::Pause)?;
-    Ok(Json(state.sessions.get(id).ok_or_else(|| {
-        AppError::NotFound(format!("unknown session `{id}`"))
-    })?))
+    Ok(Json(
+        state
+            .sessions
+            .command_wait(id, SessionCommand::Pause)
+            .await?,
+    ))
 }
 
 async fn resume_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<SessionSummary>, AppError> {
-    state.sessions.command(id, SessionCommand::Resume)?;
-    Ok(Json(state.sessions.get(id).ok_or_else(|| {
-        AppError::NotFound(format!("unknown session `{id}`"))
-    })?))
+    Ok(Json(
+        state
+            .sessions
+            .command_wait(id, SessionCommand::Resume)
+            .await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,22 +166,24 @@ async fn step_session(
     Path(id): Path<Uuid>,
     Json(request): Json<StepRequest>,
 ) -> Result<Json<SessionSummary>, AppError> {
-    state
-        .sessions
-        .command(id, SessionCommand::Step(request.substeps.unwrap_or(1)))?;
-    Ok(Json(state.sessions.get(id).ok_or_else(|| {
-        AppError::NotFound(format!("unknown session `{id}`"))
-    })?))
+    Ok(Json(
+        state
+            .sessions
+            .command_wait(id, SessionCommand::Step(request.substeps.unwrap_or(1)))
+            .await?,
+    ))
 }
 
 async fn snapshot_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<SessionSummary>, AppError> {
-    state.sessions.command(id, SessionCommand::Snapshot)?;
-    Ok(Json(state.sessions.get(id).ok_or_else(|| {
-        AppError::NotFound(format!("unknown session `{id}`"))
-    })?))
+    Ok(Json(
+        state
+            .sessions
+            .command_wait(id, SessionCommand::Snapshot)
+            .await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]

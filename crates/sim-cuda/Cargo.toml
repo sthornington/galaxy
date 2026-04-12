@@ -8,5 +8,8 @@ license.workspace = true
 anyhow.workspace = true
 sim-core = { path = "../sim-core" }
 
+[dev-dependencies]
+uuid.workspace = true
+
 [build-dependencies]
 cmake.workspace = true
