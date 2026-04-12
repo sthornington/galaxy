@@ -239,11 +239,21 @@ async fn session_task(
     let mut preview_budget = preview_budget;
     let mut running = false;
     let particle_count = initial_conditions.particles.len() as u64;
-    // Keep the browser fed with frames even for multi-million-particle presets
-    // by scaling the simulation work budget to the particle count.
+    let mesh_cells = config
+        .gravity
+        .mesh_resolution
+        .into_iter()
+        .map(u64::from)
+        .product::<u64>()
+        .max(1);
     let target_particle_updates_per_tick = 96_000_000_u64;
-    let steps_per_tick = ((target_particle_updates_per_tick / particle_count.max(1)) as u32)
-        .clamp(4, config.integration.max_substeps.saturating_mul(4).max(1));
+    let target_mesh_cells_per_tick = 12_000_000_u64;
+    let particle_limited_steps =
+        (target_particle_updates_per_tick / particle_count.max(1)).max(1);
+    let mesh_limited_steps = (target_mesh_cells_per_tick / mesh_cells).max(1);
+    let steps_per_tick = particle_limited_steps
+        .min(mesh_limited_steps)
+        .clamp(1, u64::from(config.integration.max_substeps.max(1))) as u32;
     let mut backend = match GpuBackend::new(&config, &initial_conditions) {
         Ok(backend) => backend,
         Err(error) => {

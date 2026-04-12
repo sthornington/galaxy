@@ -61,6 +61,8 @@ struct FfiCreateParams {
     galaxy_count: u32,
     grav_const_kpc_kms2_per_msun: f64,
     base_timestep_myr: f64,
+    mesh_resolution: [u32; 3],
+    enable_smbh_post_newtonian: u32,
 }
 
 unsafe extern "C" {
@@ -123,6 +125,10 @@ impl GpuBackend {
             galaxy_count: config.galaxies.len() as u32,
             grav_const_kpc_kms2_per_msun: config.gravity.grav_const_kpc_kms2_per_msun,
             base_timestep_myr: config.integration.base_timestep_myr,
+            mesh_resolution: config.gravity.mesh_resolution,
+            enable_smbh_post_newtonian: u32::from(
+                config.relativity.enable_smbh_post_newtonian,
+            ),
         };
         let ffi_particles: Vec<FfiParticle> = initial_conditions
             .particles
@@ -412,7 +418,11 @@ fn decode_error(bytes: &[i8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use sim_core::{InitialConditions, ParticleComponent, SimulationConfig, Vec3, built_in_presets};
+    use sim_core::{
+        Diagnostics, GalaxyConfig, InitialConditions, ObserverEffectsConfig, Particle,
+        ParticleComponent, PreviewConfig, RelativityConfig, SimulationConfig, SmbhConfig,
+        SnapshotConfig, TimeIntegrationConfig, Vec3, built_in_presets,
+    };
     use uuid::Uuid;
 
     use super::GpuBackend;
@@ -479,6 +489,73 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "requires NVIDIA GPU"]
+    fn self_gravity_moves_particles_without_analytic_galaxy_masses() {
+        let config = self_gravity_only_config();
+        let initial_conditions = InitialConditions {
+            seed: 11,
+            total_mass_msun: 2.0e8,
+            particles: vec![
+                Particle {
+                    galaxy_index: 0,
+                    component: ParticleComponent::Disk,
+                    position_kpc: Vec3::new(-8.0, 0.0, 0.0),
+                    velocity_kms: Vec3::ZERO,
+                    mass_msun: 1.0e8,
+                    softening_kpc: 0.2,
+                    color_rgba: [1.0, 1.0, 1.0, 1.0],
+                },
+                Particle {
+                    galaxy_index: 0,
+                    component: ParticleComponent::Disk,
+                    position_kpc: Vec3::new(8.0, 0.0, 0.0),
+                    velocity_kms: Vec3::ZERO,
+                    mass_msun: 1.0e8,
+                    softening_kpc: 0.2,
+                    color_rgba: [1.0, 1.0, 1.0, 1.0],
+                },
+                Particle {
+                    galaxy_index: 0,
+                    component: ParticleComponent::Smbh,
+                    position_kpc: Vec3::new(0.0, 0.0, 0.0),
+                    velocity_kms: Vec3::ZERO,
+                    mass_msun: 0.0,
+                    softening_kpc: 0.01,
+                    color_rgba: [1.0, 1.0, 1.0, 1.0],
+                },
+            ],
+        };
+
+        let mut backend = GpuBackend::new(&config, &initial_conditions).unwrap();
+        let Diagnostics {
+            sim_time_myr, ..
+        } = backend.advance(32).unwrap();
+        assert!(sim_time_myr > 0.0);
+
+        let particles = backend.download_particles().unwrap();
+        let left = particles
+            .iter()
+            .find(|particle| {
+                matches!(particle.component, ParticleComponent::Disk)
+                    && particle.position_kpc.x < 0.0
+            })
+            .unwrap();
+        let right = particles
+            .iter()
+            .find(|particle| {
+                matches!(particle.component, ParticleComponent::Disk)
+                    && particle.position_kpc.x > 0.0
+            })
+            .unwrap();
+
+        let final_separation = (right.position_kpc - left.position_kpc).length();
+        assert!(
+            final_separation < 16.0,
+            "self-gravity should pull the particles together, got separation {final_separation:.3}"
+        );
+    }
+
     fn mean_disk_radius(particles: &[sim_core::Particle]) -> f64 {
         let center = particles
             .iter()
@@ -509,11 +586,76 @@ mod tests {
         config.output_directory = format!("/tmp/galaxy-cuda-smoke-{}", Uuid::new_v4());
         config.snapshots.directory = config.output_directory.clone();
         config.preview.particle_budget = 64;
+        config.gravity.mesh_resolution = [64, 64, 32];
         for galaxy in &mut config.galaxies {
             galaxy.halo_particle_count = 96;
             galaxy.disk_particle_count = 48;
             galaxy.bulge_particle_count = 12;
         }
         config
+    }
+
+    fn self_gravity_only_config() -> SimulationConfig {
+        SimulationConfig {
+            name: "self-gravity-only".to_string(),
+            gravity: sim_core::GravityConfig {
+                grav_const_kpc_kms2_per_msun: 4.300_91e-6,
+                halo_softening_kpc: 0.2,
+                disk_softening_kpc: 0.2,
+                bulge_softening_kpc: 0.2,
+                opening_angle: 0.55,
+                mesh_resolution: [64, 64, 32],
+            },
+            relativity: RelativityConfig {
+                enable_weak_field_mesh: true,
+                enable_smbh_post_newtonian: true,
+                observer_effects: ObserverEffectsConfig {
+                    doppler_boosting: true,
+                    gravitational_redshift: true,
+                    weak_lensing: true,
+                    time_delay: true,
+                },
+            },
+            preview: PreviewConfig {
+                particle_budget: 16,
+                density_grid: [64, 64],
+                target_fps: 60,
+            },
+            snapshots: SnapshotConfig {
+                directory: format!("/tmp/galaxy-self-gravity-{}", Uuid::new_v4()),
+                cadence_steps: 120,
+                compress: false,
+            },
+            integration: TimeIntegrationConfig {
+                base_timestep_myr: 0.05,
+                max_substeps: 4,
+                cfl_safety_factor: 0.35,
+            },
+            galaxies: vec![GalaxyConfig {
+                label: "Test".to_string(),
+                halo_mass_msun: 0.0,
+                halo_scale_radius_kpc: 10.0,
+                halo_particle_count: 0,
+                disk_mass_msun: 0.0,
+                disk_scale_radius_kpc: 2.0,
+                disk_scale_height_kpc: 0.4,
+                disk_particle_count: 0,
+                bulge_mass_msun: 0.0,
+                bulge_scale_radius_kpc: 1.0,
+                bulge_particle_count: 0,
+                smbh: SmbhConfig {
+                    mass_msun: 0.0,
+                    softening_kpc: 0.01,
+                    substeps: 8,
+                },
+                position_kpc: [0.0, 0.0, 0.0],
+                velocity_kms: [0.0, 0.0, 0.0],
+                disk_tilt_deg: [0.0, 0.0, 0.0],
+                color_rgba: [1.0, 1.0, 1.0, 1.0],
+            }],
+            initial_separation_kpc: 0.0,
+            initial_relative_velocity_kms: 0.0,
+            output_directory: format!("/tmp/galaxy-self-gravity-{}", Uuid::new_v4()),
+        }
     }
 }

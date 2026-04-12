@@ -21,5 +21,6 @@ fn main() {
     }
     println!("cargo:rustc-link-lib=static=sim_cuda");
     println!("cargo:rustc-link-lib=cudart");
+    println!("cargo:rustc-link-lib=cufft");
     println!("cargo:rustc-link-lib=stdc++");
 }

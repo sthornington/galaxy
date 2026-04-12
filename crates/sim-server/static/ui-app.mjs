@@ -333,7 +333,69 @@ export function createUiApp({
       context.fill();
     }
     context.globalCompositeOperation = "source-over";
+    if (camera.dragging) {
+      drawXyPlaneGrid(width, height);
+    }
     drawOriginAxes(width, height);
+  }
+
+  function niceGridSpacing(target) {
+    const normalized = Math.max(target, 0.25);
+    const exponent = Math.floor(Math.log10(normalized));
+    const base = 10 ** exponent;
+    const scaled = normalized / base;
+    if (scaled <= 1) {
+      return base;
+    }
+    if (scaled <= 2) {
+      return 2 * base;
+    }
+    if (scaled <= 5) {
+      return 5 * base;
+    }
+    return 10 * base;
+  }
+
+  function drawProjectedSegment(a, b, color, width) {
+    if (!a || !b) {
+      return;
+    }
+    context.beginPath();
+    context.strokeStyle = color;
+    context.lineWidth = width;
+    context.moveTo(a.x, a.y);
+    context.lineTo(b.x, b.y);
+    context.stroke();
+  }
+
+  function drawXyPlaneGrid(width, height) {
+    const extent = Math.max(10, camera.sceneRadius * 0.9);
+    const spacing = niceGridSpacing(extent / 6);
+    const lineCount = Math.max(2, Math.min(10, Math.ceil(extent / spacing)));
+
+    context.save?.();
+    for (let i = -lineCount; i <= lineCount; i += 1) {
+      const axisOffset = i * spacing;
+      const major = i % 5 === 0;
+      const color = major
+        ? "rgba(210, 224, 245, 0.11)"
+        : "rgba(210, 224, 245, 0.055)";
+      const strokeWidth = major ? 0.9 : 0.65;
+
+      drawProjectedSegment(
+        projectPoint([axisOffset, -extent, 0], width, height),
+        projectPoint([axisOffset, extent, 0], width, height),
+        color,
+        strokeWidth
+      );
+      drawProjectedSegment(
+        projectPoint([-extent, axisOffset, 0], width, height),
+        projectPoint([extent, axisOffset, 0], width, height),
+        color,
+        strokeWidth
+      );
+    }
+    context.restore?.();
   }
 
   function drawOriginAxes(width, height) {

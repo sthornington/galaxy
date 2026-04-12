@@ -51,6 +51,8 @@ struct SimCudaCreateParams {
   std::uint32_t galaxy_count;
   double grav_const_kpc_kms2_per_msun;
   double base_timestep_myr;
+  std::uint32_t mesh_resolution[3];
+  std::uint32_t enable_smbh_post_newtonian;
 };
 
 int sim_cuda_create(const SimCudaCreateParams* params,

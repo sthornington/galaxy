@@ -611,7 +611,86 @@ mod wasm {
             context.fill();
         }
         let _ = context.set_global_composite_operation("source-over");
+        if camera.dragging {
+            draw_xy_plane_grid(context, width, height, camera);
+        }
         draw_origin_axes(context, width, height, camera);
+    }
+
+    fn nice_grid_spacing(target: f64) -> f64 {
+        let normalized = target.max(0.25);
+        let exponent = normalized.log10().floor();
+        let base = 10_f64.powf(exponent);
+        let scaled = normalized / base;
+        if scaled <= 1.0 {
+            base
+        } else if scaled <= 2.0 {
+            2.0 * base
+        } else if scaled <= 5.0 {
+            5.0 * base
+        } else {
+            10.0 * base
+        }
+    }
+
+    fn draw_projected_segment(
+        context: &CanvasRenderingContext2d,
+        start: Option<(f64, f64, f64, f64, [f64; 3])>,
+        end: Option<(f64, f64, f64, f64, [f64; 3])>,
+        color: &str,
+        width: f64,
+    ) {
+        let (Some((x0, y0, _depth0, _perspective0, _forward0)), Some((x1, y1, _depth1, _perspective1, _forward1))) =
+            (start, end)
+        else {
+            return;
+        };
+
+        context.begin_path();
+        context.set_stroke_style_str(color);
+        context.set_line_width(width);
+        context.move_to(x0, y0);
+        context.line_to(x1, y1);
+        context.stroke();
+    }
+
+    fn draw_xy_plane_grid(
+        context: &CanvasRenderingContext2d,
+        width: f64,
+        height: f64,
+        camera: &CameraState,
+    ) {
+        let extent = camera.scene_radius.max(10.0) * 0.9;
+        let spacing = nice_grid_spacing(extent / 6.0);
+        let line_count = ((extent / spacing).ceil() as i32).clamp(2, 10);
+
+        context.save();
+        for i in -line_count..=line_count {
+            let axis_offset = f64::from(i) * spacing;
+            let major = i % 5 == 0;
+            let color = if major {
+                "rgba(210, 224, 245, 0.11)"
+            } else {
+                "rgba(210, 224, 245, 0.055)"
+            };
+            let stroke_width = if major { 0.9 } else { 0.65 };
+
+            draw_projected_segment(
+                context,
+                project_point([axis_offset, -extent, 0.0], width, height, camera),
+                project_point([axis_offset, extent, 0.0], width, height, camera),
+                color,
+                stroke_width,
+            );
+            draw_projected_segment(
+                context,
+                project_point([-extent, axis_offset, 0.0], width, height, camera),
+                project_point([extent, axis_offset, 0.0], width, height, camera),
+                color,
+                stroke_width,
+            );
+        }
+        context.restore();
     }
 
     fn draw_origin_axes(

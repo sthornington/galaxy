@@ -5,7 +5,7 @@ find_package(CUDAToolkit REQUIRED)
 
 add_library(sim_cuda STATIC src/sim_cuda.cu)
 target_include_directories(sim_cuda PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(sim_cuda PUBLIC CUDA::cudart)
+target_link_libraries(sim_cuda PUBLIC CUDA::cudart CUDA::cufft)
 
 set_target_properties(
   sim_cuda

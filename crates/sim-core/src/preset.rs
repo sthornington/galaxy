@@ -22,7 +22,7 @@ fn gravity_defaults() -> GravityConfig {
         disk_softening_kpc: 0.03,
         bulge_softening_kpc: 0.02,
         opening_angle: 0.55,
-        mesh_resolution: [512, 512, 256],
+        mesh_resolution: [256, 256, 128],
     }
 }
 
