@@ -6,10 +6,15 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 #include <cuda_runtime.h>
 #include <cufft.h>
+#include <thrust/device_ptr.h>
+#include <thrust/extrema.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/transform_reduce.h>
 
 namespace {
 
@@ -86,6 +91,8 @@ struct DeviceState {
   double base_timestep_myr = 0.0;
   double sim_time_myr = 0.0;
   bool enable_smbh_post_newtonian = false;
+  std::uint32_t max_substeps = 1;
+  double cfl_safety_factor = 0.35;
 
   int nx = 0;
   int ny = 0;
@@ -523,6 +530,74 @@ bool grid_regions_overlap(const int a_min[3], const int a_max[3], const int b_mi
     }
   }
   return true;
+}
+
+struct PositionAccessor {
+  int axis = 0;
+
+  __host__ __device__ double operator()(const SimCudaParticle& particle) const {
+    return particle.position_kpc[axis];
+  }
+};
+
+struct SpeedAccessor {
+  __host__ __device__ double operator()(const SimCudaParticle& particle) const {
+    return sqrt(particle.velocity_kms[0] * particle.velocity_kms[0] +
+                particle.velocity_kms[1] * particle.velocity_kms[1] +
+                particle.velocity_kms[2] * particle.velocity_kms[2]);
+  }
+};
+
+int update_simulation_domain_from_device(DeviceState* state,
+                                         char* error_buffer,
+                                         const std::size_t error_buffer_len) {
+  try {
+    thrust::device_ptr<SimCudaParticle> begin(state->particles);
+    thrust::device_ptr<SimCudaParticle> end = begin + state->particle_count;
+    for (int axis = 0; axis < 3; ++axis) {
+      auto transformed_begin = thrust::make_transform_iterator(begin, PositionAccessor{axis});
+      auto transformed_end = thrust::make_transform_iterator(end, PositionAccessor{axis});
+      auto minmax = thrust::minmax_element(transformed_begin, transformed_end);
+      const double min_value = *minmax.first;
+      const double max_value = *minmax.second;
+      const double range = std::max(1.0, max_value - min_value);
+      const double center = 0.5 * (min_value + max_value);
+      const double padded_length = std::max(kMinGlobalBoxLengthKpc, range * kGlobalDomainPadding);
+      state->box_length[axis] = padded_length;
+      state->domain_origin[axis] = center - 0.5 * padded_length;
+    }
+    state->cell_size[0] = state->box_length[0] / static_cast<double>(state->nx);
+    state->cell_size[1] = state->box_length[1] / static_cast<double>(state->ny);
+    state->cell_size[2] = state->box_length[2] / static_cast<double>(state->nz);
+    state->cell_volume = state->cell_size[0] * state->cell_size[1] * state->cell_size[2];
+  } catch (const std::exception& error) {
+    fill_error(error_buffer, error_buffer_len, error.what());
+    return 1;
+  }
+  return 0;
+}
+
+std::uint32_t estimate_substeps_for_step(DeviceState* state,
+                                         const double dt_myr,
+                                         char* error_buffer,
+                                         const std::size_t error_buffer_len) {
+  try {
+    thrust::device_ptr<SimCudaParticle> begin(state->particles);
+    thrust::device_ptr<SimCudaParticle> end = begin + state->particle_count;
+    const double max_speed_kms =
+        thrust::transform_reduce(begin, end, SpeedAccessor{}, 0.0, thrust::maximum<double>());
+    const double min_cell = std::max(
+        1.0e-4, std::min(state->cell_size[0], std::min(state->cell_size[1], state->cell_size[2])));
+    const double allowed_displacement = state->cfl_safety_factor * min_cell;
+    const double predicted_displacement = max_speed_kms * dt_myr * kKpcPerKmPerMyr;
+    const double raw_substeps = predicted_displacement / std::max(allowed_displacement, 1.0e-6);
+    const std::uint32_t substeps = static_cast<std::uint32_t>(
+        std::clamp(std::ceil(raw_substeps), 1.0, static_cast<double>(std::max(1u, state->max_substeps))));
+    return std::max(1u, substeps);
+  } catch (const std::exception& error) {
+    fill_error(error_buffer, error_buffer_len, error.what());
+    return std::max(1u, state->max_substeps);
+  }
 }
 
 void initialize_refinement_patch_geometry(const DeviceState& state,
@@ -1667,6 +1742,106 @@ int build_local_force_mesh(DeviceState* state,
   return 0;
 }
 
+int apply_force_kick(DeviceState* state,
+                     const int particle_blocks,
+                     const int threads_per_block,
+                     const double inv_fft_cells,
+                     const double dt_myr,
+                     char* error_buffer,
+                     const std::size_t error_buffer_len) {
+  if (update_simulation_domain_from_device(state, error_buffer, error_buffer_len) != 0) {
+    return 1;
+  }
+  if (build_force_mesh(state, error_buffer, error_buffer_len) != 0) {
+    return 1;
+  }
+
+  for (auto& patch : state->refinement_patches) {
+    if (build_local_force_mesh(state, patch, error_buffer, error_buffer_len) != 0) {
+      return 1;
+    }
+  }
+
+  kick_particles_global<<<particle_blocks, threads_per_block>>>(
+      state->particles,
+      state->particle_count,
+      state->force_x,
+      state->force_y,
+      state->force_z,
+      state->nx,
+      state->ny,
+      state->nz,
+      state->domain_origin[0],
+      state->domain_origin[1],
+      state->domain_origin[2],
+      state->box_length[0],
+      state->box_length[1],
+      state->box_length[2],
+      state->cell_size[0],
+      state->cell_size[1],
+      state->cell_size[2],
+      inv_fft_cells,
+      state->galaxy_smbh_indices,
+      state->galaxy_count,
+      state->grav_const,
+      state->enable_smbh_post_newtonian ? 1 : 0,
+      dt_myr);
+  cudaError_t cuda_status = cudaGetLastError();
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "global particle kick kernel failed", cuda_status);
+    return 1;
+  }
+
+  for (const auto& patch : state->refinement_patches) {
+    if (!patch.active) {
+      continue;
+    }
+    apply_local_mesh_correction<<<particle_blocks, threads_per_block>>>(
+        state->particles,
+        state->particle_count,
+        patch.fine.force_x,
+        patch.fine.force_y,
+        patch.fine.force_z,
+        patch.fine.nx,
+        patch.fine.ny,
+        patch.fine.nz,
+        patch.domain_origin[0],
+        patch.domain_origin[1],
+        patch.domain_origin[2],
+        patch.cell_size_fine[0],
+        patch.cell_size_fine[1],
+        patch.cell_size_fine[2],
+        1.0 / static_cast<double>(patch.fine.real_count),
+        patch.coarse.force_x,
+        patch.coarse.force_y,
+        patch.coarse.force_z,
+        patch.coarse.nx,
+        patch.coarse.ny,
+        patch.coarse.nz,
+        patch.domain_origin[0],
+        patch.domain_origin[1],
+        patch.domain_origin[2],
+        patch.cell_size_coarse[0],
+        patch.cell_size_coarse[1],
+        patch.cell_size_coarse[2],
+        1.0 / static_cast<double>(patch.coarse.real_count),
+        patch.domain_origin[0] + 0.5 * patch.box_length[0],
+        patch.domain_origin[1] + 0.5 * patch.box_length[1],
+        patch.domain_origin[2] + 0.5 * patch.box_length[2],
+        0.5 * patch.box_length[0],
+        0.5 * patch.box_length[1],
+        0.5 * patch.box_length[2],
+        dt_myr);
+    cuda_status = cudaGetLastError();
+    if (cuda_status != cudaSuccess) {
+      fill_cuda_error(error_buffer, error_buffer_len, "refinement correction kernel failed", cuda_status);
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
 int run_steps(DeviceState* state,
               const std::uint32_t step_count,
               const double dt_myr,
@@ -1685,99 +1860,41 @@ int run_steps(DeviceState* state,
   const double inv_fft_cells = 1.0 / static_cast<double>(state->real_count);
 
   for (std::uint32_t step = 0; step < step_count; ++step) {
-    if (build_force_mesh(state, error_buffer, error_buffer_len) != 0) {
+    if (update_simulation_domain_from_device(state, error_buffer, error_buffer_len) != 0) {
       return 1;
     }
+    const std::uint32_t substeps =
+        estimate_substeps_for_step(state, dt_myr, error_buffer, error_buffer_len);
+    const double substep_dt_myr = dt_myr / static_cast<double>(std::max(1u, substeps));
+    const double half_substep_dt_myr = 0.5 * substep_dt_myr;
 
-    for (auto& patch : state->refinement_patches) {
-      if (build_local_force_mesh(state, patch, error_buffer, error_buffer_len) != 0) {
+    for (std::uint32_t substep = 0; substep < substeps; ++substep) {
+      if (apply_force_kick(state,
+                           particle_blocks,
+                           threads_per_block,
+                           inv_fft_cells,
+                           half_substep_dt_myr,
+                           error_buffer,
+                           error_buffer_len) != 0) {
         return 1;
       }
-    }
 
-    kick_particles_global<<<particle_blocks, threads_per_block>>>(
-        state->particles,
-        state->particle_count,
-        state->force_x,
-        state->force_y,
-        state->force_z,
-        state->nx,
-        state->ny,
-        state->nz,
-        state->domain_origin[0],
-        state->domain_origin[1],
-        state->domain_origin[2],
-        state->box_length[0],
-        state->box_length[1],
-        state->box_length[2],
-        state->cell_size[0],
-        state->cell_size[1],
-        state->cell_size[2],
-        inv_fft_cells,
-        state->galaxy_smbh_indices,
-        state->galaxy_count,
-        state->grav_const,
-        state->enable_smbh_post_newtonian ? 1 : 0,
-        dt_myr);
-
-    cudaError_t cuda_status = cudaGetLastError();
-    if (cuda_status != cudaSuccess) {
-      fill_cuda_error(error_buffer, error_buffer_len, "global particle kick kernel failed", cuda_status);
-      return 1;
-    }
-
-    for (const auto& patch : state->refinement_patches) {
-      if (!patch.active) {
-        continue;
-      }
-      apply_local_mesh_correction<<<particle_blocks, threads_per_block>>>(
-          state->particles,
-          state->particle_count,
-          patch.fine.force_x,
-          patch.fine.force_y,
-          patch.fine.force_z,
-          patch.fine.nx,
-          patch.fine.ny,
-          patch.fine.nz,
-          patch.domain_origin[0],
-          patch.domain_origin[1],
-          patch.domain_origin[2],
-          patch.cell_size_fine[0],
-          patch.cell_size_fine[1],
-          patch.cell_size_fine[2],
-          1.0 / static_cast<double>(patch.fine.real_count),
-          patch.coarse.force_x,
-          patch.coarse.force_y,
-          patch.coarse.force_z,
-          patch.coarse.nx,
-          patch.coarse.ny,
-          patch.coarse.nz,
-          patch.domain_origin[0],
-          patch.domain_origin[1],
-          patch.domain_origin[2],
-          patch.cell_size_coarse[0],
-          patch.cell_size_coarse[1],
-          patch.cell_size_coarse[2],
-          1.0 / static_cast<double>(patch.coarse.real_count),
-          patch.domain_origin[0] + 0.5 * patch.box_length[0],
-          patch.domain_origin[1] + 0.5 * patch.box_length[1],
-          patch.domain_origin[2] + 0.5 * patch.box_length[2],
-          0.5 * patch.box_length[0],
-          0.5 * patch.box_length[1],
-          0.5 * patch.box_length[2],
-          dt_myr);
-      cuda_status = cudaGetLastError();
+      drift_particles<<<particle_blocks, threads_per_block>>>(state->particles, state->particle_count, substep_dt_myr);
+      cudaError_t cuda_status = cudaGetLastError();
       if (cuda_status != cudaSuccess) {
-        fill_cuda_error(error_buffer, error_buffer_len, "local correction kernel failed", cuda_status);
+        fill_cuda_error(error_buffer, error_buffer_len, "particle drift kernel failed", cuda_status);
         return 1;
       }
-    }
 
-    drift_particles<<<particle_blocks, threads_per_block>>>(state->particles, state->particle_count, dt_myr);
-    cuda_status = cudaGetLastError();
-    if (cuda_status != cudaSuccess) {
-      fill_cuda_error(error_buffer, error_buffer_len, "particle drift kernel failed", cuda_status);
-      return 1;
+      if (apply_force_kick(state,
+                           particle_blocks,
+                           threads_per_block,
+                           inv_fft_cells,
+                           half_substep_dt_myr,
+                           error_buffer,
+                           error_buffer_len) != 0) {
+        return 1;
+      }
     }
   }
 
@@ -1821,6 +1938,8 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
   state->grav_const = params->grav_const_kpc_kms2_per_msun;
   state->base_timestep_myr = params->base_timestep_myr;
   state->enable_smbh_post_newtonian = params->enable_smbh_post_newtonian != 0;
+  state->max_substeps = std::max(1u, params->max_substeps);
+  state->cfl_safety_factor = std::max(0.05, params->cfl_safety_factor);
   state->nx = static_cast<int>(params->mesh_resolution[0]);
   state->ny = static_cast<int>(params->mesh_resolution[1]);
   state->nz = static_cast<int>(params->mesh_resolution[2]);

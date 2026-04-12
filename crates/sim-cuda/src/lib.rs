@@ -61,6 +61,8 @@ struct FfiCreateParams {
     galaxy_count: u32,
     grav_const_kpc_kms2_per_msun: f64,
     base_timestep_myr: f64,
+    max_substeps: u32,
+    cfl_safety_factor: f64,
     mesh_resolution: [u32; 3],
     enable_smbh_post_newtonian: u32,
 }
@@ -125,6 +127,8 @@ impl GpuBackend {
             galaxy_count: config.galaxies.len() as u32,
             grav_const_kpc_kms2_per_msun: config.gravity.grav_const_kpc_kms2_per_msun,
             base_timestep_myr: config.integration.base_timestep_myr,
+            max_substeps: config.integration.max_substeps,
+            cfl_safety_factor: config.integration.cfl_safety_factor,
             mesh_resolution: config.gravity.mesh_resolution,
             enable_smbh_post_newtonian: u32::from(
                 config.relativity.enable_smbh_post_newtonian,
