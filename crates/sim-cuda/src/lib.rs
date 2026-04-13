@@ -90,6 +90,22 @@ unsafe extern "C" {
         error_buffer: *mut i8,
         error_buffer_len: usize,
     ) -> i32;
+    fn sim_cuda_request_preview(
+        handle: *mut c_void,
+        max_particles: u32,
+        out_count: *mut u32,
+        error_buffer: *mut i8,
+        error_buffer_len: usize,
+    ) -> i32;
+    fn sim_cuda_collect_preview(
+        handle: *mut c_void,
+        out_particles: *mut FfiPreviewParticle,
+        particle_capacity: u32,
+        out_count: *mut u32,
+        out_ready: *mut i32,
+        error_buffer: *mut i8,
+        error_buffer_len: usize,
+    ) -> i32;
     fn sim_cuda_copy_particles(
         handle: *mut c_void,
         out_particles: *mut FfiParticle,
@@ -105,6 +121,7 @@ pub struct GpuBackend {
     last_diagnostics: Diagnostics,
     preview_scratch: Vec<FfiPreviewParticle>,
     preview_packet_scratch: Vec<u8>,
+    pending_preview_diagnostics: Option<Diagnostics>,
 }
 
 unsafe impl Send for GpuBackend {}
@@ -164,6 +181,7 @@ impl GpuBackend {
             },
             preview_scratch: Vec::new(),
             preview_packet_scratch: Vec::new(),
+            pending_preview_diagnostics: None,
         })
     }
 
@@ -210,6 +228,7 @@ impl GpuBackend {
     }
 
     fn fill_preview_scratch(&mut self, budget: u32) -> anyhow::Result<u32> {
+        self.pending_preview_diagnostics = None;
         let max_particles = budget.min(self.particle_count.min(u64::from(u32::MAX)) as u32);
         self.preview_scratch.resize(
             max_particles as usize,
@@ -237,6 +256,85 @@ impl GpuBackend {
         }
 
         Ok(out_count)
+    }
+
+    pub fn request_preview(&mut self, budget: u32) -> anyhow::Result<Diagnostics> {
+        let max_particles = budget.min(self.particle_count.min(u64::from(u32::MAX)) as u32);
+        self.preview_scratch.resize(
+            max_particles as usize,
+            FfiPreviewParticle {
+                position_kpc: [0.0; 3],
+                velocity_kms: [0.0; 3],
+                mass_msun: 0.0,
+                component: 0,
+            },
+        );
+
+        let mut out_count = 0_u32;
+        let mut error_buffer = [0_i8; 512];
+        let code = unsafe {
+            sim_cuda_request_preview(
+                self.handle,
+                max_particles,
+                &mut out_count,
+                error_buffer.as_mut_ptr(),
+                error_buffer.len(),
+            )
+        };
+        if code != 0 {
+            return Err(anyhow!(decode_error(&error_buffer)))
+                .context("async preview request failed");
+        }
+
+        let diagnostics = Diagnostics {
+            preview_count: out_count,
+            ..self.last_diagnostics.clone()
+        };
+        self.pending_preview_diagnostics = Some(diagnostics.clone());
+        Ok(diagnostics)
+    }
+
+    pub fn try_collect_preview_packet_bytes(
+        &mut self,
+    ) -> anyhow::Result<Option<(Vec<u8>, Diagnostics)>> {
+        let Some(diagnostics) = self.pending_preview_diagnostics.clone() else {
+            return Ok(None);
+        };
+
+        let capacity = self.preview_scratch.len() as u32;
+        let mut out_count = 0_u32;
+        let mut ready = 0_i32;
+        let mut error_buffer = [0_i8; 512];
+        let code = unsafe {
+            sim_cuda_collect_preview(
+                self.handle,
+                self.preview_scratch.as_mut_ptr(),
+                capacity,
+                &mut out_count,
+                &mut ready,
+                error_buffer.as_mut_ptr(),
+                error_buffer.len(),
+            )
+        };
+        if code != 0 {
+            return Err(anyhow!(decode_error(&error_buffer)))
+                .context("async preview collection failed");
+        }
+        if ready == 0 {
+            return Ok(None);
+        }
+
+        let diagnostics = Diagnostics {
+            preview_count: out_count,
+            ..diagnostics
+        };
+        encode_preview_packet_into(
+            &mut self.preview_packet_scratch,
+            &diagnostics,
+            &self.preview_scratch[..out_count as usize],
+        );
+        self.pending_preview_diagnostics = None;
+        Ok(Some((self.preview_packet_scratch.clone(), diagnostics)))
     }
 
     pub fn preview_packet_bytes(&mut self, budget: u32) -> anyhow::Result<(Vec<u8>, Diagnostics)> {

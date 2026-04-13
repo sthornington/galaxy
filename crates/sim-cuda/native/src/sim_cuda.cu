@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <cufft.h>
 #include <thrust/device_ptr.h>
+#include <thrust/system/cuda/execution_policy.h>
 #include <thrust/extrema.h>
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/sort.h>
@@ -295,10 +296,25 @@ struct DeviceState {
 
   cufftHandle forward_plan = 0;
   cufftHandle inverse_plan = 0;
+  cudaStream_t compute_stream = nullptr;
+  cudaStream_t preview_stream = nullptr;
+  cudaEvent_t preview_sample_event = nullptr;
+  cudaEvent_t preview_copy_done_event = nullptr;
 
   SimCudaPreviewParticle* preview_particles = nullptr;
+  SimCudaPreviewParticle* preview_host_particles = nullptr;
   std::uint32_t preview_capacity = 0;
+  std::uint32_t preview_in_flight_count = 0;
+  bool preview_in_flight = false;
 };
+
+__global__ void sample_preview(const SimCudaParticle* particles,
+                               const std::uint64_t particle_count,
+                               const int* anchor_indices,
+                               const std::uint32_t anchor_count,
+                               const std::uint32_t sampled_count,
+                               const std::uint64_t stride,
+                               SimCudaPreviewParticle* out_particles);
 
 const char* cufft_error_string(const cufftResult status) {
   switch (status) {
@@ -463,6 +479,18 @@ void destroy_state(DeviceState* state) {
     destroy_mesh_buffers(patch.fine);
     destroy_mesh_buffers(patch.coarse);
   }
+  if (state->preview_copy_done_event != nullptr) {
+    cudaEventDestroy(state->preview_copy_done_event);
+  }
+  if (state->preview_sample_event != nullptr) {
+    cudaEventDestroy(state->preview_sample_event);
+  }
+  if (state->preview_stream != nullptr) {
+    cudaStreamDestroy(state->preview_stream);
+  }
+  if (state->compute_stream != nullptr) {
+    cudaStreamDestroy(state->compute_stream);
+  }
   if (state->forward_plan != 0) {
     cufftDestroy(state->forward_plan);
   }
@@ -484,6 +512,7 @@ void destroy_state(DeviceState* state) {
   cudaFree(state->short_sorted_particle_indices);
   cudaFree(state->short_sorted_cell_ids);
   cudaFree(state->short_source_particle_indices);
+  cudaFreeHost(state->preview_host_particles);
   cudaFree(state->preview_particles);
   cudaFree(state->force_z);
   cudaFree(state->force_y);
@@ -521,10 +550,16 @@ int ensure_preview_capacity(DeviceState* state,
   if (state->preview_particles != nullptr) {
     cudaFree(state->preview_particles);
     state->preview_particles = nullptr;
-    state->preview_capacity = 0;
   }
+  if (state->preview_host_particles != nullptr) {
+    cudaFreeHost(state->preview_host_particles);
+    state->preview_host_particles = nullptr;
+  }
+  state->preview_capacity = 0;
+  state->preview_in_flight = false;
+  state->preview_in_flight_count = 0;
 
-  const cudaError_t cuda_status = cudaMalloc(
+  cudaError_t cuda_status = cudaMalloc(
       reinterpret_cast<void**>(&state->preview_particles),
       sizeof(SimCudaPreviewParticle) * count);
   if (cuda_status != cudaSuccess) {
@@ -532,8 +567,123 @@ int ensure_preview_capacity(DeviceState* state,
         error_buffer, error_buffer_len, "cudaMalloc for preview buffer failed", cuda_status);
     return 1;
   }
+  cuda_status = cudaMallocHost(
+      reinterpret_cast<void**>(&state->preview_host_particles),
+      sizeof(SimCudaPreviewParticle) * count);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(
+        error_buffer, error_buffer_len, "cudaMallocHost for preview buffer failed", cuda_status);
+    cudaFree(state->preview_particles);
+    state->preview_particles = nullptr;
+    return 1;
+  }
 
   state->preview_capacity = count;
+  return 0;
+}
+
+int wait_for_in_flight_preview(DeviceState* state,
+                               char* error_buffer,
+                               const std::size_t error_buffer_len) {
+  if (!state->preview_in_flight) {
+    return 0;
+  }
+
+  const cudaError_t cuda_status = cudaEventSynchronize(state->preview_copy_done_event);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(
+        error_buffer, error_buffer_len, "preview synchronization failed", cuda_status);
+    return 1;
+  }
+
+  state->preview_in_flight = false;
+  state->preview_in_flight_count = 0;
+  return 0;
+}
+
+int schedule_preview_capture(DeviceState* state,
+                             const std::uint32_t max_particles,
+                             std::uint32_t* out_count,
+                             char* error_buffer,
+                             const std::size_t error_buffer_len) {
+  if (state->particle_count == 0 || max_particles == 0) {
+    if (out_count != nullptr) {
+      *out_count = 0;
+    }
+    state->preview_in_flight = false;
+    state->preview_in_flight_count = 0;
+    return 0;
+  }
+
+  if (state->preview_in_flight) {
+    fill_error(error_buffer, error_buffer_len, "preview capture already in flight");
+    return 1;
+  }
+
+  const std::uint32_t count = std::min<std::uint32_t>(
+      max_particles,
+      static_cast<std::uint32_t>(std::min<std::uint64_t>(
+          state->particle_count,
+          static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))));
+  if (ensure_preview_capacity(state, count, error_buffer, error_buffer_len) != 0) {
+    return 1;
+  }
+
+  const std::uint32_t anchor_count =
+      std::min<std::uint32_t>(count, static_cast<std::uint32_t>(state->galaxy_smbh_indices_host.size()));
+  const std::uint32_t sampled_count = count - anchor_count;
+  const std::uint64_t stride =
+      std::max<std::uint64_t>(1, state->particle_count / std::max<std::uint32_t>(1, sampled_count));
+  const int threads_per_block = 256;
+  const int blocks = static_cast<int>((count + threads_per_block - 1) / threads_per_block);
+
+  sample_preview<<<blocks, threads_per_block, 0, state->compute_stream>>>(
+      state->particles,
+      state->particle_count,
+      state->galaxy_smbh_indices,
+      anchor_count,
+      sampled_count,
+      stride,
+      state->preview_particles);
+  cudaError_t cuda_status = cudaGetLastError();
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "preview kernel launch failed", cuda_status);
+    return 1;
+  }
+
+  cuda_status = cudaEventRecord(state->preview_sample_event, state->compute_stream);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "preview sample event record failed", cuda_status);
+    return 1;
+  }
+
+  cuda_status = cudaStreamWaitEvent(state->preview_stream, state->preview_sample_event, 0);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "preview stream wait failed", cuda_status);
+    return 1;
+  }
+
+  cuda_status = cudaMemcpyAsync(state->preview_host_particles,
+                                state->preview_particles,
+                                sizeof(SimCudaPreviewParticle) * count,
+                                cudaMemcpyDeviceToHost,
+                                state->preview_stream);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "preview async download failed", cuda_status);
+    return 1;
+  }
+
+  cuda_status = cudaEventRecord(state->preview_copy_done_event, state->preview_stream);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "preview copy event record failed", cuda_status);
+    return 1;
+  }
+
+  state->preview_in_flight = true;
+  state->preview_in_flight_count = count;
+  if (out_count != nullptr) {
+    *out_count = count;
+  }
   return 0;
 }
 
@@ -806,7 +956,12 @@ int update_simulation_domain_from_device(DeviceState* state,
     thrust::device_ptr<SimCudaParticle> begin(state->particles);
     thrust::device_ptr<SimCudaParticle> end = begin + state->particle_count;
     const DomainBounds bounds = thrust::transform_reduce(
-        begin, end, DomainBoundsAccessor{}, empty_domain_bounds(), MergeDomainBounds{});
+        thrust::cuda::par.on(state->compute_stream),
+        begin,
+        end,
+        DomainBoundsAccessor{},
+        empty_domain_bounds(),
+        MergeDomainBounds{});
     for (int axis = 0; axis < 3; ++axis) {
       const double min_value = bounds.min_pos[axis];
       const double max_value = bounds.max_pos[axis];
@@ -1205,10 +1360,15 @@ int build_short_range_tree(DeviceState* state,
 
   if (state->short_source_particle_count <= particle_tree_threshold()) {
     state->particles_host.resize(state->particle_count);
-    const cudaError_t particle_status = cudaMemcpy(state->particles_host.data(),
-                                                   state->particles,
-                                                   sizeof(SimCudaParticle) * state->particle_count,
-                                                   cudaMemcpyDeviceToHost);
+    cudaError_t particle_status =
+        cudaMemcpyAsync(state->particles_host.data(),
+                        state->particles,
+                        sizeof(SimCudaParticle) * state->particle_count,
+                        cudaMemcpyDeviceToHost,
+                        state->compute_stream);
+    if (particle_status == cudaSuccess) {
+      particle_status = cudaStreamSynchronize(state->compute_stream);
+    }
     if (particle_status != cudaSuccess) {
       fill_cuda_error(error_buffer,
                       error_buffer_len,
@@ -1279,10 +1439,12 @@ int build_short_range_tree(DeviceState* state,
                                         error_buffer_len) != 0) {
       return 1;
     }
-    const cudaError_t cuda_status = cudaMemcpy(state->short_tree_nodes,
-                                               state->short_tree_host.data(),
-                                               sizeof(ShortRangeTreeNode) * state->short_tree_node_count,
-                                               cudaMemcpyHostToDevice);
+    const cudaError_t cuda_status =
+        cudaMemcpyAsync(state->short_tree_nodes,
+                        state->short_tree_host.data(),
+                        sizeof(ShortRangeTreeNode) * state->short_tree_node_count,
+                        cudaMemcpyHostToDevice,
+                        state->compute_stream);
     if (cuda_status != cudaSuccess) {
       fill_cuda_error(error_buffer, error_buffer_len, "short-range particle tree upload failed", cuda_status);
       return 1;
@@ -1295,36 +1457,45 @@ int build_short_range_tree(DeviceState* state,
   state->short_cell_com_y_host.resize(state->short_cell_count);
   state->short_cell_com_z_host.resize(state->short_cell_count);
 
-  cudaError_t cuda_status = cudaMemcpy(state->short_cell_mass_host.data(),
-                                       state->short_cell_mass,
-                                       sizeof(double) * state->short_cell_count,
-                                       cudaMemcpyDeviceToHost);
+  cudaError_t cuda_status = cudaMemcpyAsync(state->short_cell_mass_host.data(),
+                                            state->short_cell_mass,
+                                            sizeof(double) * state->short_cell_count,
+                                            cudaMemcpyDeviceToHost,
+                                            state->compute_stream);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer, error_buffer_len, "short-range mass download failed", cuda_status);
     return 1;
   }
-  cuda_status = cudaMemcpy(state->short_cell_com_x_host.data(),
-                           state->short_cell_com_x,
-                           sizeof(double) * state->short_cell_count,
-                           cudaMemcpyDeviceToHost);
+  cuda_status = cudaMemcpyAsync(state->short_cell_com_x_host.data(),
+                                state->short_cell_com_x,
+                                sizeof(double) * state->short_cell_count,
+                                cudaMemcpyDeviceToHost,
+                                state->compute_stream);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer, error_buffer_len, "short-range com_x download failed", cuda_status);
     return 1;
   }
-  cuda_status = cudaMemcpy(state->short_cell_com_y_host.data(),
-                           state->short_cell_com_y,
-                           sizeof(double) * state->short_cell_count,
-                           cudaMemcpyDeviceToHost);
+  cuda_status = cudaMemcpyAsync(state->short_cell_com_y_host.data(),
+                                state->short_cell_com_y,
+                                sizeof(double) * state->short_cell_count,
+                                cudaMemcpyDeviceToHost,
+                                state->compute_stream);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer, error_buffer_len, "short-range com_y download failed", cuda_status);
     return 1;
   }
-  cuda_status = cudaMemcpy(state->short_cell_com_z_host.data(),
-                           state->short_cell_com_z,
-                           sizeof(double) * state->short_cell_count,
-                           cudaMemcpyDeviceToHost);
+  cuda_status = cudaMemcpyAsync(state->short_cell_com_z_host.data(),
+                                state->short_cell_com_z,
+                                sizeof(double) * state->short_cell_count,
+                                cudaMemcpyDeviceToHost,
+                                state->compute_stream);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer, error_buffer_len, "short-range com_z download failed", cuda_status);
+    return 1;
+  }
+  cuda_status = cudaStreamSynchronize(state->compute_stream);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "short-range cell download sync failed", cuda_status);
     return 1;
   }
 
@@ -1393,10 +1564,11 @@ int build_short_range_tree(DeviceState* state,
                                       error_buffer_len) != 0) {
     return 1;
   }
-  cuda_status = cudaMemcpy(state->short_tree_nodes,
-                           state->short_tree_host.data(),
-                           sizeof(ShortRangeTreeNode) * state->short_tree_node_count,
-                           cudaMemcpyHostToDevice);
+  cuda_status = cudaMemcpyAsync(state->short_tree_nodes,
+                                state->short_tree_host.data(),
+                                sizeof(ShortRangeTreeNode) * state->short_tree_node_count,
+                                cudaMemcpyHostToDevice,
+                                state->compute_stream);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer, error_buffer_len, "short-range tree upload failed", cuda_status);
     return 1;
@@ -1533,10 +1705,11 @@ int update_short_range_grid(DeviceState* state,
   }
 
   const cudaError_t lut_copy_status =
-      cudaMemcpy(state->short_force_factor_lut,
-                 state->short_force_factor_lut_host.data(),
-                 sizeof(float) * kShortRangeForceFactorLutSize,
-                 cudaMemcpyHostToDevice);
+      cudaMemcpyAsync(state->short_force_factor_lut,
+                      state->short_force_factor_lut_host.data(),
+                      sizeof(float) * kShortRangeForceFactorLutSize,
+                      cudaMemcpyHostToDevice,
+                      state->compute_stream);
   if (lut_copy_status != cudaSuccess) {
     fill_cuda_error(
         error_buffer, error_buffer_len, "short-range factor LUT upload failed", lut_copy_status);
@@ -1552,8 +1725,13 @@ std::uint32_t estimate_substeps_for_step(DeviceState* state,
   try {
     thrust::device_ptr<SimCudaParticle> begin(state->particles);
     thrust::device_ptr<SimCudaParticle> end = begin + state->particle_count;
-    const double max_speed_kms =
-        thrust::transform_reduce(begin, end, SpeedAccessor{}, 0.0, thrust::maximum<double>());
+    const double max_speed_kms = thrust::transform_reduce(
+        thrust::cuda::par.on(state->compute_stream),
+        begin,
+        end,
+        SpeedAccessor{},
+        0.0,
+        thrust::maximum<double>());
     const double min_global_cell = std::max(
         1.0e-4, std::min(state->cell_size[0], std::min(state->cell_size[1], state->cell_size[2])));
     double integration_scale = min_global_cell;
@@ -2867,16 +3045,23 @@ __global__ void drift_particles(SimCudaParticle* particles,
 
 __global__ void sample_preview(const SimCudaParticle* particles,
                                const std::uint64_t particle_count,
-                               const std::uint32_t preview_count,
+                               const int* anchor_indices,
+                               const std::uint32_t anchor_count,
+                               const std::uint32_t sampled_count,
                                const std::uint64_t stride,
                                SimCudaPreviewParticle* out_particles) {
+  const std::uint32_t preview_count = anchor_count + sampled_count;
   const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index >= preview_count) {
     return;
   }
 
-  const std::uint64_t source_index =
-      min(static_cast<std::uint64_t>(index) * stride, particle_count - 1);
+  std::uint64_t source_index = 0;
+  if (index < anchor_count) {
+    source_index = static_cast<std::uint64_t>(anchor_indices[index] < 0 ? 0 : anchor_indices[index]);
+  } else {
+    source_index = min(static_cast<std::uint64_t>(index - anchor_count) * stride, particle_count - 1);
+  }
   const SimCudaParticle& particle = particles[source_index];
   out_particles[index].position_kpc[0] = static_cast<float>(particle.position_kpc[0]);
   out_particles[index].position_kpc[1] = static_cast<float>(particle.position_kpc[1]);
@@ -2903,7 +3088,10 @@ SimCudaPreviewParticle preview_particle_from_host_particle(const SimCudaParticle
 
 int build_force_mesh(DeviceState* state, char* error_buffer, const std::size_t error_buffer_len) {
   const cudaError_t clear_status =
-      cudaMemset(state->density_grid, 0, sizeof(cufftReal) * state->real_count);
+      cudaMemsetAsync(state->density_grid,
+                      0,
+                      sizeof(cufftReal) * state->real_count,
+                      state->compute_stream);
   if (clear_status != cudaSuccess) {
     fill_cuda_error(error_buffer, error_buffer_len, "density grid clear failed", clear_status);
     return 1;
@@ -2912,7 +3100,7 @@ int build_force_mesh(DeviceState* state, char* error_buffer, const std::size_t e
   const int threads_per_block = 256;
   const int particle_blocks =
       static_cast<int>((state->particle_count + threads_per_block - 1) / threads_per_block);
-  deposit_mass_cic<<<particle_blocks, threads_per_block>>>(
+  deposit_mass_cic<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
       state->particles,
       state->particle_count,
       state->density_grid,
@@ -2944,7 +3132,7 @@ int build_force_mesh(DeviceState* state, char* error_buffer, const std::size_t e
 
   const int complex_blocks =
       static_cast<int>((state->complex_count + threads_per_block - 1) / threads_per_block);
-  apply_potential_spectrum<<<complex_blocks, threads_per_block>>>(
+  apply_potential_spectrum<<<complex_blocks, threads_per_block, 0, state->compute_stream>>>(
       state->density_k,
       state->force_k,
       state->nx,
@@ -2975,7 +3163,7 @@ int build_force_mesh(DeviceState* state, char* error_buffer, const std::size_t e
 
   const int real_blocks =
       static_cast<int>((state->real_count + threads_per_block - 1) / threads_per_block);
-  compute_force_from_potential<<<real_blocks, threads_per_block>>>(
+  compute_force_from_potential<<<real_blocks, threads_per_block, 0, state->compute_stream>>>(
       state->density_grid,
       state->force_x,
       state->force_y,
@@ -3024,8 +3212,10 @@ int build_short_range_structure(DeviceState* state,
   const int particle_blocks =
       static_cast<int>((state->short_source_particle_count + threads_per_block - 1) / threads_per_block);
   auto stage_start = std::chrono::steady_clock::now();
-  cudaError_t cuda_status =
-      cudaMemset(state->short_cell_start, 0xff, sizeof(int) * (state->short_cell_count + 1));
+  cudaError_t cuda_status = cudaMemsetAsync(state->short_cell_start,
+                                            0xff,
+                                            sizeof(int) * (state->short_cell_count + 1),
+                                            state->compute_stream);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer,
                     error_buffer_len,
@@ -3033,7 +3223,10 @@ int build_short_range_structure(DeviceState* state,
                     cuda_status);
     return 1;
   }
-  cuda_status = cudaMemset(state->short_cell_end, 0xff, sizeof(int) * (state->short_cell_count + 1));
+  cuda_status = cudaMemsetAsync(state->short_cell_end,
+                                0xff,
+                                sizeof(int) * (state->short_cell_count + 1),
+                                state->compute_stream);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer,
                     error_buffer_len,
@@ -3041,7 +3234,10 @@ int build_short_range_structure(DeviceState* state,
                     cuda_status);
     return 1;
   }
-  cuda_status = cudaMemset(state->short_cell_mass, 0, sizeof(double) * state->short_cell_count);
+  cuda_status = cudaMemsetAsync(state->short_cell_mass,
+                                0,
+                                sizeof(double) * state->short_cell_count,
+                                state->compute_stream);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer,
                     error_buffer_len,
@@ -3049,7 +3245,10 @@ int build_short_range_structure(DeviceState* state,
                     cuda_status);
     return 1;
   }
-  cuda_status = cudaMemset(state->short_cell_com_x, 0, sizeof(double) * state->short_cell_count);
+  cuda_status = cudaMemsetAsync(state->short_cell_com_x,
+                                0,
+                                sizeof(double) * state->short_cell_count,
+                                state->compute_stream);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer,
                     error_buffer_len,
@@ -3057,7 +3256,10 @@ int build_short_range_structure(DeviceState* state,
                     cuda_status);
     return 1;
   }
-  cuda_status = cudaMemset(state->short_cell_com_y, 0, sizeof(double) * state->short_cell_count);
+  cuda_status = cudaMemsetAsync(state->short_cell_com_y,
+                                0,
+                                sizeof(double) * state->short_cell_count,
+                                state->compute_stream);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer,
                     error_buffer_len,
@@ -3065,7 +3267,10 @@ int build_short_range_structure(DeviceState* state,
                     cuda_status);
     return 1;
   }
-  cuda_status = cudaMemset(state->short_cell_com_z, 0, sizeof(double) * state->short_cell_count);
+  cuda_status = cudaMemsetAsync(state->short_cell_com_z,
+                                0,
+                                sizeof(double) * state->short_cell_count,
+                                state->compute_stream);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer,
                     error_buffer_len,
@@ -3073,7 +3278,10 @@ int build_short_range_structure(DeviceState* state,
                     cuda_status);
     return 1;
   }
-  cuda_status = cudaMemset(state->short_cell_octant_mass, 0, sizeof(double) * state->short_cell_count * 8u);
+  cuda_status = cudaMemsetAsync(state->short_cell_octant_mass,
+                                0,
+                                sizeof(double) * state->short_cell_count * 8u,
+                                state->compute_stream);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer,
                     error_buffer_len,
@@ -3081,7 +3289,10 @@ int build_short_range_structure(DeviceState* state,
                     cuda_status);
     return 1;
   }
-  cuda_status = cudaMemset(state->short_cell_octant_com_x, 0, sizeof(double) * state->short_cell_count * 8u);
+  cuda_status = cudaMemsetAsync(state->short_cell_octant_com_x,
+                                0,
+                                sizeof(double) * state->short_cell_count * 8u,
+                                state->compute_stream);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer,
                     error_buffer_len,
@@ -3089,7 +3300,10 @@ int build_short_range_structure(DeviceState* state,
                     cuda_status);
     return 1;
   }
-  cuda_status = cudaMemset(state->short_cell_octant_com_y, 0, sizeof(double) * state->short_cell_count * 8u);
+  cuda_status = cudaMemsetAsync(state->short_cell_octant_com_y,
+                                0,
+                                sizeof(double) * state->short_cell_count * 8u,
+                                state->compute_stream);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer,
                     error_buffer_len,
@@ -3097,7 +3311,10 @@ int build_short_range_structure(DeviceState* state,
                     cuda_status);
     return 1;
   }
-  cuda_status = cudaMemset(state->short_cell_octant_com_z, 0, sizeof(double) * state->short_cell_count * 8u);
+  cuda_status = cudaMemsetAsync(state->short_cell_octant_com_z,
+                                0,
+                                sizeof(double) * state->short_cell_count * 8u,
+                                state->compute_stream);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer,
                     error_buffer_len,
@@ -3110,7 +3327,7 @@ int build_short_range_structure(DeviceState* state,
   }
 
   stage_start = std::chrono::steady_clock::now();
-  compute_short_range_cells<<<particle_blocks, threads_per_block>>>(
+  compute_short_range_cells<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
       state->particles,
       state->short_source_particle_indices,
       state->short_source_particle_count,
@@ -3143,7 +3360,8 @@ int build_short_range_structure(DeviceState* state,
     thrust::device_ptr<int> key_begin(state->short_sorted_cell_ids);
     thrust::device_ptr<int> key_end = key_begin + state->short_source_particle_count;
     thrust::device_ptr<int> value_begin(state->short_sorted_particle_indices);
-    thrust::sort_by_key(key_begin, key_end, value_begin);
+    thrust::sort_by_key(
+        thrust::cuda::par.on(state->compute_stream), key_begin, key_end, value_begin);
     if (finish_stage("short_range.sort_by_cell", stage_start) != 0) {
       return 1;
     }
@@ -3153,7 +3371,7 @@ int build_short_range_structure(DeviceState* state,
   }
 
   stage_start = std::chrono::steady_clock::now();
-  build_short_range_cell_ranges<<<particle_blocks, threads_per_block>>>(
+  build_short_range_cell_ranges<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
       state->short_sorted_cell_ids,
       state->short_source_particle_count,
       state->short_cell_start,
@@ -3166,7 +3384,7 @@ int build_short_range_structure(DeviceState* state,
 
   const int cell_blocks =
       static_cast<int>((state->short_cell_count + threads_per_block - 1) / threads_per_block);
-  normalize_short_range_cell_moments<<<cell_blocks, threads_per_block>>>(
+  normalize_short_range_cell_moments<<<cell_blocks, threads_per_block, 0, state->compute_stream>>>(
       state->short_cell_count,
       state->short_cell_mass,
       state->short_cell_com_x,
@@ -3182,7 +3400,7 @@ int build_short_range_structure(DeviceState* state,
   }
 
   stage_start = std::chrono::steady_clock::now();
-  build_short_range_cell_octant_moments<<<particle_blocks, threads_per_block>>>(
+  build_short_range_cell_octant_moments<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
       state->particles,
       state->short_sorted_cell_ids,
       state->short_sorted_particle_indices,
@@ -3233,13 +3451,14 @@ int build_local_force_mesh(DeviceState* state,
       static_cast<int>((state->particle_count + threads_per_block - 1) / threads_per_block);
 
   auto build_mesh = [&](MeshBuffers& mesh, const double cell_size[3]) -> int {
-    cudaError_t cuda_status = cudaMemset(mesh.density_grid, 0, sizeof(cufftReal) * mesh.real_count);
+    cudaError_t cuda_status = cudaMemsetAsync(
+        mesh.density_grid, 0, sizeof(cufftReal) * mesh.real_count, state->compute_stream);
     if (cuda_status != cudaSuccess) {
       fill_cuda_error(error_buffer, error_buffer_len, "local density grid clear failed", cuda_status);
       return 1;
     }
 
-    deposit_mass_cic_local<<<particle_blocks, threads_per_block>>>(
+    deposit_mass_cic_local<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
         state->particles,
         state->particle_count,
         mesh.density_grid,
@@ -3267,7 +3486,7 @@ int build_local_force_mesh(DeviceState* state,
 
     const int complex_blocks =
         static_cast<int>((mesh.complex_count + threads_per_block - 1) / threads_per_block);
-    apply_potential_spectrum<<<complex_blocks, threads_per_block>>>(
+    apply_potential_spectrum<<<complex_blocks, threads_per_block, 0, state->compute_stream>>>(
         mesh.density_k,
         mesh.force_k,
         mesh.nx,
@@ -3296,7 +3515,7 @@ int build_local_force_mesh(DeviceState* state,
 
     const int real_blocks =
         static_cast<int>((mesh.real_count + threads_per_block - 1) / threads_per_block);
-    compute_force_from_potential_clamped<<<real_blocks, threads_per_block>>>(
+    compute_force_from_potential_clamped<<<real_blocks, threads_per_block, 0, state->compute_stream>>>(
         mesh.density_grid,
         mesh.force_x,
         mesh.force_y,
@@ -3390,7 +3609,7 @@ int apply_force_kick_from_state(DeviceState* state,
                                 const double dt_myr,
                                 char* error_buffer,
                                 const std::size_t error_buffer_len) {
-  kick_particles_global<<<particle_blocks, threads_per_block>>>(
+  kick_particles_global<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
       state->particles,
       state->particle_count,
       state->force_x,
@@ -3517,7 +3736,8 @@ int run_steps(DeviceState* state,
       }
 
       stage_start = std::chrono::steady_clock::now();
-      drift_particles<<<particle_blocks, threads_per_block>>>(state->particles, state->particle_count, substep_dt_myr);
+      drift_particles<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
+          state->particles, state->particle_count, substep_dt_myr);
       cudaError_t cuda_status = cudaGetLastError();
       if (cuda_status != cudaSuccess) {
         fill_cuda_error(error_buffer, error_buffer_len, "particle drift kernel failed", cuda_status);
@@ -3601,10 +3821,39 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
     state->max_softening_kpc = std::max(state->max_softening_kpc, particles[i].softening_kpc);
   }
 
+  cudaError_t cuda_status =
+      cudaStreamCreateWithFlags(&state->compute_stream, cudaStreamNonBlocking);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "compute stream creation failed", cuda_status);
+    destroy_state(state);
+    return 1;
+  }
+
+  cuda_status = cudaStreamCreateWithFlags(&state->preview_stream, cudaStreamNonBlocking);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "preview stream creation failed", cuda_status);
+    destroy_state(state);
+    return 1;
+  }
+
+  cuda_status = cudaEventCreateWithFlags(&state->preview_sample_event, cudaEventDisableTiming);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "preview sample event creation failed", cuda_status);
+    destroy_state(state);
+    return 1;
+  }
+
+  cuda_status = cudaEventCreateWithFlags(&state->preview_copy_done_event, cudaEventDisableTiming);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "preview copy event creation failed", cuda_status);
+    destroy_state(state);
+    return 1;
+  }
+
   compute_simulation_domain(state, particles);
 
   const auto particle_bytes = sizeof(SimCudaParticle) * params->particle_count;
-  cudaError_t cuda_status = cudaMalloc(reinterpret_cast<void**>(&state->particles), particle_bytes);
+  cuda_status = cudaMalloc(reinterpret_cast<void**>(&state->particles), particle_bytes);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for particles failed", cuda_status);
     destroy_state(state);
@@ -3773,10 +4022,22 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
     destroy_state(state);
     return 1;
   }
+  fft_status = cufftSetStream(state->forward_plan, state->compute_stream);
+  if (fft_status != CUFFT_SUCCESS) {
+    fill_cufft_error(error_buffer, error_buffer_len, "forward FFT stream binding failed", fft_status);
+    destroy_state(state);
+    return 1;
+  }
 
   fft_status = cufftPlan3d(&state->inverse_plan, state->nx, state->ny, state->nz, CUFFT_C2R);
   if (fft_status != CUFFT_SUCCESS) {
     fill_cufft_error(error_buffer, error_buffer_len, "inverse FFT plan creation failed", fft_status);
+    destroy_state(state);
+    return 1;
+  }
+  fft_status = cufftSetStream(state->inverse_plan, state->compute_stream);
+  if (fft_status != CUFFT_SUCCESS) {
+    fill_cufft_error(error_buffer, error_buffer_len, "inverse FFT stream binding failed", fft_status);
     destroy_state(state);
     return 1;
   }
@@ -3840,67 +4101,86 @@ extern "C" int sim_cuda_fill_preview(void* handle,
   }
 
   auto* state = static_cast<DeviceState*>(handle);
-  if (state->particle_count == 0 || max_particles == 0) {
-    *out_count = 0;
-    return 0;
+  if (wait_for_in_flight_preview(state, error_buffer, error_buffer_len) != 0) {
+    return 1;
   }
-
-  const std::uint32_t count = std::min<std::uint32_t>(
-      max_particles,
-      static_cast<std::uint32_t>(std::min<std::uint64_t>(
-          state->particle_count,
-          static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))));
-  const std::uint32_t anchor_count =
-      std::min<std::uint32_t>(count, static_cast<std::uint32_t>(state->galaxy_smbh_indices_host.size()));
-  const std::uint32_t sampled_count = count - anchor_count;
-
-  if (ensure_preview_capacity(state, count, error_buffer, error_buffer_len) != 0) {
+  if (schedule_preview_capture(state, max_particles, out_count, error_buffer, error_buffer_len) != 0) {
     return 1;
   }
 
-  cudaError_t cuda_status = cudaSuccess;
-  if (sampled_count > 0) {
-    const std::uint64_t stride =
-        std::max<std::uint64_t>(1, state->particle_count / std::max<std::uint32_t>(1, sampled_count));
-    const int threads_per_block = 256;
-    const int blocks = static_cast<int>((sampled_count + threads_per_block - 1) / threads_per_block);
-
-    sample_preview<<<blocks, threads_per_block>>>(
-        state->particles,
-        state->particle_count,
-        sampled_count,
-        stride,
-        state->preview_particles + anchor_count);
-    cuda_status = cudaGetLastError();
-    if (cuda_status != cudaSuccess) {
-      fill_cuda_error(error_buffer, error_buffer_len, "preview kernel launch failed", cuda_status);
-      return 1;
-    }
-
-    cuda_status = cudaMemcpy(out_particles + anchor_count,
-                             state->preview_particles + anchor_count,
-                             sizeof(SimCudaPreviewParticle) * sampled_count,
-                             cudaMemcpyDeviceToHost);
-    if (cuda_status != cudaSuccess) {
-      fill_cuda_error(error_buffer, error_buffer_len, "preview download failed", cuda_status);
-      return 1;
-    }
+  const cudaError_t cuda_status = cudaEventSynchronize(state->preview_copy_done_event);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "preview download failed", cuda_status);
+    state->preview_in_flight = false;
+    state->preview_in_flight_count = 0;
+    return 1;
   }
 
-  for (std::uint32_t i = 0; i < anchor_count; ++i) {
-    SimCudaParticle particle{};
-    cuda_status = cudaMemcpy(&particle,
-                             state->particles + state->galaxy_smbh_indices_host[i],
-                             sizeof(SimCudaParticle),
-                             cudaMemcpyDeviceToHost);
-    if (cuda_status != cudaSuccess) {
-      fill_cuda_error(error_buffer, error_buffer_len, "SMBH preview download failed", cuda_status);
-      return 1;
-    }
-    out_particles[i] = preview_particle_from_host_particle(particle);
+  if (*out_count > 0) {
+    std::memcpy(out_particles,
+                state->preview_host_particles,
+                sizeof(SimCudaPreviewParticle) * (*out_count));
+  }
+  state->preview_in_flight = false;
+  state->preview_in_flight_count = 0;
+  return 0;
+}
+
+extern "C" int sim_cuda_request_preview(void* handle,
+                                        std::uint32_t max_particles,
+                                        std::uint32_t* out_count,
+                                        char* error_buffer,
+                                        std::size_t error_buffer_len) {
+  if (handle == nullptr || out_count == nullptr) {
+    fill_error(error_buffer, error_buffer_len, "invalid preview request parameters");
+    return 1;
   }
 
-  *out_count = count;
+  auto* state = static_cast<DeviceState*>(handle);
+  return schedule_preview_capture(state, max_particles, out_count, error_buffer, error_buffer_len);
+}
+
+extern "C" int sim_cuda_collect_preview(void* handle,
+                                        SimCudaPreviewParticle* out_particles,
+                                        std::uint32_t particle_capacity,
+                                        std::uint32_t* out_count,
+                                        int* out_ready,
+                                        char* error_buffer,
+                                        std::size_t error_buffer_len) {
+  if (handle == nullptr || out_particles == nullptr || out_count == nullptr || out_ready == nullptr) {
+    fill_error(error_buffer, error_buffer_len, "invalid preview collect parameters");
+    return 1;
+  }
+
+  auto* state = static_cast<DeviceState*>(handle);
+  *out_ready = 0;
+  *out_count = 0;
+  if (!state->preview_in_flight) {
+    return 0;
+  }
+  if (particle_capacity < state->preview_in_flight_count) {
+    fill_error(error_buffer, error_buffer_len, "preview capacity smaller than in-flight frame");
+    return 1;
+  }
+
+  const cudaError_t query_status = cudaEventQuery(state->preview_copy_done_event);
+  if (query_status == cudaErrorNotReady) {
+    return 0;
+  }
+  if (query_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "preview readiness query failed", query_status);
+    return 1;
+  }
+
+  if (state->preview_in_flight_count > 0) {
+    std::memcpy(out_particles,
+                state->preview_host_particles,
+                sizeof(SimCudaPreviewParticle) * state->preview_in_flight_count);
+  }
+  *out_count = state->preview_in_flight_count;
+  *out_ready = 1;
+  state->preview_in_flight = false;
+  state->preview_in_flight_count = 0;
   return 0;
 }
 

@@ -515,7 +515,7 @@ async fn session_task(
 ) {
     let mut preview_budget = preview_budget;
     let mut running = false;
-    let mut frame_dirty = false;
+    let mut preview_pending = false;
     let initial_conditions = initial_conditions;
     let particle_count = initial_conditions.particles.len() as u64;
     let mesh_cells = config
@@ -578,6 +578,14 @@ async fn session_task(
                 SessionCommand::Pause => {
                     running = false;
                     summary.write().state = SessionState::Paused;
+                    let _ = publish_frame(
+                        &mut backend,
+                        preview_budget,
+                        &summary,
+                        &latest_frame,
+                        &frame_tx,
+                    );
+                    preview_pending = false;
                     Ok(())
                 }
                 SessionCommand::Resume => {
@@ -585,14 +593,17 @@ async fn session_task(
                     summary.write().state = SessionState::Running;
                     Ok(())
                 }
-                SessionCommand::Step(substeps) => step_and_publish(
-                    &mut backend,
-                    substeps.max(1),
-                    preview_budget,
-                    &summary,
-                    &latest_frame,
-                    &frame_tx,
-                ),
+                SessionCommand::Step(substeps) => {
+                    preview_pending = false;
+                    step_and_publish(
+                        &mut backend,
+                        substeps.max(1),
+                        preview_budget,
+                        &summary,
+                        &latest_frame,
+                        &frame_tx,
+                    )
+                }
                 SessionCommand::Snapshot => match run_backend_blocking(|| backend.download_particles()) {
                     Ok(particles) => {
                         let snapshot_summary = summary.read().clone();
@@ -613,6 +624,14 @@ async fn session_task(
                     ControlCommand::Pause => {
                         running = false;
                         summary.write().state = SessionState::Paused;
+                        let _ = publish_frame(
+                            &mut backend,
+                            preview_budget,
+                            &summary,
+                            &latest_frame,
+                            &frame_tx,
+                        );
+                        preview_pending = false;
                         Ok(())
                     }
                     ControlCommand::Resume => {
@@ -620,14 +639,17 @@ async fn session_task(
                         summary.write().state = SessionState::Running;
                         Ok(())
                     }
-                    ControlCommand::Step { substeps } => step_and_publish(
-                        &mut backend,
-                        substeps.unwrap_or(1).max(1),
-                        preview_budget,
-                        &summary,
-                        &latest_frame,
-                        &frame_tx,
-                    ),
+                    ControlCommand::Step { substeps } => {
+                        preview_pending = false;
+                        step_and_publish(
+                            &mut backend,
+                            substeps.unwrap_or(1).max(1),
+                            preview_budget,
+                            &summary,
+                            &latest_frame,
+                            &frame_tx,
+                        )
+                    }
                     ControlCommand::SetPreviewBudget { particle_budget } => {
                         preview_budget = particle_budget.max(1);
                         summary.write().preview_particle_budget = preview_budget;
@@ -638,9 +660,7 @@ async fn session_task(
                             &latest_frame,
                             &frame_tx,
                         );
-                        if result.is_ok() {
-                            frame_dirty = false;
-                        }
+                        preview_pending = false;
                         result
                     }
                 },
@@ -684,6 +704,14 @@ async fn session_task(
                     SessionCommand::Pause => {
                         running = false;
                         summary.write().state = SessionState::Paused;
+                        let _ = publish_frame(
+                            &mut backend,
+                            preview_budget,
+                            &summary,
+                            &latest_frame,
+                            &frame_tx,
+                        );
+                        preview_pending = false;
                         Ok(())
                     }
                     SessionCommand::Resume => {
@@ -691,14 +719,17 @@ async fn session_task(
                         summary.write().state = SessionState::Running;
                         Ok(())
                     }
-                    SessionCommand::Step(substeps) => step_and_publish(
-                        &mut backend,
-                        substeps.max(1),
-                        preview_budget,
-                        &summary,
-                        &latest_frame,
-                        &frame_tx,
-                    ),
+                    SessionCommand::Step(substeps) => {
+                        preview_pending = false;
+                        step_and_publish(
+                            &mut backend,
+                            substeps.max(1),
+                            preview_budget,
+                            &summary,
+                            &latest_frame,
+                            &frame_tx,
+                        )
+                    }
                     SessionCommand::Snapshot => match run_backend_blocking(|| backend.download_particles()) {
                         Ok(particles) => {
                             let snapshot_summary = summary.read().clone();
@@ -719,6 +750,14 @@ async fn session_task(
                         ControlCommand::Pause => {
                             running = false;
                             summary.write().state = SessionState::Paused;
+                            let _ = publish_frame(
+                                &mut backend,
+                                preview_budget,
+                                &summary,
+                                &latest_frame,
+                                &frame_tx,
+                            );
+                            preview_pending = false;
                             Ok(())
                         }
                         ControlCommand::Resume => {
@@ -726,14 +765,17 @@ async fn session_task(
                             summary.write().state = SessionState::Running;
                             Ok(())
                         }
-                        ControlCommand::Step { substeps } => step_and_publish(
-                            &mut backend,
-                            substeps.unwrap_or(1).max(1),
-                            preview_budget,
-                            &summary,
-                            &latest_frame,
-                            &frame_tx,
-                        ),
+                        ControlCommand::Step { substeps } => {
+                            preview_pending = false;
+                            step_and_publish(
+                                &mut backend,
+                                substeps.unwrap_or(1).max(1),
+                                preview_budget,
+                                &summary,
+                                &latest_frame,
+                                &frame_tx,
+                            )
+                        }
                         ControlCommand::SetPreviewBudget { particle_budget } => {
                             preview_budget = particle_budget.max(1);
                             summary.write().preview_particle_budget = preview_budget;
@@ -744,9 +786,7 @@ async fn session_task(
                                 &latest_frame,
                                 &frame_tx,
                             );
-                            if result.is_ok() {
-                                frame_dirty = false;
-                            }
+                            preview_pending = false;
                             result
                         }
                     },
@@ -768,19 +808,23 @@ async fn session_task(
                     }
                 }
             }
-            _ = frame_ticker.tick(), if frame_dirty => {
-                if let Err(error) = publish_frame(
+            _ = frame_ticker.tick(), if preview_pending => {
+                let published = match try_publish_ready_frame(
                     &mut backend,
-                    preview_budget,
                     &summary,
                     &latest_frame,
                     &frame_tx,
                 ) {
-                    error!("session {id} failed while publishing frame: {error:#}");
-                    summary.write().state = SessionState::Failed;
-                    return;
+                    Ok(published) => published,
+                    Err(error) => {
+                        error!("session {id} failed while publishing frame: {error:#}");
+                        summary.write().state = SessionState::Failed;
+                        return;
+                    }
+                };
+                if published {
+                    preview_pending = false;
                 }
-                frame_dirty = false;
             }
             _ = tokio::task::yield_now() => {
                 let advance_start = Instant::now();
@@ -806,7 +850,18 @@ async fn session_task(
                         .max(1.0) as u32;
                     steps_per_tick = target_steps.clamp(1, max_steps_per_tick.max(1));
                 }
-                frame_dirty = true;
+                if !preview_pending {
+                    if let Err(error) = request_preview_capture(
+                        &mut backend,
+                        preview_budget,
+                        &summary,
+                    ) {
+                        error!("session {id} failed while queueing preview frame: {error:#}");
+                        summary.write().state = SessionState::Failed;
+                        return;
+                    }
+                    preview_pending = true;
+                }
             }
         }
     }
@@ -874,6 +929,43 @@ fn publish_frame(
     summary.write().diagnostics = diagnostics;
     let _ = frame_tx.send(payload);
     Ok(())
+}
+
+fn request_preview_capture(
+    backend: &mut GpuBackend,
+    preview_budget: u32,
+    summary: &Arc<RwLock<SessionSummary>>,
+) -> anyhow::Result<()> {
+    let diagnostics = run_backend_blocking(|| backend.request_preview(preview_budget))?;
+    summary.write().diagnostics = diagnostics;
+    Ok(())
+}
+
+fn try_publish_ready_frame(
+    backend: &mut GpuBackend,
+    summary: &Arc<RwLock<SessionSummary>>,
+    latest_frame: &Arc<RwLock<Option<Bytes>>>,
+    frame_tx: &broadcast::Sender<Bytes>,
+) -> anyhow::Result<bool> {
+    let start = Instant::now();
+    let Some((payload, diagnostics)) =
+        run_backend_blocking(|| backend.try_collect_preview_packet_bytes())?
+    else {
+        return Ok(false);
+    };
+    if profile_session_loop() {
+        info!(
+            "session publish_ready preview_count={} wall_ms={:.3} bytes={}",
+            diagnostics.preview_count,
+            start.elapsed().as_secs_f64() * 1000.0,
+            payload.len()
+        );
+    }
+    let payload = Bytes::from(payload);
+    *latest_frame.write() = Some(payload.clone());
+    summary.write().diagnostics = diagnostics;
+    let _ = frame_tx.send(payload);
+    Ok(true)
 }
 
 fn step_and_publish(

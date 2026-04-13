@@ -83,6 +83,20 @@ int sim_cuda_fill_preview(void* handle,
                           char* error_buffer,
                           std::size_t error_buffer_len);
 
+int sim_cuda_request_preview(void* handle,
+                             std::uint32_t max_particles,
+                             std::uint32_t* out_count,
+                             char* error_buffer,
+                             std::size_t error_buffer_len);
+
+int sim_cuda_collect_preview(void* handle,
+                             SimCudaPreviewParticle* out_particles,
+                             std::uint32_t particle_capacity,
+                             std::uint32_t* out_count,
+                             int* out_ready,
+                             char* error_buffer,
+                             std::size_t error_buffer_len);
+
 int sim_cuda_copy_particles(void* handle,
                             SimCudaParticle* out_particles,
                             std::uint64_t particle_capacity,
