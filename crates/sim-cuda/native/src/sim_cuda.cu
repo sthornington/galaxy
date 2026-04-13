@@ -2885,17 +2885,10 @@ __global__ void sample_preview(const SimCudaParticle* particles,
   out_particles[index].velocity_kms[1] = static_cast<float>(particle.velocity_kms[1]);
   out_particles[index].velocity_kms[2] = static_cast<float>(particle.velocity_kms[2]);
   out_particles[index].mass_msun = static_cast<float>(particle.mass_msun);
-  out_particles[index].galaxy_index = particle.galaxy_index;
   out_particles[index].component = particle.component;
-  out_particles[index].color_rgba[0] = particle.color_rgba[0];
-  out_particles[index].color_rgba[1] = particle.color_rgba[1];
-  out_particles[index].color_rgba[2] = particle.color_rgba[2];
-  out_particles[index].color_rgba[3] = particle.color_rgba[3];
-  out_particles[index].intensity = 1.0f;
 }
 
-SimCudaPreviewParticle preview_particle_from_host_particle(const SimCudaParticle& particle,
-                                                           const float intensity) {
+SimCudaPreviewParticle preview_particle_from_host_particle(const SimCudaParticle& particle) {
   SimCudaPreviewParticle preview{};
   preview.position_kpc[0] = static_cast<float>(particle.position_kpc[0]);
   preview.position_kpc[1] = static_cast<float>(particle.position_kpc[1]);
@@ -2904,13 +2897,7 @@ SimCudaPreviewParticle preview_particle_from_host_particle(const SimCudaParticle
   preview.velocity_kms[1] = static_cast<float>(particle.velocity_kms[1]);
   preview.velocity_kms[2] = static_cast<float>(particle.velocity_kms[2]);
   preview.mass_msun = static_cast<float>(particle.mass_msun);
-  preview.galaxy_index = particle.galaxy_index;
   preview.component = particle.component;
-  preview.color_rgba[0] = particle.color_rgba[0];
-  preview.color_rgba[1] = particle.color_rgba[1];
-  preview.color_rgba[2] = particle.color_rgba[2];
-  preview.color_rgba[3] = particle.color_rgba[3];
-  preview.intensity = intensity;
   return preview;
 }
 
@@ -3910,7 +3897,7 @@ extern "C" int sim_cuda_fill_preview(void* handle,
       fill_cuda_error(error_buffer, error_buffer_len, "SMBH preview download failed", cuda_status);
       return 1;
     }
-    out_particles[i] = preview_particle_from_host_particle(particle, 1.0f);
+    out_particles[i] = preview_particle_from_host_particle(particle);
   }
 
   *out_count = count;

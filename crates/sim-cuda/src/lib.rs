@@ -217,10 +217,7 @@ impl GpuBackend {
                 position_kpc: [0.0; 3],
                 velocity_kms: [0.0; 3],
                 mass_msun: 0.0,
-                galaxy_index: 0,
                 component: 0,
-                color_rgba: [0.0; 4],
-                intensity: 0.0,
             },
         );
         let mut out_count = 0_u32;
@@ -270,10 +267,10 @@ impl GpuBackend {
                     position_kpc: particle.position_kpc,
                     velocity_kms: particle.velocity_kms,
                     mass_msun: particle.mass_msun,
-                    galaxy_index: particle.galaxy_index,
+                    galaxy_index: 0,
                     component: particle.component,
-                    color_rgba: particle.color_rgba,
-                    intensity: particle.intensity,
+                    color_rgba: [0.0, 0.0, 0.0, 1.0],
+                    intensity: 1.0,
                 })
                 .collect(),
         })

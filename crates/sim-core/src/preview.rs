@@ -59,10 +59,7 @@ pub struct PreviewPacketParticle {
     pub position_kpc: [f32; 3],
     pub velocity_kms: [f32; 3],
     pub mass_msun: f32,
-    pub galaxy_index: u32,
     pub component: u32,
-    pub color_rgba: [f32; 4],
-    pub intensity: f32,
 }
 
 pub fn encode_preview_packet_into(
@@ -133,10 +130,10 @@ pub fn decode_preview_packet(bytes: &[u8]) -> anyhow::Result<PreviewFrame> {
             position_kpc: particle.position_kpc,
             velocity_kms: particle.velocity_kms,
             mass_msun: particle.mass_msun,
-            galaxy_index: particle.galaxy_index,
+            galaxy_index: 0,
             component: particle.component,
-            color_rgba: particle.color_rgba,
-            intensity: particle.intensity,
+            color_rgba: [0.0, 0.0, 0.0, 1.0],
+            intensity: 1.0,
         })
         .collect();
 

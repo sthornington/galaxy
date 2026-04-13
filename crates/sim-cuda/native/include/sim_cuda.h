@@ -19,10 +19,7 @@ struct SimCudaPreviewParticle {
   float position_kpc[3];
   float velocity_kms[3];
   float mass_msun;
-  std::uint32_t galaxy_index;
   std::uint32_t component;
-  float color_rgba[4];
-  float intensity;
 };
 
 struct SimCudaGalaxy {

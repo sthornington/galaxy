@@ -423,19 +423,13 @@ mod tests {
                 position_kpc: [1.0, 2.0, 3.0],
                 velocity_kms: [4.0, 5.0, 6.0],
                 mass_msun: 7.0,
-                galaxy_index: 8,
                 component: 1,
-                color_rgba: [0.1, 0.2, 0.3, 0.4],
-                intensity: 0.9,
             },
             PreviewPacketParticle {
                 position_kpc: [-1.0, -2.0, -3.0],
                 velocity_kms: [-4.0, -5.0, -6.0],
                 mass_msun: 8.0,
-                galaxy_index: 9,
                 component: 2,
-                color_rgba: [0.5, 0.6, 0.7, 0.8],
-                intensity: 1.0,
             },
         ];
 

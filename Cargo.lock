@@ -930,6 +930,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bincode",
+ "bytes",
  "futures-util",
  "parking_lot",
  "serde",

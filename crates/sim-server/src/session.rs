@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, anyhow};
+use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sim_core::{
@@ -151,8 +152,8 @@ impl SessionRegistry {
 pub struct SessionHandle {
     pub id: Uuid,
     pub summary: Arc<RwLock<SessionSummary>>,
-    pub latest_frame: Arc<RwLock<Option<Vec<u8>>>>,
-    pub frame_tx: broadcast::Sender<Vec<u8>>,
+    pub latest_frame: Arc<RwLock<Option<Bytes>>>,
+    pub frame_tx: broadcast::Sender<Bytes>,
     pub command_tx: mpsc::UnboundedSender<SessionRequest>,
 }
 
@@ -161,11 +162,11 @@ impl SessionHandle {
         self.summary.read().clone()
     }
 
-    pub fn latest_frame(&self) -> Option<Vec<u8>> {
+    pub fn latest_frame(&self) -> Option<Bytes> {
         self.latest_frame.read().clone()
     }
 
-    pub fn subscribe_frames(&self) -> broadcast::Receiver<Vec<u8>> {
+    pub fn subscribe_frames(&self) -> broadcast::Receiver<Bytes> {
         self.frame_tx.subscribe()
     }
 
@@ -508,8 +509,8 @@ async fn session_task(
     preview_budget: u32,
     initial_conditions: InitialConditions,
     summary: Arc<RwLock<SessionSummary>>,
-    latest_frame: Arc<RwLock<Option<Vec<u8>>>>,
-    frame_tx: broadcast::Sender<Vec<u8>>,
+    latest_frame: Arc<RwLock<Option<Bytes>>>,
+    frame_tx: broadcast::Sender<Bytes>,
     mut command_rx: mpsc::UnboundedReceiver<SessionRequest>,
 ) {
     let mut preview_budget = preview_budget;
@@ -853,8 +854,8 @@ fn publish_frame(
     backend: &mut GpuBackend,
     preview_budget: u32,
     summary: &Arc<RwLock<SessionSummary>>,
-    latest_frame: &Arc<RwLock<Option<Vec<u8>>>>,
-    frame_tx: &broadcast::Sender<Vec<u8>>,
+    latest_frame: &Arc<RwLock<Option<Bytes>>>,
+    frame_tx: &broadcast::Sender<Bytes>,
 ) -> anyhow::Result<()> {
     let start = Instant::now();
     let (payload, diagnostics) =
@@ -868,6 +869,7 @@ fn publish_frame(
             payload.len()
         );
     }
+    let payload = Bytes::from(payload);
     *latest_frame.write() = Some(payload.clone());
     summary.write().diagnostics = diagnostics;
     let _ = frame_tx.send(payload);
@@ -879,8 +881,8 @@ fn step_and_publish(
     substeps: u32,
     preview_budget: u32,
     summary: &Arc<RwLock<SessionSummary>>,
-    latest_frame: &Arc<RwLock<Option<Vec<u8>>>>,
-    frame_tx: &broadcast::Sender<Vec<u8>>,
+    latest_frame: &Arc<RwLock<Option<Bytes>>>,
+    frame_tx: &broadcast::Sender<Bytes>,
 ) -> anyhow::Result<()> {
     let diagnostics = run_backend_blocking(|| backend.step(substeps))?;
     {

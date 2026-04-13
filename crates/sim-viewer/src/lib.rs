@@ -5,8 +5,8 @@ mod wasm {
     use sim_core::{PreviewFrame, PreviewParticle, decode_preview_packet};
     use wasm_bindgen::{JsCast, closure::Closure, prelude::*};
     use web_sys::{
-        BinaryType, CanvasRenderingContext2d, HtmlCanvasElement, MessageEvent, MouseEvent,
-        WebSocket, WheelEvent,
+        BinaryType, CanvasRenderingContext2d, Event, HtmlCanvasElement, MessageEvent, MouseEvent,
+        WebSocket, WheelEvent, Window,
     };
 
     #[derive(Clone, Copy)]
@@ -131,12 +131,23 @@ mod wasm {
     }
 
     #[wasm_bindgen]
-    pub fn boot(canvas_id: &str, session_id: &str) -> Result<(), JsValue> {
+    pub fn shutdown() {
         VIEWER_STATE.with(|state| {
             if let Some(previous) = state.borrow_mut().take() {
                 previous.dispose();
             }
         });
+    }
+
+    fn dispatch_window_event(window: &Window, event_name: &str) {
+        if let Ok(event) = Event::new(event_name) {
+            let _ = window.dispatch_event(&event);
+        }
+    }
+
+    #[wasm_bindgen]
+    pub fn boot(canvas_id: &str, session_id: &str) -> Result<(), JsValue> {
+        shutdown();
 
         let window = web_sys::window().ok_or_else(|| JsValue::from_str("missing window"))?;
         let document = window
@@ -153,6 +164,7 @@ mod wasm {
 
         let frame = Rc::new(RefCell::new(None));
         let camera = Rc::new(RefCell::new(CameraState::default()));
+        let saw_first_frame = Rc::new(RefCell::new(false));
 
         let location = window.location();
         let scheme = if location.protocol()?.starts_with("https") {
@@ -169,16 +181,32 @@ mod wasm {
             let canvas = canvas.clone();
             let frame = frame.clone();
             let camera = camera.clone();
+            let window = window.clone();
+            let saw_first_frame = saw_first_frame.clone();
             Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-                if let Ok(buffer) = event.data().dyn_into::<js_sys::ArrayBuffer>() {
-                    let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
-                    if let Ok(decoded) = decode_preview_packet(&bytes) {
-                        {
-                            let mut camera = camera.borrow_mut();
-                            update_scene_bounds(&mut camera, &decoded, false);
-                            draw_frame(&context, &canvas, &decoded, &camera);
+                match event.data().dyn_into::<js_sys::ArrayBuffer>() {
+                    Ok(buffer) => {
+                        let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+                        match decode_preview_packet(&bytes) {
+                            Ok(decoded) => {
+                                {
+                                    let mut camera = camera.borrow_mut();
+                                    update_scene_bounds(&mut camera, &decoded, false);
+                                    draw_frame(&context, &canvas, &decoded, &camera);
+                                }
+                                *frame.borrow_mut() = Some(decoded);
+                                if !*saw_first_frame.borrow() {
+                                    *saw_first_frame.borrow_mut() = true;
+                                    dispatch_window_event(&window, "galaxy-viewer-frame");
+                                }
+                            }
+                            Err(_) => {
+                                dispatch_window_event(&window, "galaxy-viewer-error");
+                            }
                         }
-                        *frame.borrow_mut() = Some(decoded);
+                    }
+                    Err(_) => {
+                        dispatch_window_event(&window, "galaxy-viewer-error");
                     }
                 }
             })
