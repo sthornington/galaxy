@@ -159,6 +159,70 @@ mod tests {
     }
 
     #[test]
+    fn major_merger_disks_have_exponential_radial_scale() {
+        let preset = built_in_presets()
+            .into_iter()
+            .find(|preset| preset.id == "major-merger")
+            .unwrap();
+        let initial_conditions = InitialConditions::generate(&preset.config, 42).unwrap();
+
+        for (galaxy_index, galaxy) in preset.config.galaxies.iter().enumerate() {
+            let origin = Vec3::new(
+                galaxy.position_kpc[0],
+                galaxy.position_kpc[1],
+                galaxy.position_kpc[2],
+            );
+            let bulk_velocity = Vec3::new(
+                galaxy.velocity_kms[0],
+                galaxy.velocity_kms[1],
+                galaxy.velocity_kms[2],
+            );
+
+            let mut total_angular_momentum = Vec3::ZERO;
+            let disk_particles: Vec<_> = initial_conditions
+                .particles
+                .iter()
+                .filter(|particle| {
+                    particle.galaxy_index == galaxy_index as u32
+                        && matches!(particle.component, ParticleComponent::Disk)
+                })
+                .collect();
+            assert!(!disk_particles.is_empty());
+
+            for particle in &disk_particles {
+                let relative_position = particle.position_kpc - origin;
+                let relative_velocity = particle.velocity_kms - bulk_velocity;
+                total_angular_momentum += Vec3::new(
+                    relative_position.y * relative_velocity.z
+                        - relative_position.z * relative_velocity.y,
+                    relative_position.z * relative_velocity.x
+                        - relative_position.x * relative_velocity.z,
+                    relative_position.x * relative_velocity.y
+                        - relative_position.y * relative_velocity.x,
+                ) * particle.mass_msun;
+            }
+            let disk_normal = total_angular_momentum.normalized();
+
+            let mean_cylindrical_radius = disk_particles
+                .iter()
+                .map(|particle| {
+                    let relative_position = particle.position_kpc - origin;
+                    let height = relative_position.dot(disk_normal);
+                    let in_plane = relative_position - disk_normal * height;
+                    in_plane.length()
+                })
+                .sum::<f64>()
+                / disk_particles.len() as f64;
+            let scale_ratio = mean_cylindrical_radius / galaxy.disk_scale_radius_kpc.max(1.0e-6);
+
+            assert!(
+                (1.6..=2.4).contains(&scale_ratio),
+                "galaxy {galaxy_index} disk radius sampler drifted from exponential expectation: mean_R/Rd={scale_ratio:.3}"
+            );
+        }
+    }
+
+    #[test]
     fn galaxies_are_recentred_to_configured_origin_and_bulk_velocity() {
         let preset = built_in_presets()
             .into_iter()

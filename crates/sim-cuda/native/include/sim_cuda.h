@@ -53,6 +53,7 @@ struct SimCudaCreateParams {
   double base_timestep_myr;
   std::uint32_t max_substeps;
   double cfl_safety_factor;
+  double opening_angle;
   std::uint32_t mesh_resolution[3];
   std::uint32_t enable_smbh_post_newtonian;
 };

@@ -63,6 +63,7 @@ struct FfiCreateParams {
     base_timestep_myr: f64,
     max_substeps: u32,
     cfl_safety_factor: f64,
+    opening_angle: f64,
     mesh_resolution: [u32; 3],
     enable_smbh_post_newtonian: u32,
 }
@@ -129,6 +130,7 @@ impl GpuBackend {
             base_timestep_myr: config.integration.base_timestep_myr,
             max_substeps: config.integration.max_substeps,
             cfl_safety_factor: config.integration.cfl_safety_factor,
+            opening_angle: config.gravity.opening_angle,
             mesh_resolution: config.gravity.mesh_resolution,
             enable_smbh_post_newtonian: u32::from(
                 config.relativity.enable_smbh_post_newtonian,
@@ -591,6 +593,53 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy, Debug)]
+    struct GalaxyDiskMetrics {
+        r50_kpc: f64,
+        rms_height_kpc: f64,
+        spin: f64,
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA GPU"]
+    fn major_merger_debug_stays_structurally_bound_over_first_2_myr() {
+        let config = built_in_presets()
+            .into_iter()
+            .find(|preset| preset.id == "major-merger-debug")
+            .unwrap()
+            .config;
+        let initial_conditions = InitialConditions::generate(&config, 42).unwrap();
+        let initial_metrics = [
+            galaxy_disk_metrics(&initial_conditions.particles, 0),
+            galaxy_disk_metrics(&initial_conditions.particles, 1),
+        ];
+
+        let mut backend = GpuBackend::new(&config, &initial_conditions).unwrap();
+        let diagnostics = backend.advance(20).unwrap();
+        assert!(diagnostics.sim_time_myr >= 2.0 - 1.0e-6);
+
+        let particles = backend.download_particles().unwrap();
+        for (galaxy_index, initial) in initial_metrics.iter().enumerate() {
+            let final_metrics = galaxy_disk_metrics(&particles, galaxy_index as u32);
+            let r50_ratio = final_metrics.r50_kpc / initial.r50_kpc.max(1.0e-6);
+            let z_ratio = final_metrics.rms_height_kpc / initial.rms_height_kpc.max(1.0e-6);
+            let spin_ratio = final_metrics.spin / initial.spin.max(1.0e-6);
+
+            assert!(
+                r50_ratio <= 1.03,
+                "galaxy {galaxy_index} disk expanded too quickly over first 2 Myr: ratio={r50_ratio:.3}"
+            );
+            assert!(
+                z_ratio <= 1.05,
+                "galaxy {galaxy_index} disk thickened too quickly over first 2 Myr: ratio={z_ratio:.3}"
+            );
+            assert!(
+                spin_ratio >= 0.995,
+                "galaxy {galaxy_index} disk lost too much spin over first 2 Myr: ratio={spin_ratio:.6}"
+            );
+        }
+    }
+
     fn mean_disk_radius(particles: &[sim_core::Particle]) -> f64 {
         let center = particles
             .iter()
@@ -655,6 +704,81 @@ mod tests {
                 accum + angular_momentum
             })
             .length()
+    }
+
+    fn galaxy_disk_metrics(particles: &[sim_core::Particle], galaxy_index: u32) -> GalaxyDiskMetrics {
+        let center = particles
+            .iter()
+            .find(|particle| {
+                particle.galaxy_index == galaxy_index
+                    && matches!(particle.component, ParticleComponent::Smbh)
+            })
+            .map(|particle| particle.position_kpc)
+            .unwrap_or(Vec3::ZERO);
+        let bulk_velocity = particles
+            .iter()
+            .find(|particle| {
+                particle.galaxy_index == galaxy_index
+                    && matches!(particle.component, ParticleComponent::Smbh)
+            })
+            .map(|particle| particle.velocity_kms)
+            .unwrap_or(Vec3::ZERO);
+
+        let disk_particles: Vec<_> = particles
+            .iter()
+            .filter(|particle| {
+                particle.galaxy_index == galaxy_index
+                    && matches!(particle.component, ParticleComponent::Disk)
+            })
+            .collect();
+        let spin_vector = disk_particles.iter().fold(Vec3::ZERO, |accum, particle| {
+            let radius = particle.position_kpc - center;
+            let velocity = particle.velocity_kms - bulk_velocity;
+            accum
+                + Vec3::new(
+                    radius.y * velocity.z - radius.z * velocity.y,
+                    radius.z * velocity.x - radius.x * velocity.z,
+                    radius.x * velocity.y - radius.y * velocity.x,
+                ) * particle.mass_msun
+        });
+        let disk_normal = spin_vector.normalized();
+
+        let mut cylindrical_radii: Vec<f64> = disk_particles
+            .iter()
+            .map(|particle| {
+                let relative = particle.position_kpc - center;
+                let height = relative.dot(disk_normal);
+                let in_plane = relative - disk_normal * height;
+                in_plane.length()
+            })
+            .collect();
+        cylindrical_radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let rms_height_kpc = (disk_particles
+            .iter()
+            .map(|particle| {
+                let relative = particle.position_kpc - center;
+                let height = relative.dot(disk_normal);
+                height * height
+            })
+            .sum::<f64>()
+            / disk_particles.len().max(1) as f64)
+            .sqrt();
+
+        GalaxyDiskMetrics {
+            r50_kpc: quantile_radius(&cylindrical_radii, 0.5),
+            rms_height_kpc,
+            spin: spin_vector.length(),
+        }
+    }
+
+    fn quantile_radius(sorted_radii: &[f64], quantile: f64) -> f64 {
+        if sorted_radii.is_empty() {
+            return 0.0;
+        }
+        let index =
+            ((sorted_radii.len() - 1) as f64 * quantile.clamp(0.0, 1.0)).round() as usize;
+        sorted_radii[index]
     }
 
     fn small_test_config() -> SimulationConfig {

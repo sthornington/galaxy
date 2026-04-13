@@ -1,0 +1,325 @@
+use std::{env, time::Instant};
+
+use anyhow::{Context, Result, bail};
+use sim_core::{
+    InitialConditions, Particle, ParticleComponent, SimulationConfig, Vec3, built_in_presets,
+};
+use sim_cuda::GpuBackend;
+
+#[derive(Clone, Debug)]
+struct DiagArgs {
+    preset_id: String,
+    steps: u32,
+    batch: u32,
+    relax_steps: u32,
+    seed: u64,
+}
+
+#[derive(Clone, Debug)]
+struct GalaxyMetrics {
+    disk_r50_kpc: f64,
+    disk_r90_kpc: f64,
+    disk_rms_height_kpc: f64,
+    disk_spin: f64,
+    disk_mean_radial_velocity_kms: f64,
+    disk_count: usize,
+}
+
+fn main() -> Result<()> {
+    let args = parse_args()?;
+    let preset = built_in_presets()
+        .into_iter()
+        .find(|preset| preset.id == args.preset_id)
+        .with_context(|| format!("unknown preset `{}`", args.preset_id))?;
+
+    let mut initial_conditions =
+        InitialConditions::generate(&preset.config, args.seed).context("generate ICs")?;
+    if args.relax_steps > 0 {
+        initial_conditions = relax_initial_conditions(&preset.config, initial_conditions, args.relax_steps)
+            .context("relax ICs")?;
+    }
+
+    let initial_metrics = compute_all_metrics(&initial_conditions.particles, &preset.config);
+    print_metrics("initial", 0.0, 0.0, &initial_metrics, &initial_metrics);
+
+    let mut backend = GpuBackend::new(&preset.config, &initial_conditions).context("create backend")?;
+    let mut completed = 0_u32;
+    while completed < args.steps {
+        let run_steps = args.batch.min(args.steps - completed).max(1);
+        let wall_start = Instant::now();
+        let diagnostics = backend.advance(run_steps).context("advance backend")?;
+        let wall_seconds = wall_start.elapsed().as_secs_f64();
+        let particles = backend.download_particles().context("download particles")?;
+        let metrics = compute_all_metrics(&particles, &preset.config);
+        print_metrics(
+            &format!("step+{run_steps}"),
+            diagnostics.sim_time_myr,
+            wall_seconds,
+            &metrics,
+            &initial_metrics,
+        );
+        completed += run_steps;
+    }
+
+    Ok(())
+}
+
+fn parse_args() -> Result<DiagArgs> {
+    let mut args = DiagArgs {
+        preset_id: "major-merger-debug".to_string(),
+        steps: 16,
+        batch: 1,
+        relax_steps: 16,
+        seed: 42,
+    };
+
+    let mut it = env::args().skip(1);
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--preset" => args.preset_id = next_value(&mut it, "--preset")?,
+            "--steps" => args.steps = next_value(&mut it, "--steps")?.parse()?,
+            "--batch" => args.batch = next_value(&mut it, "--batch")?.parse()?,
+            "--relax-steps" => args.relax_steps = next_value(&mut it, "--relax-steps")?.parse()?,
+            "--seed" => args.seed = next_value(&mut it, "--seed")?.parse()?,
+            "--no-relax" => args.relax_steps = 0,
+            "--help" | "-h" => {
+                println!(
+                    "usage: cargo run -p sim-cuda --bin solver_diag -- [--preset ID] [--steps N] [--batch N] [--relax-steps N] [--seed N]"
+                );
+                std::process::exit(0);
+            }
+            other => bail!("unknown argument `{other}`"),
+        }
+    }
+
+    Ok(args)
+}
+
+fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
+    it.next().with_context(|| format!("missing value for {flag}"))
+}
+
+fn relax_initial_conditions(
+    config: &SimulationConfig,
+    initial_conditions: InitialConditions,
+    relaxation_steps: u32,
+) -> Result<InitialConditions> {
+    if relaxation_steps == 0 || config.galaxies.is_empty() {
+        return Ok(initial_conditions);
+    }
+
+    let mut relaxed_particles = Vec::with_capacity(initial_conditions.particles.len());
+    for (galaxy_index, galaxy) in config.galaxies.iter().enumerate() {
+        let target_origin = Vec3::new(
+            galaxy.position_kpc[0],
+            galaxy.position_kpc[1],
+            galaxy.position_kpc[2],
+        );
+        let target_velocity = Vec3::new(
+            galaxy.velocity_kms[0],
+            galaxy.velocity_kms[1],
+            galaxy.velocity_kms[2],
+        );
+
+        let isolated_particles: Vec<Particle> = initial_conditions
+            .particles
+            .iter()
+            .filter(|particle| particle.galaxy_index == galaxy_index as u32)
+            .cloned()
+            .map(|mut particle| {
+                particle.position_kpc -= target_origin;
+                particle.velocity_kms -= target_velocity;
+                particle.galaxy_index = 0;
+                particle
+            })
+            .collect();
+        if isolated_particles.is_empty() {
+            continue;
+        }
+
+        let isolated_mass = isolated_particles.iter().map(|particle| particle.mass_msun).sum::<f64>();
+        let mut isolated_config = config.clone();
+        isolated_config.name = format!("{}-diag-relax-{galaxy_index}", config.name);
+        isolated_config.galaxies = vec![{
+            let mut isolated = galaxy.clone();
+            isolated.position_kpc = [0.0, 0.0, 0.0];
+            isolated.velocity_kms = [0.0, 0.0, 0.0];
+            isolated
+        }];
+        let isolated_ic = InitialConditions {
+            seed: initial_conditions.seed
+                ^ (galaxy_index as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            particles: isolated_particles,
+            total_mass_msun: isolated_mass,
+        };
+        let mut backend = GpuBackend::new(&isolated_config, &isolated_ic)
+            .with_context(|| format!("create isolated backend for galaxy {galaxy_index}"))?;
+        backend
+            .advance(relaxation_steps)
+            .with_context(|| format!("relax galaxy {galaxy_index}"))?;
+        let mut particles = backend
+            .download_particles()
+            .with_context(|| format!("download relaxed galaxy {galaxy_index}"))?;
+        recenter_particles(&mut particles, galaxy_index as u32, target_origin, target_velocity);
+        relaxed_particles.extend(particles.into_iter().map(|mut particle| {
+            particle.galaxy_index = galaxy_index as u32;
+            particle
+        }));
+    }
+
+    Ok(InitialConditions {
+        seed: initial_conditions.seed,
+        particles: relaxed_particles,
+        total_mass_msun: initial_conditions.total_mass_msun,
+    })
+}
+
+fn recenter_particles(
+    particles: &mut [Particle],
+    galaxy_index: u32,
+    origin: Vec3,
+    bulk_velocity: Vec3,
+) {
+    if particles.is_empty() {
+        return;
+    }
+
+    let mut total_mass = 0.0;
+    let mut center_of_mass = Vec3::ZERO;
+    let mut center_velocity = Vec3::ZERO;
+    for particle in particles.iter() {
+        total_mass += particle.mass_msun;
+        center_of_mass += particle.position_kpc * particle.mass_msun;
+        center_velocity += particle.velocity_kms * particle.mass_msun;
+    }
+    if total_mass > 0.0 {
+        center_of_mass = center_of_mass / total_mass;
+        center_velocity = center_velocity / total_mass;
+    }
+
+    let position_shift = origin - center_of_mass;
+    let velocity_shift = bulk_velocity - center_velocity;
+    for particle in particles.iter_mut() {
+        particle.position_kpc += position_shift;
+        particle.velocity_kms += velocity_shift;
+    }
+
+    if let Some(smbh) = particles.iter_mut().find(|particle| {
+        particle.galaxy_index == galaxy_index && matches!(particle.component, ParticleComponent::Smbh)
+    }) {
+        smbh.position_kpc = origin;
+        smbh.velocity_kms = bulk_velocity;
+    }
+}
+
+fn compute_all_metrics(particles: &[Particle], config: &SimulationConfig) -> Vec<GalaxyMetrics> {
+    config
+        .galaxies
+        .iter()
+        .enumerate()
+        .map(|(galaxy_index, _)| compute_galaxy_metrics(particles, galaxy_index as u32))
+        .collect()
+}
+
+fn compute_galaxy_metrics(particles: &[Particle], galaxy_index: u32) -> GalaxyMetrics {
+    let mut center = Vec3::ZERO;
+    let mut bulk_velocity = Vec3::ZERO;
+    if let Some(smbh) = particles.iter().find(|particle| {
+        particle.galaxy_index == galaxy_index && matches!(particle.component, ParticleComponent::Smbh)
+    }) {
+        center = smbh.position_kpc;
+        bulk_velocity = smbh.velocity_kms;
+    }
+
+    let disk_particles: Vec<&Particle> = particles
+        .iter()
+        .filter(|particle| {
+            particle.galaxy_index == galaxy_index && matches!(particle.component, ParticleComponent::Disk)
+        })
+        .collect();
+    if disk_particles.is_empty() {
+        return GalaxyMetrics {
+            disk_r50_kpc: 0.0,
+            disk_r90_kpc: 0.0,
+            disk_rms_height_kpc: 0.0,
+            disk_spin: 0.0,
+            disk_mean_radial_velocity_kms: 0.0,
+            disk_count: 0,
+        };
+    }
+
+    let total_angular_momentum = disk_particles.iter().fold(Vec3::ZERO, |accum, particle| {
+        let r = particle.position_kpc - center;
+        let v = particle.velocity_kms - bulk_velocity;
+        accum
+            + Vec3::new(
+                r.y * v.z - r.z * v.y,
+                r.z * v.x - r.x * v.z,
+                r.x * v.y - r.y * v.x,
+            ) * particle.mass_msun
+    });
+    let disk_normal = total_angular_momentum.normalized();
+    let spin = total_angular_momentum.length();
+
+    let mut cylindrical_radii = Vec::with_capacity(disk_particles.len());
+    let mut height_sq_sum = 0.0;
+    let mut radial_velocity_sum = 0.0;
+    for particle in &disk_particles {
+        let r = particle.position_kpc - center;
+        let v = particle.velocity_kms - bulk_velocity;
+        let height = r.dot(disk_normal);
+        let in_plane = r - disk_normal * height;
+        let cylindrical_radius = in_plane.length();
+        cylindrical_radii.push(cylindrical_radius);
+        height_sq_sum += height * height;
+        if cylindrical_radius > 1.0e-6 {
+            radial_velocity_sum += in_plane.dot(v) / cylindrical_radius;
+        }
+    }
+    cylindrical_radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    GalaxyMetrics {
+        disk_r50_kpc: quantile(&cylindrical_radii, 0.5),
+        disk_r90_kpc: quantile(&cylindrical_radii, 0.9),
+        disk_rms_height_kpc: (height_sq_sum / disk_particles.len() as f64).sqrt(),
+        disk_spin: spin,
+        disk_mean_radial_velocity_kms: radial_velocity_sum / disk_particles.len() as f64,
+        disk_count: disk_particles.len(),
+    }
+}
+
+fn quantile(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let index = ((sorted.len() - 1) as f64 * q.clamp(0.0, 1.0)).round() as usize;
+    sorted[index]
+}
+
+fn print_metrics(
+    label: &str,
+    sim_time_myr: f64,
+    wall_seconds: f64,
+    metrics: &[GalaxyMetrics],
+    baseline: &[GalaxyMetrics],
+) {
+    println!("label={label} sim_time_myr={sim_time_myr:.3} wall_s={wall_seconds:.3}");
+    for (index, (current, initial)) in metrics.iter().zip(baseline.iter()).enumerate() {
+        let r50_ratio = current.disk_r50_kpc / initial.disk_r50_kpc.max(1.0e-6);
+        let r90_ratio = current.disk_r90_kpc / initial.disk_r90_kpc.max(1.0e-6);
+        let z_ratio = current.disk_rms_height_kpc / initial.disk_rms_height_kpc.max(1.0e-6);
+        let spin_ratio = current.disk_spin / initial.disk_spin.max(1.0e-6);
+        println!(
+            " galaxy={index} disk_count={} r50_kpc={:.3} r50_ratio={:.3} r90_kpc={:.3} r90_ratio={:.3} z_rms_kpc={:.3} z_ratio={:.3} spin_ratio={:.3} mean_vr_kms={:.3}",
+            current.disk_count,
+            current.disk_r50_kpc,
+            r50_ratio,
+            current.disk_r90_kpc,
+            r90_ratio,
+            current.disk_rms_height_kpc,
+            z_ratio,
+            spin_ratio,
+            current.disk_mean_radial_velocity_kms
+        );
+    }
+}

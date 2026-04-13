@@ -112,12 +112,16 @@ async fn create_session(
         ));
     };
 
-    let summary = state.sessions.create(CreateSessionParams {
+    let params = CreateSessionParams {
         config,
         preset_id: request.preset_id.unwrap_or_else(|| "custom".to_string()),
         seed: request.seed.unwrap_or(42),
         preview_particle_budget: request.preview_particle_budget,
-    })?;
+    };
+    let sessions = state.sessions.clone();
+    let summary = tokio::task::spawn_blocking(move || sessions.create(params))
+        .await
+        .map_err(|error| AppError::Internal(anyhow::anyhow!("session creation task failed to join: {error}")))??;
 
     Ok(Json(summary))
 }

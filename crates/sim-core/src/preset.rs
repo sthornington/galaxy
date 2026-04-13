@@ -14,7 +14,12 @@ pub struct MergerPreset {
 }
 
 pub fn built_in_presets() -> Vec<MergerPreset> {
-    vec![major_merger(), polar_flyby(), minor_merger()]
+    vec![
+        major_merger_debug(),
+        major_merger(),
+        polar_flyby(),
+        minor_merger(),
+    ]
 }
 
 fn gravity_defaults() -> GravityConfig {
@@ -160,6 +165,26 @@ fn major_merger() -> MergerPreset {
             output_directory: "output/major-merger".to_string(),
             galaxies: vec![primary, secondary],
         },
+    }
+}
+
+fn major_merger_debug() -> MergerPreset {
+    let mut config = major_merger().config;
+    config.name = "major-merger-debug".to_string();
+    config.output_directory = "output/major-merger-debug".to_string();
+    config.preview.particle_budget = 16_384;
+    config.galaxies[0].halo_particle_count = 80_000;
+    config.galaxies[0].disk_particle_count = 32_000;
+    config.galaxies[0].bulge_particle_count = 6_400;
+    config.galaxies[1].halo_particle_count = 72_000;
+    config.galaxies[1].disk_particle_count = 28_000;
+    config.galaxies[1].bulge_particle_count = 5_600;
+
+    MergerPreset {
+        id: "major-merger-debug",
+        title: "Major Merger Debug",
+        summary: "Same equal-mass encounter at roughly 10x fewer particles for fast solver debugging.",
+        config,
     }
 }
 

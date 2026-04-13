@@ -48,8 +48,16 @@ impl SessionRegistry {
 
     pub fn create(&self, params: CreateSessionParams) -> anyhow::Result<SessionSummary> {
         let particle_count = validate_particle_count(&params.config)?;
-        let initial_conditions = InitialConditions::generate(&params.config, params.seed)
+        let mut initial_conditions = InitialConditions::generate(&params.config, params.seed)
             .context("failed to generate initial conditions")?;
+        if should_relax_initial_conditions(particle_count, &params.config) {
+            info!(
+                "relaxing initial conditions for preset {} ({} particles)",
+                params.preset_id, particle_count
+            );
+            initial_conditions = relax_initial_conditions_if_needed(&params.config, initial_conditions)
+                .context("failed to relax initial conditions")?;
+        }
 
         let id = Uuid::new_v4();
         let preview_budget = params
@@ -327,6 +335,12 @@ fn relaxation_steps_for_config(config: &SimulationConfig) -> u32 {
     raw_steps as u32
 }
 
+fn should_relax_initial_conditions(particle_count: u64, config: &SimulationConfig) -> bool {
+    let _ = particle_count;
+    let _ = config;
+    false
+}
+
 fn recenter_particles(
     particles: &mut [Particle],
     galaxy_index: u32,
@@ -471,7 +485,7 @@ async fn session_task(
                         &latest_frame,
                         &frame_tx,
                     ),
-                    SessionCommand::Snapshot => match tokio::task::block_in_place(|| backend.download_particles()) {
+                    SessionCommand::Snapshot => match run_backend_blocking(|| backend.download_particles()) {
                         Ok(particles) => {
                             let snapshot_summary = summary.read().clone();
                             match write_snapshot(id, &config, &snapshot_summary, &particles) {
@@ -556,7 +570,7 @@ fn advance_and_publish(
     latest_frame: &Arc<RwLock<Option<Vec<u8>>>>,
     frame_tx: &broadcast::Sender<Vec<u8>>,
 ) -> anyhow::Result<()> {
-    let diagnostics = tokio::task::block_in_place(|| backend.advance(steps.max(1)))?;
+    let diagnostics = run_backend_blocking(|| backend.advance(steps.max(1)))?;
     {
         let mut summary = summary.write();
         summary.sim_time_myr = diagnostics.sim_time_myr;
@@ -572,7 +586,7 @@ fn publish_frame(
     latest_frame: &Arc<RwLock<Option<Vec<u8>>>>,
     frame_tx: &broadcast::Sender<Vec<u8>>,
 ) -> anyhow::Result<()> {
-    let preview = tokio::task::block_in_place(|| backend.preview_frame(preview_budget))?;
+    let preview = run_backend_blocking(|| backend.preview_frame(preview_budget))?;
     let payload = bincode::serialize(&preview).context("failed to serialize preview frame")?;
     *latest_frame.write() = Some(payload.clone());
     summary.write().diagnostics = preview.diagnostics.clone();
@@ -588,13 +602,22 @@ fn step_and_publish(
     latest_frame: &Arc<RwLock<Option<Vec<u8>>>>,
     frame_tx: &broadcast::Sender<Vec<u8>>,
 ) -> anyhow::Result<()> {
-    let diagnostics = tokio::task::block_in_place(|| backend.step(substeps))?;
+    let diagnostics = run_backend_blocking(|| backend.step(substeps))?;
     {
         let mut summary = summary.write();
         summary.sim_time_myr = diagnostics.sim_time_myr;
         summary.diagnostics = diagnostics;
     }
     publish_frame(backend, preview_budget, summary, latest_frame, frame_tx)
+}
+
+fn run_backend_blocking<T>(work: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if matches!(handle.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread) => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
 }
 
 fn write_snapshot(

@@ -261,8 +261,11 @@ fn extend_exponential_disk(
     let particle_mass = total_mass_msun / count as f64;
 
     for _ in 0..count {
-        let u: f64 = rng.random::<f64>().clamp(1.0e-8, 1.0 - 1.0e-8);
-        let radius = -scale_radius_kpc * (1.0 - u).ln();
+        // For a 2D exponential disk, p(R) dR ∝ R exp(-R/Rd) dR, i.e. a Gamma(k=2, theta=Rd).
+        // Sampling a plain exponential overconcentrates the disk and destabilizes the live system.
+        let u1: f64 = rng.random::<f64>().clamp(1.0e-8, 1.0 - 1.0e-8);
+        let u2: f64 = rng.random::<f64>().clamp(1.0e-8, 1.0 - 1.0e-8);
+        let radius = -scale_radius_kpc * (u1 * u2).ln();
         let phi = rng.random::<f64>() * std::f64::consts::TAU;
         let z = sample_sech2_height(rng, scale_height_kpc);
         let local = Vec3::new(radius * phi.cos(), radius * phi.sin(), z);
