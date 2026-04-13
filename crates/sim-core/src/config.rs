@@ -63,6 +63,8 @@ pub struct TimeIntegrationConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GalaxyConfig {
     pub label: String,
+    #[serde(default)]
+    pub equilibrium_snapshot: Option<String>,
     pub halo_mass_msun: f64,
     pub halo_scale_radius_kpc: f64,
     pub halo_particle_count: u32,

@@ -10,16 +10,33 @@ pub use config::{
     SimulationConfig, SmbhConfig, SnapshotConfig, TimeIntegrationConfig,
 };
 pub use init::{
-    InitialConditionError, InitialConditions, Particle, ParticleComponent, validate_particle_count,
+    InitialConditionError, InitialConditions, Particle, ParticleComponent, generate_analytic_galaxy,
+    validate_particle_count,
 };
 pub use math::Vec3;
 pub use preset::{MergerPreset, built_in_presets};
 pub use preview::{Diagnostics, PreviewFrame, PreviewParticle};
-pub use snapshot::{SnapshotChunk, SnapshotManifest};
+pub use snapshot::{
+    SnapshotChunk, SnapshotManifest, load_particle_snapshot, write_particle_snapshot,
+};
 
 #[cfg(test)]
 mod tests {
-    use super::{InitialConditions, ParticleComponent, Vec3, built_in_presets, validate_particle_count};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::{
+        InitialConditions, MergerPreset, Particle, ParticleComponent, Vec3, built_in_presets,
+        load_particle_snapshot, validate_particle_count, write_particle_snapshot,
+    };
+
+    fn strip_equilibrium_snapshots(preset: &mut MergerPreset) {
+        for galaxy in &mut preset.config.galaxies {
+            galaxy.equilibrium_snapshot = None;
+        }
+    }
 
     #[test]
     fn built_in_presets_have_unique_ids() {
@@ -32,7 +49,8 @@ mod tests {
 
     #[test]
     fn initial_conditions_match_configured_particle_count() {
-        let preset = built_in_presets().remove(0);
+        let mut preset = built_in_presets().remove(0);
+        strip_equilibrium_snapshots(&mut preset);
         let expected = validate_particle_count(&preset.config).unwrap();
         let initial_conditions = InitialConditions::generate(&preset.config, 42).unwrap();
         assert_eq!(initial_conditions.particles.len() as u64, expected);
@@ -41,10 +59,11 @@ mod tests {
 
     #[test]
     fn minor_merger_disks_have_internal_angular_momentum() {
-        let preset = built_in_presets()
+        let mut preset = built_in_presets()
             .into_iter()
             .find(|preset| preset.id == "minor-merger")
             .unwrap();
+        strip_equilibrium_snapshots(&mut preset);
         let initial_conditions = InitialConditions::generate(&preset.config, 42).unwrap();
 
         for (galaxy_index, galaxy) in preset.config.galaxies.iter().enumerate() {
@@ -95,10 +114,11 @@ mod tests {
 
     #[test]
     fn major_merger_disks_have_visible_vertical_structure() {
-        let preset = built_in_presets()
+        let mut preset = built_in_presets()
             .into_iter()
             .find(|preset| preset.id == "major-merger")
             .unwrap();
+        strip_equilibrium_snapshots(&mut preset);
         let initial_conditions = InitialConditions::generate(&preset.config, 42).unwrap();
 
         for (galaxy_index, galaxy) in preset.config.galaxies.iter().enumerate() {
@@ -160,10 +180,11 @@ mod tests {
 
     #[test]
     fn major_merger_disks_have_exponential_radial_scale() {
-        let preset = built_in_presets()
+        let mut preset = built_in_presets()
             .into_iter()
             .find(|preset| preset.id == "major-merger")
             .unwrap();
+        strip_equilibrium_snapshots(&mut preset);
         let initial_conditions = InitialConditions::generate(&preset.config, 42).unwrap();
 
         for (galaxy_index, galaxy) in preset.config.galaxies.iter().enumerate() {
@@ -224,10 +245,11 @@ mod tests {
 
     #[test]
     fn galaxies_are_recentred_to_configured_origin_and_bulk_velocity() {
-        let preset = built_in_presets()
+        let mut preset = built_in_presets()
             .into_iter()
             .find(|preset| preset.id == "major-merger")
             .unwrap();
+        strip_equilibrium_snapshots(&mut preset);
         let initial_conditions = InitialConditions::generate(&preset.config, 42).unwrap();
 
         for (galaxy_index, galaxy) in preset.config.galaxies.iter().enumerate() {
@@ -265,10 +287,11 @@ mod tests {
 
     #[test]
     fn major_merger_orbit_is_bound_and_mass_weighted() {
-        let preset = built_in_presets()
+        let mut preset = built_in_presets()
             .into_iter()
             .find(|preset| preset.id == "major-merger")
             .unwrap();
+        strip_equilibrium_snapshots(&mut preset);
         let galaxies = &preset.config.galaxies;
         let m1 = galaxies[0].halo_mass_msun
             + galaxies[0].disk_mass_msun
@@ -302,5 +325,79 @@ mod tests {
             "orbit should start with zero net linear momentum"
         );
         assert!(specific_orbital_energy < 0.0, "major merger should start on a bound orbit");
+    }
+
+    #[test]
+    fn initial_conditions_can_load_equilibrium_snapshot_per_galaxy() {
+        let mut preset = built_in_presets()
+            .into_iter()
+            .find(|preset| preset.id == "major-merger")
+            .unwrap();
+        preset.config.galaxies.truncate(1);
+        preset.config.galaxies[0].equilibrium_snapshot = None;
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = std::env::temp_dir().join(format!("galaxy-snapshot-test-{timestamp}"));
+        let manifest_path = temp_root.join("manifest.json");
+
+        let snapshot_particles = vec![
+            Particle {
+                galaxy_index: 0,
+                component: ParticleComponent::Disk,
+                position_kpc: Vec3::new(1.0, 0.0, 0.5),
+                velocity_kms: Vec3::new(0.0, 10.0, 0.0),
+                mass_msun: 2.0,
+                softening_kpc: 0.01,
+                color_rgba: [0.1, 0.2, 0.3, 1.0],
+            },
+            Particle {
+                galaxy_index: 0,
+                component: ParticleComponent::Smbh,
+                position_kpc: Vec3::ZERO,
+                velocity_kms: Vec3::ZERO,
+                mass_msun: 1.0,
+                softening_kpc: 0.001,
+                color_rgba: [1.0, 1.0, 1.0, 1.0],
+            },
+        ];
+        write_particle_snapshot(&manifest_path, "test", 0.0, &snapshot_particles).unwrap();
+        let (_manifest, loaded_snapshot) = load_particle_snapshot(&manifest_path).unwrap();
+        assert_eq!(loaded_snapshot.len(), snapshot_particles.len());
+
+        preset.config.galaxies[0].equilibrium_snapshot =
+            Some(manifest_path.display().to_string());
+        let initial_conditions = InitialConditions::generate(&preset.config, 42).unwrap();
+        assert_eq!(initial_conditions.particles.len(), snapshot_particles.len());
+
+        let smbh = initial_conditions
+            .particles
+            .iter()
+            .find(|particle| matches!(particle.component, ParticleComponent::Smbh))
+            .unwrap();
+        let target_origin = Vec3::new(
+            preset.config.galaxies[0].position_kpc[0],
+            preset.config.galaxies[0].position_kpc[1],
+            preset.config.galaxies[0].position_kpc[2],
+        );
+        let target_velocity = Vec3::new(
+            preset.config.galaxies[0].velocity_kms[0],
+            preset.config.galaxies[0].velocity_kms[1],
+            preset.config.galaxies[0].velocity_kms[2],
+        );
+        assert_eq!(smbh.position_kpc, target_origin);
+        assert_eq!(smbh.velocity_kms, target_velocity);
+
+        let disk = initial_conditions
+            .particles
+            .iter()
+            .find(|particle| matches!(particle.component, ParticleComponent::Disk))
+            .unwrap();
+        assert!(disk.position_kpc.length() > 0.0);
+        assert_eq!(disk.color_rgba, preset.config.galaxies[0].color_rgba);
+
+        fs::remove_dir_all(temp_root).ok();
     }
 }

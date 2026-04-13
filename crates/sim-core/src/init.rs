@@ -4,14 +4,14 @@ use rand_distr::{Distribution, StandardNormal};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{GravityConfig, SimulationConfig, Vec3};
+use crate::{GravityConfig, SimulationConfig, Vec3, load_particle_snapshot};
 
 const GRAV_CONST_KPC_KMS2_PER_MSUN: f64 = 4.300_91e-6;
 const NFW_CONCENTRATION: f64 = 12.0;
-const TOOMRE_Q_TARGET: f64 = 1.7;
+const TOOMRE_Q_TARGET: f64 = 1.2;
 const EQUILIBRIUM_SAMPLES: usize = 320;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParticleComponent {
     Halo,
     Disk,
@@ -41,6 +41,8 @@ pub struct InitialConditions {
 pub enum InitialConditionError {
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+    #[error("snapshot load failed: {0}")]
+    SnapshotLoad(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -86,96 +88,13 @@ impl InitialConditions {
         let mut total_mass_msun = 0.0;
 
         for (galaxy_index, galaxy) in config.galaxies.iter().enumerate() {
-            let origin = Vec3::new(
-                galaxy.position_kpc[0],
-                galaxy.position_kpc[1],
-                galaxy.position_kpc[2],
-            );
-            let bulk_velocity = Vec3::new(
-                galaxy.velocity_kms[0],
-                galaxy.velocity_kms[1],
-                galaxy.velocity_kms[2],
-            );
-
-            let rotation = rotation_from_euler_deg(galaxy.disk_tilt_deg);
-            let potential = GalaxyPotential {
-                halo_mass_msun: galaxy.halo_mass_msun,
-                halo_scale_radius_kpc: galaxy.halo_scale_radius_kpc,
-                disk_mass_msun: galaxy.disk_mass_msun,
-                disk_scale_radius_kpc: galaxy.disk_scale_radius_kpc,
-                disk_scale_height_kpc: galaxy.disk_scale_height_kpc,
-                bulge_mass_msun: galaxy.bulge_mass_msun,
-                bulge_scale_radius_kpc: galaxy.bulge_scale_radius_kpc,
-                smbh_mass_msun: galaxy.smbh.mass_msun,
+            let galaxy_particles = if let Some(snapshot_path) = &galaxy.equilibrium_snapshot {
+                load_galaxy_from_snapshot(config, galaxy_index as u32, snapshot_path)?
+            } else {
+                generate_analytic_galaxy(config, galaxy_index as u32, galaxy, &mut rng)?
             };
-            let equilibrium = build_equilibrium_table(galaxy, &config.gravity, potential);
-            let galaxy_start = particles.len();
-
-            extend_nfw_halo(
-                &mut particles,
-                &mut rng,
-                galaxy_index as u32,
-                galaxy.halo_particle_count,
-                galaxy.halo_mass_msun,
-                galaxy.halo_scale_radius_kpc,
-                config.gravity.halo_softening_kpc,
-                galaxy.color_rgba,
-                origin,
-                bulk_velocity,
-                &equilibrium,
-            )?;
-
-            extend_exponential_disk(
-                &mut particles,
-                &mut rng,
-                galaxy_index as u32,
-                galaxy.disk_particle_count,
-                galaxy.disk_mass_msun,
-                galaxy.disk_scale_radius_kpc,
-                galaxy.disk_scale_height_kpc,
-                config.gravity.disk_softening_kpc,
-                galaxy.color_rgba,
-                origin,
-                bulk_velocity,
-                rotation,
-                &equilibrium,
-            )?;
-
-            extend_hernquist_bulge(
-                &mut particles,
-                &mut rng,
-                galaxy_index as u32,
-                galaxy.bulge_particle_count,
-                galaxy.bulge_mass_msun,
-                galaxy.bulge_scale_radius_kpc,
-                config.gravity.bulge_softening_kpc,
-                galaxy.color_rgba,
-                origin,
-                bulk_velocity,
-                &equilibrium,
-            )?;
-
-            particles.push(Particle {
-                galaxy_index: galaxy_index as u32,
-                component: ParticleComponent::Smbh,
-                position_kpc: origin,
-                velocity_kms: bulk_velocity,
-                mass_msun: galaxy.smbh.mass_msun,
-                softening_kpc: galaxy.smbh.softening_kpc,
-                color_rgba: [1.0, 1.0, 1.0, 1.0],
-            });
-
-            total_mass_msun += galaxy.halo_mass_msun
-                + galaxy.disk_mass_msun
-                + galaxy.bulge_mass_msun
-                + galaxy.smbh.mass_msun;
-
-            recenter_galaxy(
-                &mut particles[galaxy_start..],
-                origin,
-                bulk_velocity,
-                galaxy_index as u32,
-            );
+            total_mass_msun += galaxy_particles.iter().map(|particle| particle.mass_msun).sum::<f64>();
+            particles.extend(galaxy_particles);
         }
 
         Ok(Self {
@@ -184,6 +103,128 @@ impl InitialConditions {
             total_mass_msun,
         })
     }
+}
+
+pub fn generate_analytic_galaxy(
+    config: &SimulationConfig,
+    galaxy_index: u32,
+    galaxy: &crate::GalaxyConfig,
+    rng: &mut SmallRng,
+) -> Result<Vec<Particle>, InitialConditionError> {
+    let origin = Vec3::new(
+        galaxy.position_kpc[0],
+        galaxy.position_kpc[1],
+        galaxy.position_kpc[2],
+    );
+    let bulk_velocity = Vec3::new(
+        galaxy.velocity_kms[0],
+        galaxy.velocity_kms[1],
+        galaxy.velocity_kms[2],
+    );
+
+    let rotation = rotation_from_euler_deg(galaxy.disk_tilt_deg);
+    let potential = GalaxyPotential {
+        halo_mass_msun: galaxy.halo_mass_msun,
+        halo_scale_radius_kpc: galaxy.halo_scale_radius_kpc,
+        disk_mass_msun: galaxy.disk_mass_msun,
+        disk_scale_radius_kpc: galaxy.disk_scale_radius_kpc,
+        disk_scale_height_kpc: galaxy.disk_scale_height_kpc,
+        bulge_mass_msun: galaxy.bulge_mass_msun,
+        bulge_scale_radius_kpc: galaxy.bulge_scale_radius_kpc,
+        smbh_mass_msun: galaxy.smbh.mass_msun,
+    };
+    let equilibrium = build_equilibrium_table(galaxy, &config.gravity, potential);
+    let mut particles = Vec::new();
+
+    extend_nfw_halo(
+        &mut particles,
+        rng,
+        galaxy_index,
+        galaxy.halo_particle_count,
+        galaxy.halo_mass_msun,
+        galaxy.halo_scale_radius_kpc,
+        config.gravity.halo_softening_kpc,
+        galaxy.color_rgba,
+        origin,
+        bulk_velocity,
+        &equilibrium,
+    )?;
+
+    extend_exponential_disk(
+        &mut particles,
+        rng,
+        galaxy_index,
+        galaxy.disk_particle_count,
+        galaxy.disk_mass_msun,
+        galaxy.disk_scale_radius_kpc,
+        galaxy.disk_scale_height_kpc,
+        config.gravity.disk_softening_kpc,
+        galaxy.color_rgba,
+        origin,
+        bulk_velocity,
+        rotation,
+        &equilibrium,
+    )?;
+
+    extend_hernquist_bulge(
+        &mut particles,
+        rng,
+        galaxy_index,
+        galaxy.bulge_particle_count,
+        galaxy.bulge_mass_msun,
+        galaxy.bulge_scale_radius_kpc,
+        config.gravity.bulge_softening_kpc,
+        galaxy.color_rgba,
+        origin,
+        bulk_velocity,
+        &equilibrium,
+    )?;
+
+    particles.push(Particle {
+        galaxy_index,
+        component: ParticleComponent::Smbh,
+        position_kpc: origin,
+        velocity_kms: bulk_velocity,
+        mass_msun: galaxy.smbh.mass_msun,
+        softening_kpc: galaxy.smbh.softening_kpc,
+        color_rgba: [1.0, 1.0, 1.0, 1.0],
+    });
+
+    recenter_galaxy(&mut particles, origin, bulk_velocity, galaxy_index);
+    Ok(particles)
+}
+
+fn load_galaxy_from_snapshot(
+    config: &SimulationConfig,
+    galaxy_index: u32,
+    snapshot_path: &str,
+) -> Result<Vec<Particle>, InitialConditionError> {
+    let galaxy = &config.galaxies[galaxy_index as usize];
+    let (_, mut particles) = load_particle_snapshot(snapshot_path)
+        .map_err(|error| InitialConditionError::SnapshotLoad(error.to_string()))?;
+    let origin = Vec3::new(
+        galaxy.position_kpc[0],
+        galaxy.position_kpc[1],
+        galaxy.position_kpc[2],
+    );
+    let bulk_velocity = Vec3::new(
+        galaxy.velocity_kms[0],
+        galaxy.velocity_kms[1],
+        galaxy.velocity_kms[2],
+    );
+
+    for particle in &mut particles {
+        particle.galaxy_index = galaxy_index;
+        particle.position_kpc += origin;
+        particle.velocity_kms += bulk_velocity;
+        particle.color_rgba = match particle.component {
+            ParticleComponent::Smbh => [1.0, 1.0, 1.0, 1.0],
+            _ => galaxy.color_rgba,
+        };
+    }
+
+    recenter_galaxy(&mut particles, origin, bulk_velocity, galaxy_index);
+    Ok(particles)
 }
 
 fn extend_nfw_halo(

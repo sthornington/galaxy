@@ -1,4 +1,9 @@
-use std::{env, time::Instant};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Instant,
+};
 
 use anyhow::{Context, Result, bail};
 use sim_core::{
@@ -13,6 +18,8 @@ struct DiagArgs {
     batch: u32,
     relax_steps: u32,
     seed: u64,
+    isolate_galaxy: Option<usize>,
+    base_timestep_myr: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -31,30 +38,52 @@ fn main() -> Result<()> {
         .into_iter()
         .find(|preset| preset.id == args.preset_id)
         .with_context(|| format!("unknown preset `{}`", args.preset_id))?;
+    ensure_equilibrium_snapshots_for_config(&preset.config, &args.preset_id, args.seed)
+        .context("prepare equilibrium snapshot cache")?;
 
     let mut initial_conditions =
         InitialConditions::generate(&preset.config, args.seed).context("generate ICs")?;
+    let mut config = preset.config.clone();
+    if let Some(base_timestep_myr) = args.base_timestep_myr {
+        config.integration.base_timestep_myr = base_timestep_myr;
+    }
+    if let Some(galaxy_index) = args.isolate_galaxy {
+        let isolated = isolate_galaxy_state(&config, &initial_conditions, galaxy_index)
+            .with_context(|| format!("isolate galaxy {galaxy_index}"))?;
+        config = isolated.0;
+        initial_conditions = isolated.1;
+    }
     if args.relax_steps > 0 {
-        initial_conditions = relax_initial_conditions(&preset.config, initial_conditions, args.relax_steps)
+        initial_conditions = relax_initial_conditions(&config, initial_conditions, args.relax_steps)
             .context("relax ICs")?;
     }
 
-    let initial_metrics = compute_all_metrics(&initial_conditions.particles, &preset.config);
-    print_metrics("initial", 0.0, 0.0, &initial_metrics, &initial_metrics);
+    let initial_metrics = compute_all_metrics(&initial_conditions.particles, &config);
+    print_metrics("initial", 0.0, 0.0, 0.0, 1.0, &initial_metrics, &initial_metrics);
 
-    let mut backend = GpuBackend::new(&preset.config, &initial_conditions).context("create backend")?;
+    let mut backend = GpuBackend::new(&config, &initial_conditions).context("create backend")?;
     let mut completed = 0_u32;
+    let mut baseline_total_energy = None;
     while completed < args.steps {
         let run_steps = args.batch.min(args.steps - completed).max(1);
         let wall_start = Instant::now();
         let diagnostics = backend.advance(run_steps).context("advance backend")?;
         let wall_seconds = wall_start.elapsed().as_secs_f64();
+        let total_energy = diagnostics.kinetic_energy + diagnostics.estimated_potential_energy;
+        let baseline_energy = *baseline_total_energy.get_or_insert(total_energy);
+        let energy_ratio = if baseline_energy.abs() > 0.0 {
+            total_energy / baseline_energy
+        } else {
+            1.0
+        };
         let particles = backend.download_particles().context("download particles")?;
-        let metrics = compute_all_metrics(&particles, &preset.config);
+        let metrics = compute_all_metrics(&particles, &config);
         print_metrics(
             &format!("step+{run_steps}"),
             diagnostics.sim_time_myr,
             wall_seconds,
+            total_energy,
+            energy_ratio,
             &metrics,
             &initial_metrics,
         );
@@ -71,6 +100,8 @@ fn parse_args() -> Result<DiagArgs> {
         batch: 1,
         relax_steps: 16,
         seed: 42,
+        isolate_galaxy: None,
+        base_timestep_myr: None,
     };
 
     let mut it = env::args().skip(1);
@@ -81,10 +112,16 @@ fn parse_args() -> Result<DiagArgs> {
             "--batch" => args.batch = next_value(&mut it, "--batch")?.parse()?,
             "--relax-steps" => args.relax_steps = next_value(&mut it, "--relax-steps")?.parse()?,
             "--seed" => args.seed = next_value(&mut it, "--seed")?.parse()?,
+            "--base-timestep-myr" => {
+                args.base_timestep_myr = Some(next_value(&mut it, "--base-timestep-myr")?.parse()?)
+            }
+            "--isolate-galaxy" => {
+                args.isolate_galaxy = Some(next_value(&mut it, "--isolate-galaxy")?.parse()?)
+            }
             "--no-relax" => args.relax_steps = 0,
             "--help" | "-h" => {
                 println!(
-                    "usage: cargo run -p sim-cuda --bin solver_diag -- [--preset ID] [--steps N] [--batch N] [--relax-steps N] [--seed N]"
+                    "usage: cargo run -p sim-cuda --bin solver_diag -- [--preset ID] [--steps N] [--batch N] [--relax-steps N] [--seed N] [--base-timestep-myr DT] [--isolate-galaxy INDEX]"
                 );
                 std::process::exit(0);
             }
@@ -97,6 +134,93 @@ fn parse_args() -> Result<DiagArgs> {
 
 fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
     it.next().with_context(|| format!("missing value for {flag}"))
+}
+
+fn ensure_equilibrium_snapshots_for_config(
+    config: &SimulationConfig,
+    preset_id: &str,
+    seed: u64,
+) -> Result<()> {
+    for (galaxy_index, galaxy) in config.galaxies.iter().enumerate() {
+        let Some(snapshot_path) = galaxy.equilibrium_snapshot.as_deref() else {
+            continue;
+        };
+        if Path::new(snapshot_path).exists() {
+            continue;
+        }
+        generate_equilibrium_snapshot(preset_id, galaxy_index, snapshot_path, seed)
+            .with_context(|| format!("generate equilibrium snapshot for {preset_id} galaxy {galaxy_index}"))?;
+    }
+    Ok(())
+}
+
+fn generate_equilibrium_snapshot(
+    preset_id: &str,
+    galaxy_index: usize,
+    snapshot_path: &str,
+    seed: u64,
+) -> Result<()> {
+    let snapshot_path = PathBuf::from(snapshot_path);
+    if let Some(parent) = snapshot_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create equilibrium snapshot directory {}", parent.display()))?;
+    }
+
+    let mut command = resolve_equilibrate_command();
+    command
+        .arg("--preset")
+        .arg(preset_id)
+        .arg("--galaxy")
+        .arg(galaxy_index.to_string())
+        .arg("--iterations")
+        .arg("2")
+        .arg("--settle-steps")
+        .arg("20")
+        .arg("--seed")
+        .arg(seed.to_string())
+        .arg("--output")
+        .arg(&snapshot_path);
+
+    let output = command
+        .output()
+        .with_context(|| format!("spawn equilibrium generator for {preset_id} galaxy {galaxy_index}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    bail!(
+        "equilibrium generator failed with status {}:\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+fn resolve_equilibrate_command() -> Command {
+    if let Ok(explicit) = env::var("GALAXY_EQUILIBRATE_BIN") {
+        return Command::new(explicit);
+    }
+
+    if let Ok(current_exe) = env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            let sibling = parent.join("equilibrate");
+            if sibling.exists() {
+                return Command::new(sibling);
+            }
+        }
+    }
+
+    let mut command = Command::new("cargo");
+    command
+        .arg("run")
+        .arg("--release")
+        .arg("-p")
+        .arg("sim-cuda")
+        .arg("--bin")
+        .arg("equilibrate")
+        .arg("--");
+    command.current_dir("/galaxy");
+    command
 }
 
 fn relax_initial_conditions(
@@ -172,6 +296,66 @@ fn relax_initial_conditions(
         particles: relaxed_particles,
         total_mass_msun: initial_conditions.total_mass_msun,
     })
+}
+
+fn isolate_galaxy_state(
+    config: &SimulationConfig,
+    initial_conditions: &InitialConditions,
+    galaxy_index: usize,
+) -> Result<(SimulationConfig, InitialConditions)> {
+    let galaxy = config
+        .galaxies
+        .get(galaxy_index)
+        .with_context(|| format!("galaxy index {galaxy_index} out of range"))?
+        .clone();
+    let target_origin = Vec3::new(
+        galaxy.position_kpc[0],
+        galaxy.position_kpc[1],
+        galaxy.position_kpc[2],
+    );
+    let target_velocity = Vec3::new(
+        galaxy.velocity_kms[0],
+        galaxy.velocity_kms[1],
+        galaxy.velocity_kms[2],
+    );
+
+    let mut particles: Vec<Particle> = initial_conditions
+        .particles
+        .iter()
+        .filter(|particle| particle.galaxy_index == galaxy_index as u32)
+        .cloned()
+        .collect();
+    if particles.is_empty() {
+        bail!("galaxy {galaxy_index} has no particles");
+    }
+    for particle in &mut particles {
+        particle.position_kpc -= target_origin;
+        particle.velocity_kms -= target_velocity;
+        particle.galaxy_index = 0;
+    }
+
+    let total_mass_msun = particles.iter().map(|particle| particle.mass_msun).sum::<f64>();
+    let mut isolated_config = config.clone();
+    isolated_config.name = format!("{}-isolated-{galaxy_index}", config.name);
+    isolated_config.output_directory =
+        format!("{}/isolated-{galaxy_index}", config.output_directory);
+    isolated_config.initial_separation_kpc = 0.0;
+    isolated_config.initial_relative_velocity_kms = 0.0;
+    isolated_config.galaxies = vec![{
+        let mut isolated = galaxy;
+        isolated.position_kpc = [0.0, 0.0, 0.0];
+        isolated.velocity_kms = [0.0, 0.0, 0.0];
+        isolated
+    }];
+
+    Ok((
+        isolated_config,
+        InitialConditions {
+            seed: initial_conditions.seed,
+            particles,
+            total_mass_msun,
+        },
+    ))
 }
 
 fn recenter_particles(
@@ -300,10 +484,14 @@ fn print_metrics(
     label: &str,
     sim_time_myr: f64,
     wall_seconds: f64,
+    total_energy: f64,
+    energy_ratio: f64,
     metrics: &[GalaxyMetrics],
     baseline: &[GalaxyMetrics],
 ) {
-    println!("label={label} sim_time_myr={sim_time_myr:.3} wall_s={wall_seconds:.3}");
+    println!(
+        "label={label} sim_time_myr={sim_time_myr:.3} wall_s={wall_seconds:.3} total_energy={total_energy:.6e} total_energy_ratio={energy_ratio:.6}"
+    );
     for (index, (current, initial)) in metrics.iter().zip(baseline.iter()).enumerate() {
         let r50_ratio = current.disk_r50_kpc / initial.disk_r50_kpc.max(1.0e-6);
         let r90_ratio = current.disk_r90_kpc / initial.disk_r90_kpc.max(1.0e-6);

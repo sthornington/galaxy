@@ -1,11 +1,19 @@
-use std::{cmp::Ordering, collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, anyhow};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sim_core::{
-    Diagnostics, InitialConditions, Particle, SimulationConfig, SnapshotChunk, SnapshotManifest,
-    Vec3, validate_particle_count,
+    Diagnostics, InitialConditions, Particle, SimulationConfig, Vec3, validate_particle_count,
+    write_particle_snapshot,
 };
 use sim_cuda::GpuBackend;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -48,6 +56,8 @@ impl SessionRegistry {
 
     pub fn create(&self, params: CreateSessionParams) -> anyhow::Result<SessionSummary> {
         let particle_count = validate_particle_count(&params.config)?;
+        ensure_equilibrium_snapshots_for_config(&params.config, &params.preset_id, params.seed)
+            .context("failed to prepare equilibrium snapshot cache")?;
         let mut initial_conditions = InitialConditions::generate(&params.config, params.seed)
             .context("failed to generate initial conditions")?;
         if should_relax_initial_conditions(particle_count, &params.config) {
@@ -232,6 +242,100 @@ pub enum SessionCommand {
 pub struct SessionRequest {
     pub command: SessionCommand,
     pub ack: Option<oneshot::Sender<anyhow::Result<SessionSummary>>>,
+}
+
+fn ensure_equilibrium_snapshots_for_config(
+    config: &SimulationConfig,
+    preset_id: &str,
+    seed: u64,
+) -> anyhow::Result<()> {
+    if preset_id == "custom" {
+        return Ok(());
+    }
+
+    for (galaxy_index, galaxy) in config.galaxies.iter().enumerate() {
+        let Some(snapshot_path) = galaxy.equilibrium_snapshot.as_deref() else {
+            continue;
+        };
+        if Path::new(snapshot_path).exists() {
+            continue;
+        }
+        generate_equilibrium_snapshot(preset_id, galaxy_index, snapshot_path, seed)
+            .with_context(|| format!("generate equilibrium snapshot for {preset_id} galaxy {galaxy_index}"))?;
+    }
+
+    Ok(())
+}
+
+fn generate_equilibrium_snapshot(
+    preset_id: &str,
+    galaxy_index: usize,
+    snapshot_path: &str,
+    seed: u64,
+) -> anyhow::Result<()> {
+    let snapshot_path = PathBuf::from(snapshot_path);
+    if let Some(parent) = snapshot_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create equilibrium snapshot directory {}", parent.display()))?;
+    }
+
+    let mut command = resolve_equilibrate_command();
+    command
+        .arg("--preset")
+        .arg(preset_id)
+        .arg("--galaxy")
+        .arg(galaxy_index.to_string())
+        .arg("--iterations")
+        .arg("2")
+        .arg("--settle-steps")
+        .arg("20")
+        .arg("--seed")
+        .arg(seed.to_string())
+        .arg("--output")
+        .arg(&snapshot_path);
+
+    let output = command
+        .output()
+        .with_context(|| format!("spawn equilibrium generator for {preset_id} galaxy {galaxy_index}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(anyhow!(
+        "equilibrium generator failed with status {}:\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        stdout.trim(),
+        stderr.trim()
+    ))
+}
+
+fn resolve_equilibrate_command() -> Command {
+    if let Ok(explicit) = std::env::var("GALAXY_EQUILIBRATE_BIN") {
+        return Command::new(explicit);
+    }
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            let sibling = parent.join("equilibrate");
+            if sibling.exists() {
+                return Command::new(sibling);
+            }
+        }
+    }
+
+    let mut command = Command::new("cargo");
+    command
+        .arg("run")
+        .arg("--release")
+        .arg("-p")
+        .arg("sim-cuda")
+        .arg("--bin")
+        .arg("equilibrate")
+        .arg("--");
+    command.current_dir("/galaxy");
+    command
 }
 
 fn relax_initial_conditions_if_needed(
@@ -760,36 +864,9 @@ fn write_snapshot(
     let directory = PathBuf::from(&config.snapshots.directory).join(id.to_string());
     fs::create_dir_all(&directory).context("failed to create snapshot directory")?;
 
-    let manifest = SnapshotManifest {
-        schema_version: 1,
-        simulation_name: config.name.clone(),
-        sim_time_myr: summary.sim_time_myr,
-        particle_count: summary.particle_count,
-        chunk_files: vec![SnapshotChunk {
-            path: "particles.bin".to_string(),
-            particle_offset: 0,
-            particle_count: summary.particle_count,
-        }],
-    };
-
     let manifest_path = directory.join("manifest.json");
-    fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&manifest).context("failed to encode snapshot manifest")?,
-    )
-    .with_context(|| {
-        format!(
-            "failed to write snapshot manifest to {}",
-            manifest_path.display()
-        )
-    })?;
-
-    let chunk_path = directory.join("particles.bin");
-    fs::write(
-        &chunk_path,
-        bincode::serialize(particles).context("failed to encode particle chunk")?,
-    )
-    .with_context(|| format!("failed to write particle chunk {}", chunk_path.display()))?;
+    write_particle_snapshot(&manifest_path, &config.name, summary.sim_time_myr, particles)
+        .with_context(|| format!("failed to write snapshot manifest {}", manifest_path.display()))?;
 
     info!(
         "wrote snapshot manifest for session {id} to {}",

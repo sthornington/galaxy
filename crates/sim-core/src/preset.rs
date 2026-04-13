@@ -22,6 +22,10 @@ pub fn built_in_presets() -> Vec<MergerPreset> {
     ]
 }
 
+fn generated_equilibrium_snapshot_path(preset_id: &str, galaxy_index: usize) -> String {
+    format!("/galaxy/output/equilibrium/{preset_id}/galaxy-{galaxy_index}/manifest.json")
+}
+
 fn gravity_defaults() -> GravityConfig {
     GravityConfig {
         grav_const_kpc_kms2_per_msun: 4.300_91e-6,
@@ -105,6 +109,7 @@ fn set_bound_pair_orbit(
 fn major_merger() -> MergerPreset {
     let mut primary = GalaxyConfig {
         label: "Primary".to_string(),
+        equilibrium_snapshot: Some(generated_equilibrium_snapshot_path("major-merger", 0)),
         halo_mass_msun: 1.2e12,
         halo_scale_radius_kpc: 18.0,
         halo_particle_count: 800_000,
@@ -127,6 +132,7 @@ fn major_merger() -> MergerPreset {
     };
     let mut secondary = GalaxyConfig {
         label: "Secondary".to_string(),
+        equilibrium_snapshot: Some(generated_equilibrium_snapshot_path("major-merger", 1)),
         halo_mass_msun: 1.05e12,
         halo_scale_radius_kpc: 16.0,
         halo_particle_count: 720_000,
@@ -172,6 +178,7 @@ fn major_merger_debug() -> MergerPreset {
     let mut config = major_merger().config;
     config.name = "major-merger-debug".to_string();
     config.output_directory = "output/major-merger-debug".to_string();
+    config.integration.base_timestep_myr = 0.8;
     config.preview.particle_budget = 16_384;
     config.galaxies[0].halo_particle_count = 80_000;
     config.galaxies[0].disk_particle_count = 32_000;
@@ -179,6 +186,10 @@ fn major_merger_debug() -> MergerPreset {
     config.galaxies[1].halo_particle_count = 72_000;
     config.galaxies[1].disk_particle_count = 28_000;
     config.galaxies[1].bulge_particle_count = 5_600;
+    config.galaxies[0].equilibrium_snapshot =
+        Some(generated_equilibrium_snapshot_path("major-merger-debug", 0));
+    config.galaxies[1].equilibrium_snapshot =
+        Some(generated_equilibrium_snapshot_path("major-merger-debug", 1));
 
     MergerPreset {
         id: "major-merger-debug",
@@ -198,6 +209,8 @@ fn polar_flyby() -> MergerPreset {
         set_bound_pair_orbit(&mut primary[0], &mut secondary[0], 140.0, 28.0);
     config.galaxies[1].disk_tilt_deg = [88.0, 10.0, 12.0];
     config.galaxies[1].color_rgba = [0.78, 0.54, 1.0, 1.0];
+    config.galaxies[1].equilibrium_snapshot =
+        Some(generated_equilibrium_snapshot_path("polar-flyby", 1));
     MergerPreset {
         id: "polar-flyby",
         title: "Polar Fly-By",
@@ -219,6 +232,8 @@ fn minor_merger() -> MergerPreset {
     config.galaxies[1].bulge_particle_count = 48_000;
     config.galaxies[1].smbh.mass_msun = 7.5e5;
     config.galaxies[1].color_rgba = [0.59, 1.0, 0.74, 1.0];
+    config.galaxies[1].equilibrium_snapshot =
+        Some(generated_equilibrium_snapshot_path("minor-merger", 1));
     let (primary, secondary) = config.galaxies.split_at_mut(1);
     config.initial_relative_velocity_kms =
         set_bound_pair_orbit(&mut primary[0], &mut secondary[0], 140.0, 18.0);

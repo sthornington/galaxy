@@ -603,11 +603,14 @@ mod tests {
     #[test]
     #[ignore = "requires NVIDIA GPU"]
     fn major_merger_debug_stays_structurally_bound_over_first_2_myr() {
-        let config = built_in_presets()
+        let mut config = built_in_presets()
             .into_iter()
             .find(|preset| preset.id == "major-merger-debug")
             .unwrap()
             .config;
+        for galaxy in &mut config.galaxies {
+            galaxy.equilibrium_snapshot = None;
+        }
         let initial_conditions = InitialConditions::generate(&config, 42).unwrap();
         let initial_metrics = [
             galaxy_disk_metrics(&initial_conditions.particles, 0),
@@ -796,6 +799,7 @@ mod tests {
             galaxy.halo_particle_count = 96;
             galaxy.disk_particle_count = 48;
             galaxy.bulge_particle_count = 12;
+            galaxy.equilibrium_snapshot = None;
         }
         config
     }

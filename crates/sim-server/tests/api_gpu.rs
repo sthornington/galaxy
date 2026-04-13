@@ -137,6 +137,7 @@ fn small_test_config(snapshot_root: &std::path::Path) -> SimulationConfig {
         galaxy.halo_particle_count = 128;
         galaxy.disk_particle_count = 64;
         galaxy.bulge_particle_count = 16;
+        galaxy.equilibrium_snapshot = None;
     }
     config
 }
