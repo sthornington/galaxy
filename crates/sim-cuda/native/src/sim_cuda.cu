@@ -33,6 +33,7 @@ constexpr double kMinShortRangeBoxLengthKpc = 8.0;
 constexpr double kMinShortRangeCellSizeKpc = 0.35;
 constexpr double kMaxShortRangeCellSizeKpc = 3.0;
 constexpr double kShortRangeTargetOccupancy = 8.0;
+constexpr std::uint32_t kShortRangeForceFactorLutSize = 4096;
 constexpr std::size_t kMaxShortRangeCells = 4u * 1024u * 1024u;
 constexpr int kMaxShortRangeAxisCells = 1024;
 constexpr int kShortRangeDirectCellThreshold = 64;
@@ -129,6 +130,9 @@ bool profile_force_stages() {
   }();
   return enabled;
 }
+
+__host__ __device__ __forceinline__ double treepm_short_range_force_factor(
+    const double r, const double split_radius_kpc);
 
 void flush_profile_stage(const char* label,
                          const std::chrono::steady_clock::time_point start,
@@ -248,6 +252,7 @@ struct DeviceState {
   double short_cell_size[3] = {1.0, 1.0, 1.0};
   double short_cutoff_kpc = 0.0;
   double short_pm_softening_kpc = 0.0;
+  double short_force_factor_lut_scale = 0.0;
 
   SimCudaParticle* particles = nullptr;
   int* galaxy_smbh_indices = nullptr;
@@ -264,6 +269,7 @@ struct DeviceState {
   double* short_cell_octant_com_x = nullptr;
   double* short_cell_octant_com_y = nullptr;
   double* short_cell_octant_com_z = nullptr;
+  float* short_force_factor_lut = nullptr;
   ShortRangeTreeNode* short_tree_nodes = nullptr;
   std::uint32_t short_source_particle_count = 0;
   std::uint32_t short_tree_node_count = 0;
@@ -276,6 +282,7 @@ struct DeviceState {
   std::vector<double> short_cell_com_x_host;
   std::vector<double> short_cell_com_y_host;
   std::vector<double> short_cell_com_z_host;
+  std::vector<float> short_force_factor_lut_host;
   std::vector<ShortRangeTreeNode> short_tree_host;
   std::vector<SimCudaParticle> particles_host;
 
@@ -470,6 +477,7 @@ void destroy_state(DeviceState* state) {
   cudaFree(state->short_cell_octant_com_y);
   cudaFree(state->short_cell_octant_com_x);
   cudaFree(state->short_cell_octant_mass);
+  cudaFree(state->short_force_factor_lut);
   cudaFree(state->short_tree_nodes);
   cudaFree(state->short_cell_end);
   cudaFree(state->short_cell_start);
@@ -1494,6 +1502,46 @@ int update_short_range_grid(DeviceState* state,
       std::max(max_pm_cell * 1.25, 2.0 * state->max_softening_kpc);
   state->short_cutoff_kpc =
       std::max(4.5 * state->short_pm_softening_kpc, 1.5 * max_short_cell);
+
+  if (state->short_force_factor_lut == nullptr) {
+    const cudaError_t cuda_status =
+        cudaMalloc(reinterpret_cast<void**>(&state->short_force_factor_lut),
+                   sizeof(float) * kShortRangeForceFactorLutSize);
+    if (cuda_status != cudaSuccess) {
+      fill_cuda_error(
+          error_buffer, error_buffer_len, "cudaMalloc for short-range factor LUT failed", cuda_status);
+      return 1;
+    }
+    state->short_force_factor_lut_host.resize(kShortRangeForceFactorLutSize);
+  }
+
+  if (state->short_force_factor_lut_host.size() != kShortRangeForceFactorLutSize) {
+    state->short_force_factor_lut_host.resize(kShortRangeForceFactorLutSize);
+  }
+
+  const double short_cutoff_sq = state->short_cutoff_kpc * state->short_cutoff_kpc;
+  state->short_force_factor_lut_scale =
+      short_cutoff_sq > 0.0
+          ? static_cast<double>(kShortRangeForceFactorLutSize - 1) / short_cutoff_sq
+          : 0.0;
+  for (std::uint32_t i = 0; i < kShortRangeForceFactorLutSize; ++i) {
+    const double t = static_cast<double>(i) /
+                     static_cast<double>(std::max<std::uint32_t>(1, kShortRangeForceFactorLutSize - 1));
+    const double r = sqrt(t * short_cutoff_sq);
+    state->short_force_factor_lut_host[i] = static_cast<float>(
+        treepm_short_range_force_factor(r, state->short_pm_softening_kpc));
+  }
+
+  const cudaError_t lut_copy_status =
+      cudaMemcpy(state->short_force_factor_lut,
+                 state->short_force_factor_lut_host.data(),
+                 sizeof(float) * kShortRangeForceFactorLutSize,
+                 cudaMemcpyHostToDevice);
+  if (lut_copy_status != cudaSuccess) {
+    fill_cuda_error(
+        error_buffer, error_buffer_len, "short-range factor LUT upload failed", lut_copy_status);
+    return 1;
+  }
   return 0;
 }
 
@@ -1658,13 +1706,32 @@ __device__ __forceinline__ double softened_inv_r3(const double dx,
   return inv_r * inv_r * inv_r;
 }
 
-__device__ __forceinline__ double treepm_short_range_force_factor(const double r,
-                                                                  const double split_radius_kpc) {
+__host__ __device__ __forceinline__ double treepm_short_range_force_factor(
+    const double r, const double split_radius_kpc) {
   if (!(split_radius_kpc > 0.0) || !(r > 0.0)) {
     return 1.0;
   }
   const double x = 0.5 * r / split_radius_kpc;
   return erfc(x) + (r / (kSqrtPi * split_radius_kpc)) * exp(-(x * x));
+}
+
+__device__ __forceinline__ double treepm_short_range_force_factor_lookup(
+    const float* lut,
+    const std::uint32_t lut_size,
+    const double lut_scale,
+    const double r2,
+    const double split_radius_kpc) {
+  if (lut == nullptr || lut_size < 2 || !(lut_scale > 0.0)) {
+    return treepm_short_range_force_factor(sqrt(r2), split_radius_kpc);
+  }
+
+  const double scaled = fmin(r2 * lut_scale, static_cast<double>(lut_size - 1));
+  const std::uint32_t index0 = static_cast<std::uint32_t>(scaled);
+  const std::uint32_t index1 = min(index0 + 1u, lut_size - 1);
+  const double frac = scaled - static_cast<double>(index0);
+  const double value0 = static_cast<double>(lut[index0]);
+  const double value1 = static_cast<double>(lut[index1]);
+  return value0 + (value1 - value0) * frac;
 }
 
 __device__ __forceinline__ void add_point_mass_acceleration(double& ax,
@@ -2345,11 +2412,11 @@ __global__ void compute_force_from_potential_clamped(const cufftReal* potential_
   force_z[index] = -(phi_zp - phi_zm) / fmaxf(dz, 1.0e-6f);
 }
 
-__global__ void kick_particles_global(SimCudaParticle* particles,
+__global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
                                       const std::uint64_t particle_count,
-                                      const cufftReal* force_x,
-                                      const cufftReal* force_y,
-                                      const cufftReal* force_z,
+                                      const cufftReal* __restrict__ force_x,
+                                      const cufftReal* __restrict__ force_y,
+                                      const cufftReal* __restrict__ force_z,
                                       const int nx,
                                       const int ny,
                                       const int nz,
@@ -2363,18 +2430,21 @@ __global__ void kick_particles_global(SimCudaParticle* particles,
                                       const double cell_y,
                                       const double cell_z,
                                       const double inv_fft_cells,
-                                      const int* short_sorted_particle_indices,
-                                      const int* short_cell_start,
-                                      const int* short_cell_end,
-                                      const double* short_cell_mass,
-                                      const double* short_cell_com_x,
-                                      const double* short_cell_com_y,
-                                      const double* short_cell_com_z,
-                                      const double* short_cell_octant_mass,
-                                      const double* short_cell_octant_com_x,
-                                      const double* short_cell_octant_com_y,
-                                      const double* short_cell_octant_com_z,
-                                      const ShortRangeTreeNode* short_tree_nodes,
+                                      const int* __restrict__ short_sorted_particle_indices,
+                                      const int* __restrict__ short_cell_start,
+                                      const int* __restrict__ short_cell_end,
+                                      const double* __restrict__ short_cell_mass,
+                                      const double* __restrict__ short_cell_com_x,
+                                      const double* __restrict__ short_cell_com_y,
+                                      const double* __restrict__ short_cell_com_z,
+                                      const double* __restrict__ short_cell_octant_mass,
+                                      const double* __restrict__ short_cell_octant_com_x,
+                                      const double* __restrict__ short_cell_octant_com_y,
+                                      const double* __restrict__ short_cell_octant_com_z,
+                                      const float* __restrict__ short_force_factor_lut,
+                                      const std::uint32_t short_force_factor_lut_size,
+                                      const double short_force_factor_lut_scale,
+                                      const ShortRangeTreeNode* __restrict__ short_tree_nodes,
                                       const int short_tree_root,
                                       const std::uint32_t short_tree_node_count,
                                       const int short_tree_particle_mode,
@@ -2391,7 +2461,7 @@ __global__ void kick_particles_global(SimCudaParticle* particles,
                                       const double short_pm_softening_kpc,
                                       const double opening_angle,
                                       const int short_range_target_baryons_only,
-                                      const int* galaxy_smbh_indices,
+                                      const int* __restrict__ galaxy_smbh_indices,
                                       const std::uint32_t galaxy_count,
                                       const double grav_const,
                                       const int enable_smbh_post_newtonian,
@@ -2478,7 +2548,11 @@ __global__ void kick_particles_global(SimCudaParticle* particles,
             const double direct_scale =
                 grav_const * source.mass_msun * softened_inv_r3(dx, dy, dz, short_softening);
             const double correction_scale =
-                direct_scale * treepm_short_range_force_factor(sqrt(r2), short_pm_softening_kpc);
+                direct_scale * treepm_short_range_force_factor_lookup(short_force_factor_lut,
+                                                                      short_force_factor_lut_size,
+                                                                      short_force_factor_lut_scale,
+                                                                      r2,
+                                                                      short_pm_softening_kpc);
             ax += correction_scale * dx;
             ay += correction_scale * dy;
             az += correction_scale * dz;
@@ -2534,7 +2608,11 @@ __global__ void kick_particles_global(SimCudaParticle* particles,
             const double direct_scale =
                 grav_const * mass * softened_inv_r3(dx, dy, dz, cell_softening);
             const double correction_scale =
-                direct_scale * treepm_short_range_force_factor(sqrt(r2), short_pm_softening_kpc);
+                direct_scale * treepm_short_range_force_factor_lookup(short_force_factor_lut,
+                                                                      short_force_factor_lut_size,
+                                                                      short_force_factor_lut_scale,
+                                                                      r2,
+                                                                      short_pm_softening_kpc);
             ax += correction_scale * dx;
             ay += correction_scale * dy;
             az += correction_scale * dz;
@@ -2619,7 +2697,11 @@ __global__ void kick_particles_global(SimCudaParticle* particles,
         const double direct_scale =
             grav_const * node.mass * softened_inv_r3(dx, dy, dz, node_softening);
         const double correction_scale =
-            direct_scale * treepm_short_range_force_factor(sqrt(r2), short_pm_softening_kpc);
+            direct_scale * treepm_short_range_force_factor_lookup(short_force_factor_lut,
+                                                                  short_force_factor_lut_size,
+                                                                  short_force_factor_lut_scale,
+                                                                  r2,
+                                                                  short_pm_softening_kpc);
         ax += correction_scale * dx;
         ay += correction_scale * dy;
         az += correction_scale * dz;
@@ -3351,6 +3433,9 @@ int apply_force_kick_from_state(DeviceState* state,
       state->short_cell_octant_com_x,
       state->short_cell_octant_com_y,
       state->short_cell_octant_com_z,
+      state->short_force_factor_lut,
+      kShortRangeForceFactorLutSize,
+      state->short_force_factor_lut_scale,
       state->short_tree_nodes,
       state->short_tree_root,
       state->short_tree_node_count,
@@ -3398,6 +3483,21 @@ int run_steps(DeviceState* state,
   const int particle_blocks =
       static_cast<int>((state->particle_count + threads_per_block - 1) / threads_per_block);
   const double inv_fft_cells = 1.0 / static_cast<double>(state->real_count);
+  const bool profile_stages = profile_force_stages();
+
+  auto finish_profile_stage = [&](const char* label,
+                                  const std::chrono::steady_clock::time_point start) -> int {
+    if (!profile_stages) {
+      return 0;
+    }
+    const cudaError_t sync_status = cudaDeviceSynchronize();
+    if (sync_status != cudaSuccess) {
+      fill_cuda_error(error_buffer, error_buffer_len, label, sync_status);
+      return 1;
+    }
+    flush_profile_stage(label, start, std::chrono::steady_clock::now());
+    return 0;
+  };
 
   for (std::uint32_t step = 0; step < step_count; ++step) {
     const std::uint32_t substeps =
@@ -3406,11 +3506,16 @@ int run_steps(DeviceState* state,
     const double half_substep_dt_myr = 0.5 * substep_dt_myr;
 
     for (std::uint32_t substep = 0; substep < substeps; ++substep) {
+      auto stage_start = std::chrono::steady_clock::now();
       if (!state->force_state_valid &&
           build_force_state(state, error_buffer, error_buffer_len) != 0) {
         return 1;
       }
+      if (finish_profile_stage("run_steps.build_force_state_a", stage_start) != 0) {
+        return 1;
+      }
 
+      stage_start = std::chrono::steady_clock::now();
       if (apply_force_kick_from_state(state,
                                       particle_blocks,
                                       threads_per_block,
@@ -3420,7 +3525,11 @@ int run_steps(DeviceState* state,
                                       error_buffer_len) != 0) {
         return 1;
       }
+      if (finish_profile_stage("run_steps.kick_a", stage_start) != 0) {
+        return 1;
+      }
 
+      stage_start = std::chrono::steady_clock::now();
       drift_particles<<<particle_blocks, threads_per_block>>>(state->particles, state->particle_count, substep_dt_myr);
       cudaError_t cuda_status = cudaGetLastError();
       if (cuda_status != cudaSuccess) {
@@ -3428,11 +3537,19 @@ int run_steps(DeviceState* state,
         return 1;
       }
       state->force_state_valid = false;
-
-      if (build_force_state(state, error_buffer, error_buffer_len) != 0) {
+      if (finish_profile_stage("run_steps.drift", stage_start) != 0) {
         return 1;
       }
 
+      stage_start = std::chrono::steady_clock::now();
+      if (build_force_state(state, error_buffer, error_buffer_len) != 0) {
+        return 1;
+      }
+      if (finish_profile_stage("run_steps.build_force_state_b", stage_start) != 0) {
+        return 1;
+      }
+
+      stage_start = std::chrono::steady_clock::now();
       if (apply_force_kick_from_state(state,
                                       particle_blocks,
                                       threads_per_block,
@@ -3440,6 +3557,9 @@ int run_steps(DeviceState* state,
                                       half_substep_dt_myr,
                                       error_buffer,
                                       error_buffer_len) != 0) {
+        return 1;
+      }
+      if (finish_profile_stage("run_steps.kick_b", stage_start) != 0) {
         return 1;
       }
     }

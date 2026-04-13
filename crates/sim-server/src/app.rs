@@ -12,7 +12,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use sim_core::{MergerPreset, PreviewFrame, SimulationConfig, built_in_presets};
+use sim_core::{MergerPreset, SimulationConfig, built_in_presets, decode_preview_packet};
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -236,7 +236,7 @@ async fn frame_socket(
 ) {
     if let Some(frame) = session.latest_frame() {
         let send_result = if as_json {
-            match bincode::deserialize::<PreviewFrame>(&frame) {
+            match decode_preview_packet(&frame) {
                 Ok(decoded) => {
                     socket
                         .send(Message::Text(
@@ -265,7 +265,7 @@ async fn frame_socket(
         match receiver.recv().await {
             Ok(frame) => {
                 let result = if as_json {
-                    match bincode::deserialize::<PreviewFrame>(&frame) {
+                    match decode_preview_packet(&frame) {
                         Ok(decoded) => {
                             socket
                                 .send(Message::Text(

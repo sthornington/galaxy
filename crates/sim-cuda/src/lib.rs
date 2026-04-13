@@ -2,8 +2,8 @@ use std::{ffi::c_void, mem::MaybeUninit};
 
 use anyhow::{Context, anyhow};
 use sim_core::{
-    Diagnostics, InitialConditions, Particle, ParticleComponent, PreviewFrame, PreviewParticle,
-    SimulationConfig, Vec3,
+    Diagnostics, InitialConditions, Particle, ParticleComponent, PreviewFrame,
+    PreviewPacketParticle, PreviewParticle, SimulationConfig, Vec3, encode_preview_packet_into,
 };
 
 #[repr(C)]
@@ -18,17 +18,7 @@ struct FfiParticle {
     color_rgba: [f32; 4],
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct FfiPreviewParticle {
-    position_kpc: [f32; 3],
-    velocity_kms: [f32; 3],
-    mass_msun: f32,
-    galaxy_index: u32,
-    component: u32,
-    color_rgba: [f32; 4],
-    intensity: f32,
-}
+type FfiPreviewParticle = PreviewPacketParticle;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -114,6 +104,7 @@ pub struct GpuBackend {
     particle_count: u64,
     last_diagnostics: Diagnostics,
     preview_scratch: Vec<FfiPreviewParticle>,
+    preview_packet_scratch: Vec<u8>,
 }
 
 unsafe impl Send for GpuBackend {}
@@ -172,6 +163,7 @@ impl GpuBackend {
                 ..Diagnostics::default()
             },
             preview_scratch: Vec::new(),
+            preview_packet_scratch: Vec::new(),
         })
     }
 
@@ -217,7 +209,7 @@ impl GpuBackend {
         Ok(diagnostics)
     }
 
-    pub fn preview_frame(&mut self, budget: u32) -> anyhow::Result<PreviewFrame> {
+    fn fill_preview_scratch(&mut self, budget: u32) -> anyhow::Result<u32> {
         let max_particles = budget.min(self.particle_count.min(u64::from(u32::MAX)) as u32);
         self.preview_scratch.resize(
             max_particles as usize,
@@ -247,6 +239,25 @@ impl GpuBackend {
             return Err(anyhow!(decode_error(&error_buffer))).context("preview extraction failed");
         }
 
+        Ok(out_count)
+    }
+
+    pub fn preview_packet_bytes(&mut self, budget: u32) -> anyhow::Result<(Vec<u8>, Diagnostics)> {
+        let out_count = self.fill_preview_scratch(budget)?;
+        let diagnostics = Diagnostics {
+            preview_count: out_count,
+            ..self.last_diagnostics.clone()
+        };
+        encode_preview_packet_into(
+            &mut self.preview_packet_scratch,
+            &diagnostics,
+            &self.preview_scratch[..out_count as usize],
+        );
+        Ok((self.preview_packet_scratch.clone(), diagnostics))
+    }
+
+    pub fn preview_frame(&mut self, budget: u32) -> anyhow::Result<PreviewFrame> {
+        let out_count = self.fill_preview_scratch(budget)?;
         Ok(PreviewFrame {
             sim_time_myr: self.last_diagnostics.sim_time_myr,
             diagnostics: Diagnostics {
@@ -254,7 +265,7 @@ impl GpuBackend {
                 ..self.last_diagnostics.clone()
             },
             particles: self.preview_scratch[..out_count as usize]
-                .into_iter()
+                .iter()
                 .map(|particle| PreviewParticle {
                     position_kpc: particle.position_kpc,
                     velocity_kms: particle.velocity_kms,

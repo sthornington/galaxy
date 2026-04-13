@@ -532,8 +532,8 @@ async fn session_task(
     let max_steps_per_tick = particle_limited_steps
         .min(mesh_limited_steps)
         .clamp(1, 64) as u32;
-    let target_tick_wall = Duration::from_millis(900);
-    let mut steps_per_tick = max_steps_per_tick.min(4).max(1);
+    let target_tick_wall = Duration::from_millis(125);
+    let mut steps_per_tick = 1;
     let mut per_step_wall_ema_s: Option<f64> = None;
     let mut backend = match GpuBackend::new(&config, &initial_conditions) {
         Ok(backend) => backend,
@@ -857,19 +857,19 @@ fn publish_frame(
     frame_tx: &broadcast::Sender<Vec<u8>>,
 ) -> anyhow::Result<()> {
     let start = Instant::now();
-    let preview = run_backend_blocking(|| backend.preview_frame(preview_budget))?;
-    let payload = bincode::serialize(&preview).context("failed to serialize preview frame")?;
+    let (payload, diagnostics) =
+        run_backend_blocking(|| backend.preview_packet_bytes(preview_budget))?;
     if profile_session_loop() {
         info!(
             "session publish preview_budget={} preview_count={} wall_ms={:.3} bytes={}",
             preview_budget,
-            preview.diagnostics.preview_count,
+            diagnostics.preview_count,
             start.elapsed().as_secs_f64() * 1000.0,
             payload.len()
         );
     }
     *latest_frame.write() = Some(payload.clone());
-    summary.write().diagnostics = preview.diagnostics.clone();
+    summary.write().diagnostics = diagnostics;
     let _ = frame_tx.send(payload);
     Ok(())
 }

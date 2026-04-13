@@ -2,7 +2,7 @@
 mod wasm {
     use std::{cell::RefCell, rc::Rc, thread_local};
 
-    use sim_core::{PreviewFrame, PreviewParticle};
+    use sim_core::{PreviewFrame, PreviewParticle, decode_preview_packet};
     use wasm_bindgen::{JsCast, closure::Closure, prelude::*};
     use web_sys::{
         BinaryType, CanvasRenderingContext2d, HtmlCanvasElement, MessageEvent, MouseEvent,
@@ -172,7 +172,7 @@ mod wasm {
             Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
                 if let Ok(buffer) = event.data().dyn_into::<js_sys::ArrayBuffer>() {
                     let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
-                    if let Ok(decoded) = bincode::deserialize::<PreviewFrame>(&bytes) {
+                    if let Ok(decoded) = decode_preview_packet(&bytes) {
                         {
                             let mut camera = camera.borrow_mut();
                             update_scene_bounds(&mut camera, &decoded, false);

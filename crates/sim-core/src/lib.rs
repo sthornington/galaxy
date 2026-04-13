@@ -15,7 +15,10 @@ pub use init::{
 };
 pub use math::Vec3;
 pub use preset::{MergerPreset, built_in_presets};
-pub use preview::{Diagnostics, PreviewFrame, PreviewParticle};
+pub use preview::{
+    Diagnostics, PreviewFrame, PreviewPacketHeader, PreviewPacketParticle, PreviewParticle,
+    decode_preview_packet, encode_preview_packet_into,
+};
 pub use snapshot::{
     CURRENT_SNAPSHOT_SCHEMA_VERSION, SnapshotChunk, SnapshotManifest, load_particle_snapshot,
     write_particle_snapshot,
@@ -29,8 +32,10 @@ mod tests {
     };
 
     use super::{
-        InitialConditions, MergerPreset, Particle, ParticleComponent, Vec3, built_in_presets,
-        load_particle_snapshot, validate_particle_count, write_particle_snapshot,
+        Diagnostics, InitialConditions, MergerPreset, Particle, ParticleComponent,
+        PreviewPacketParticle, Vec3, built_in_presets, decode_preview_packet,
+        encode_preview_packet_into, load_particle_snapshot, validate_particle_count,
+        write_particle_snapshot,
     };
 
     fn strip_equilibrium_snapshots(preset: &mut MergerPreset) {
@@ -400,5 +405,50 @@ mod tests {
         assert_eq!(disk.color_rgba, preset.config.galaxies[0].color_rgba);
 
         fs::remove_dir_all(temp_root).ok();
+    }
+
+    #[test]
+    fn preview_packet_round_trip_preserves_particles() {
+        let diagnostics = Diagnostics {
+            particle_count: 42,
+            preview_count: 2,
+            sim_time_myr: 1.25,
+            dt_myr: 0.05,
+            kinetic_energy: 12.5,
+            estimated_potential_energy: -27.0,
+            total_momentum: Vec3::new(1.0, -2.0, 3.5),
+        };
+        let particles = vec![
+            PreviewPacketParticle {
+                position_kpc: [1.0, 2.0, 3.0],
+                velocity_kms: [4.0, 5.0, 6.0],
+                mass_msun: 7.0,
+                galaxy_index: 8,
+                component: 1,
+                color_rgba: [0.1, 0.2, 0.3, 0.4],
+                intensity: 0.9,
+            },
+            PreviewPacketParticle {
+                position_kpc: [-1.0, -2.0, -3.0],
+                velocity_kms: [-4.0, -5.0, -6.0],
+                mass_msun: 8.0,
+                galaxy_index: 9,
+                component: 2,
+                color_rgba: [0.5, 0.6, 0.7, 0.8],
+                intensity: 1.0,
+            },
+        ];
+
+        let mut bytes = Vec::new();
+        encode_preview_packet_into(&mut bytes, &diagnostics, &particles);
+        let decoded = decode_preview_packet(&bytes).unwrap();
+
+        assert_eq!(decoded.sim_time_myr, diagnostics.sim_time_myr);
+        assert_eq!(decoded.diagnostics.particle_count, diagnostics.particle_count);
+        assert_eq!(decoded.diagnostics.preview_count, diagnostics.preview_count);
+        assert_eq!(decoded.particles.len(), particles.len());
+        assert_eq!(decoded.particles[0].position_kpc, particles[0].position_kpc);
+        assert_eq!(decoded.particles[1].velocity_kms, particles[1].velocity_kms);
+        assert_eq!(decoded.particles[1].component, particles[1].component);
     }
 }
