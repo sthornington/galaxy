@@ -393,6 +393,7 @@ async fn session_task(
 ) {
     let mut preview_budget = preview_budget;
     let mut running = false;
+    let mut frame_dirty = false;
     let initial_conditions = initial_conditions;
     let particle_count = initial_conditions.particles.len() as u64;
     let mesh_cells = config
@@ -420,8 +421,8 @@ async fn session_task(
     };
 
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(config.preview.target_fps.max(1)));
-    let mut ticker = tokio::time::interval(frame_interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut frame_ticker = tokio::time::interval(frame_interval);
+    frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     if let Err(error) = publish_frame(
         &mut backend,
@@ -434,24 +435,112 @@ async fn session_task(
     }
 
     loop {
-        tokio::select! {
-            _ = ticker.tick() => {
-                if !running {
-                    continue;
+        if !running {
+            let Some(request) = command_rx.recv().await else {
+                return;
+            };
+            let SessionRequest { command, ack } = request;
+
+            if matches!(command, SessionCommand::Stop) {
+                summary.write().state = SessionState::Paused;
+                if let Some(ack) = ack {
+                    let _ = ack.send(Ok(summary.read().clone()));
                 }
-                if let Err(error) = advance_and_publish(
+                return;
+            }
+
+            let result = match command {
+                SessionCommand::Pause => {
+                    running = false;
+                    summary.write().state = SessionState::Paused;
+                    Ok(())
+                }
+                SessionCommand::Resume => {
+                    running = true;
+                    summary.write().state = SessionState::Running;
+                    Ok(())
+                }
+                SessionCommand::Step(substeps) => step_and_publish(
                     &mut backend,
-                    steps_per_tick,
+                    substeps.max(1),
                     preview_budget,
                     &summary,
                     &latest_frame,
                     &frame_tx,
-                ) {
-                    error!("session {id} failed during run loop: {error:#}");
+                ),
+                SessionCommand::Snapshot => match run_backend_blocking(|| backend.download_particles()) {
+                    Ok(particles) => {
+                        let snapshot_summary = summary.read().clone();
+                        match write_snapshot(id, &config, &snapshot_summary, &particles) {
+                            Ok(path) => {
+                                summary.write().latest_snapshot = Some(path);
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => {
+                        Err(error.context("failed to download particles for snapshot"))
+                    }
+                },
+                SessionCommand::Stop => unreachable!("stop is handled before command dispatch"),
+                SessionCommand::Control(control) => match control {
+                    ControlCommand::Pause => {
+                        running = false;
+                        summary.write().state = SessionState::Paused;
+                        Ok(())
+                    }
+                    ControlCommand::Resume => {
+                        running = true;
+                        summary.write().state = SessionState::Running;
+                        Ok(())
+                    }
+                    ControlCommand::Step { substeps } => step_and_publish(
+                        &mut backend,
+                        substeps.unwrap_or(1).max(1),
+                        preview_budget,
+                        &summary,
+                        &latest_frame,
+                        &frame_tx,
+                    ),
+                    ControlCommand::SetPreviewBudget { particle_budget } => {
+                        preview_budget = particle_budget.max(1);
+                        summary.write().preview_particle_budget = preview_budget;
+                        let result = publish_frame(
+                            &mut backend,
+                            preview_budget,
+                            &summary,
+                            &latest_frame,
+                            &frame_tx,
+                        );
+                        if result.is_ok() {
+                            frame_dirty = false;
+                        }
+                        result
+                    }
+                },
+            };
+
+            match result {
+                Ok(()) => {
+                    if let Some(ack) = ack {
+                        let _ = ack.send(Ok(summary.read().clone()));
+                    }
+                }
+                Err(error) => {
+                    error!("session {id} command failed: {error:#}");
                     summary.write().state = SessionState::Failed;
+                    if let Some(ack) = ack {
+                        let _ = ack.send(Err(error));
+                    }
                     return;
                 }
             }
+            continue;
+        }
+
+        tokio::select! {
+            biased;
             maybe_command = command_rx.recv() => {
                 let Some(request) = maybe_command else {
                     return;
@@ -523,13 +612,17 @@ async fn session_task(
                         ControlCommand::SetPreviewBudget { particle_budget } => {
                             preview_budget = particle_budget.max(1);
                             summary.write().preview_particle_budget = preview_budget;
-                            publish_frame(
+                            let result = publish_frame(
                                 &mut backend,
                                 preview_budget,
                                 &summary,
                                 &latest_frame,
                                 &frame_tx,
-                            )
+                            );
+                            if result.is_ok() {
+                                frame_dirty = false;
+                            }
+                            result
                         }
                     },
                 };
@@ -549,6 +642,32 @@ async fn session_task(
                         return;
                     }
                 }
+            }
+            _ = frame_ticker.tick(), if frame_dirty => {
+                if let Err(error) = publish_frame(
+                    &mut backend,
+                    preview_budget,
+                    &summary,
+                    &latest_frame,
+                    &frame_tx,
+                ) {
+                    error!("session {id} failed while publishing frame: {error:#}");
+                    summary.write().state = SessionState::Failed;
+                    return;
+                }
+                frame_dirty = false;
+            }
+            _ = tokio::task::yield_now() => {
+                if let Err(error) = advance_without_publish(
+                    &mut backend,
+                    steps_per_tick,
+                    &summary,
+                ) {
+                    error!("session {id} failed during run loop: {error:#}");
+                    summary.write().state = SessionState::Failed;
+                    return;
+                }
+                frame_dirty = true;
             }
         }
     }
@@ -577,6 +696,18 @@ fn advance_and_publish(
         summary.diagnostics = diagnostics;
     }
     publish_frame(backend, preview_budget, summary, latest_frame, frame_tx)
+}
+
+fn advance_without_publish(
+    backend: &mut GpuBackend,
+    steps: u32,
+    summary: &Arc<RwLock<SessionSummary>>,
+) -> anyhow::Result<()> {
+    let diagnostics = run_backend_blocking(|| backend.advance(steps.max(1)))?;
+    let mut summary = summary.write();
+    summary.sim_time_myr = diagnostics.sim_time_myr;
+    summary.diagnostics = diagnostics;
+    Ok(())
 }
 
 fn publish_frame(

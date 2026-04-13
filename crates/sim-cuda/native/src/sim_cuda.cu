@@ -33,7 +33,10 @@ constexpr double kShortRangeTargetOccupancy = 24.0;
 constexpr std::size_t kMaxShortRangeCells = 4u * 1024u * 1024u;
 constexpr int kMaxShortRangeAxisCells = 1024;
 constexpr int kShortRangeDirectCellThreshold = 64;
-constexpr std::uint32_t kParticleTreeThreshold = 300000;
+// The old host-built particle tree copied every short-range source particle back to the CPU
+// each force rebuild. That kept the GPU mostly idle on interactive runs. Keep the branch disabled
+// until the particle-tree builder itself is moved fully onto the GPU.
+constexpr std::uint32_t kParticleTreeThreshold = 0;
 constexpr int kLocalFineNx = 128;
 constexpr int kLocalFineNy = 128;
 constexpr int kLocalFineNz = 64;
@@ -696,13 +699,24 @@ int update_simulation_domain_from_device(DeviceState* state,
       const double short_center = 0.5 *
                                   ((has_short_bounds ? short_min_value : min_value) +
                                    (has_short_bounds ? short_max_value : max_value));
-      const double tight_length =
+      const double required_tight_length =
           std::max(kMinShortRangeBoxLengthKpc, short_range * kShortRangeDomainPadding);
-      const double padded_length = std::max(kMinGlobalBoxLengthKpc, range * kGlobalDomainPadding);
-      state->tight_box_length[axis] = tight_length;
-      state->tight_domain_origin[axis] = short_center - 0.5 * tight_length;
-      state->box_length[axis] = padded_length;
-      state->domain_origin[axis] = center - 0.5 * padded_length;
+      const double required_padded_length =
+          std::max(kMinGlobalBoxLengthKpc, range * kGlobalDomainPadding);
+
+      // Keep the global PM domain fixed unless particles genuinely outgrow it.
+      // Re-centering/rescaling the FFT mesh every half-kick changes the live force law and
+      // injects numerical heating into otherwise stable disks.
+      const double global_center = state->domain_origin[axis] + 0.5 * state->box_length[axis];
+      const double next_global_length = std::max(state->box_length[axis], required_padded_length);
+      state->box_length[axis] = next_global_length;
+      state->domain_origin[axis] = global_center - 0.5 * next_global_length;
+
+      // The short-range grid can follow the active region, but only grow, not shrink,
+      // so the short-range PM subtraction softening does not oscillate frame-to-frame.
+      const double next_tight_length = std::max(state->tight_box_length[axis], required_tight_length);
+      state->tight_box_length[axis] = next_tight_length;
+      state->tight_domain_origin[axis] = short_center - 0.5 * next_tight_length;
     }
     state->cell_size[0] = state->box_length[0] / static_cast<double>(state->nx);
     state->cell_size[1] = state->box_length[1] / static_cast<double>(state->ny);
