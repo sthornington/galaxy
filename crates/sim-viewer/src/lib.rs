@@ -548,8 +548,7 @@ mod wasm {
     fn render_style(projected: ProjectedParticle) -> Option<RenderParticle> {
         let base_color = stellar_base_color(&projected.particle)?;
         let mass_msun = f64::from(projected.particle.mass_msun).max(1.0);
-        let luminosity = clamp((mass_msun.log10() - 3.7) / 2.2, 0.25, 1.8)
-            * clamp(f64::from(projected.particle.intensity), 0.35, 1.4);
+        let luminosity = clamp((mass_msun.log10() - 3.7) / 2.2, 0.25, 1.8);
         let color = apply_doppler_shift(base_color, projected.radial_velocity_kms);
 
         Some(RenderParticle {

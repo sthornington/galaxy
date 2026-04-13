@@ -5,15 +5,15 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, anyhow};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sim_core::{
-    Diagnostics, InitialConditions, Particle, SimulationConfig, Vec3, validate_particle_count,
-    write_particle_snapshot,
+    CURRENT_SNAPSHOT_SCHEMA_VERSION, Diagnostics, InitialConditions, Particle, SimulationConfig,
+    SnapshotManifest, Vec3, validate_particle_count, write_particle_snapshot,
 };
 use sim_cuda::GpuBackend;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -257,7 +257,7 @@ fn ensure_equilibrium_snapshots_for_config(
         let Some(snapshot_path) = galaxy.equilibrium_snapshot.as_deref() else {
             continue;
         };
-        if Path::new(snapshot_path).exists() {
+        if equilibrium_snapshot_is_current(snapshot_path)? {
             continue;
         }
         generate_equilibrium_snapshot(preset_id, galaxy_index, snapshot_path, seed)
@@ -265,6 +265,22 @@ fn ensure_equilibrium_snapshots_for_config(
     }
 
     Ok(())
+}
+
+fn equilibrium_snapshot_is_current(snapshot_path: &str) -> anyhow::Result<bool> {
+    let manifest_path = Path::new(snapshot_path);
+    if !manifest_path.exists() {
+        return Ok(false);
+    }
+    let bytes = fs::read(manifest_path)
+        .with_context(|| format!("failed to read equilibrium manifest {}", manifest_path.display()))?;
+    let manifest: SnapshotManifest = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed to decode equilibrium manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    Ok(manifest.schema_version >= CURRENT_SNAPSHOT_SCHEMA_VERSION)
 }
 
 fn generate_equilibrium_snapshot(
@@ -286,9 +302,9 @@ fn generate_equilibrium_snapshot(
         .arg("--galaxy")
         .arg(galaxy_index.to_string())
         .arg("--iterations")
-        .arg("2")
+        .arg("4")
         .arg("--settle-steps")
-        .arg("20")
+        .arg("32")
         .arg("--seed")
         .arg(seed.to_string())
         .arg("--output")
@@ -512,9 +528,12 @@ async fn session_task(
     let particle_limited_steps =
         (target_particle_updates_per_tick / particle_count.max(1)).max(1);
     let mesh_limited_steps = (target_mesh_cells_per_tick / mesh_cells).max(1);
-    let steps_per_tick = particle_limited_steps
+    let max_steps_per_tick = particle_limited_steps
         .min(mesh_limited_steps)
         .clamp(1, u64::from(config.integration.max_substeps.max(1))) as u32;
+    let target_tick_wall = Duration::from_millis(350);
+    let mut steps_per_tick = 1_u32;
+    let mut per_step_wall_ema_s: Option<f64> = None;
     let mut backend = match GpuBackend::new(&config, &initial_conditions) {
         Ok(backend) => backend,
         Err(error) => {
@@ -762,6 +781,7 @@ async fn session_task(
                 frame_dirty = false;
             }
             _ = tokio::task::yield_now() => {
+                let advance_start = Instant::now();
                 if let Err(error) = advance_without_publish(
                     &mut backend,
                     steps_per_tick,
@@ -770,6 +790,19 @@ async fn session_task(
                     error!("session {id} failed during run loop: {error:#}");
                     summary.write().state = SessionState::Failed;
                     return;
+                }
+                let wall_seconds = advance_start.elapsed().as_secs_f64();
+                let per_step_wall_s = wall_seconds / f64::from(steps_per_tick.max(1));
+                per_step_wall_ema_s = Some(match per_step_wall_ema_s {
+                    Some(previous) => previous * 0.7 + per_step_wall_s * 0.3,
+                    None => per_step_wall_s,
+                });
+                if let Some(per_step_wall_ema_s) = per_step_wall_ema_s {
+                    let target_steps = (target_tick_wall.as_secs_f64()
+                        / per_step_wall_ema_s.max(1.0e-6))
+                        .floor()
+                        .max(1.0) as u32;
+                    steps_per_tick = target_steps.clamp(1, max_steps_per_tick.max(1));
                 }
                 frame_dirty = true;
             }
@@ -783,23 +816,6 @@ fn session_rank(state: SessionState) -> u8 {
         SessionState::Paused => 1,
         SessionState::Failed => 2,
     }
-}
-
-fn advance_and_publish(
-    backend: &mut GpuBackend,
-    steps: u32,
-    preview_budget: u32,
-    summary: &Arc<RwLock<SessionSummary>>,
-    latest_frame: &Arc<RwLock<Option<Vec<u8>>>>,
-    frame_tx: &broadcast::Sender<Vec<u8>>,
-) -> anyhow::Result<()> {
-    let diagnostics = run_backend_blocking(|| backend.advance(steps.max(1)))?;
-    {
-        let mut summary = summary.write();
-        summary.sim_time_myr = diagnostics.sim_time_myr;
-        summary.diagnostics = diagnostics;
-    }
-    publish_frame(backend, preview_budget, summary, latest_frame, frame_tx)
 }
 
 fn advance_without_publish(

@@ -65,6 +65,8 @@ pub struct GalaxyConfig {
     pub label: String,
     #[serde(default)]
     pub equilibrium_snapshot: Option<String>,
+    #[serde(default)]
+    pub initial_profile: GalaxyInitialProfile,
     pub halo_mass_msun: f64,
     pub halo_scale_radius_kpc: f64,
     pub halo_particle_count: u32,
@@ -80,6 +82,20 @@ pub struct GalaxyConfig {
     pub velocity_kms: [f64; 3],
     pub disk_tilt_deg: [f64; 3],
     pub color_rgba: [f32; 4],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GalaxyInitialProfile {
+    #[default]
+    AnalyticGalaxy,
+    UniformSphere {
+        radius_kpc: f64,
+        #[serde(default)]
+        velocity_dispersion_kms: f64,
+        #[serde(default)]
+        edge_rotation_speed_kms: f64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

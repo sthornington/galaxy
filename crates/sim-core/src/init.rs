@@ -4,7 +4,9 @@ use rand_distr::{Distribution, StandardNormal};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{GravityConfig, SimulationConfig, Vec3, load_particle_snapshot};
+use crate::{
+    GalaxyInitialProfile, GravityConfig, SimulationConfig, Vec3, load_particle_snapshot,
+};
 
 const GRAV_CONST_KPC_KMS2_PER_MSUN: f64 = 4.300_91e-6;
 const NFW_CONCENTRATION: f64 = 12.0;
@@ -122,6 +124,25 @@ pub fn generate_analytic_galaxy(
         galaxy.velocity_kms[2],
     );
 
+    if let GalaxyInitialProfile::UniformSphere {
+        radius_kpc,
+        velocity_dispersion_kms,
+        edge_rotation_speed_kms,
+    } = galaxy.initial_profile
+    {
+        return generate_uniform_sphere_galaxy(
+            config,
+            galaxy_index,
+            galaxy,
+            rng,
+            origin,
+            bulk_velocity,
+            radius_kpc,
+            velocity_dispersion_kms,
+            edge_rotation_speed_kms,
+        );
+    }
+
     let rotation = rotation_from_euler_deg(galaxy.disk_tilt_deg);
     let potential = GalaxyPotential {
         halo_mass_msun: galaxy.halo_mass_msun,
@@ -178,6 +199,89 @@ pub fn generate_analytic_galaxy(
         origin,
         bulk_velocity,
         &equilibrium,
+    )?;
+
+    particles.push(Particle {
+        galaxy_index,
+        component: ParticleComponent::Smbh,
+        position_kpc: origin,
+        velocity_kms: bulk_velocity,
+        mass_msun: galaxy.smbh.mass_msun,
+        softening_kpc: galaxy.smbh.softening_kpc,
+        color_rgba: [1.0, 1.0, 1.0, 1.0],
+    });
+
+    recenter_galaxy(&mut particles, origin, bulk_velocity, galaxy_index);
+    Ok(particles)
+}
+
+fn generate_uniform_sphere_galaxy(
+    config: &SimulationConfig,
+    galaxy_index: u32,
+    galaxy: &crate::GalaxyConfig,
+    rng: &mut SmallRng,
+    origin: Vec3,
+    bulk_velocity: Vec3,
+    radius_kpc: f64,
+    velocity_dispersion_kms: f64,
+    edge_rotation_speed_kms: f64,
+) -> Result<Vec<Particle>, InitialConditionError> {
+    if !(radius_kpc > 0.0) {
+        return Err(InitialConditionError::InvalidConfig(
+            "uniform sphere radius must be positive".to_string(),
+        ));
+    }
+    if edge_rotation_speed_kms < 0.0 {
+        return Err(InitialConditionError::InvalidConfig(
+            "uniform sphere edge rotation speed must be non-negative".to_string(),
+        ));
+    }
+
+    let mut particles = Vec::new();
+    extend_uniform_sphere_component(
+        &mut particles,
+        rng,
+        galaxy_index,
+        ParticleComponent::Halo,
+        galaxy.halo_particle_count,
+        galaxy.halo_mass_msun,
+        radius_kpc,
+        config.gravity.halo_softening_kpc,
+        galaxy.color_rgba,
+        origin,
+        bulk_velocity,
+        velocity_dispersion_kms,
+        edge_rotation_speed_kms,
+    )?;
+    extend_uniform_sphere_component(
+        &mut particles,
+        rng,
+        galaxy_index,
+        ParticleComponent::Disk,
+        galaxy.disk_particle_count,
+        galaxy.disk_mass_msun,
+        radius_kpc,
+        config.gravity.disk_softening_kpc,
+        galaxy.color_rgba,
+        origin,
+        bulk_velocity,
+        velocity_dispersion_kms,
+        edge_rotation_speed_kms,
+    )?;
+    extend_uniform_sphere_component(
+        &mut particles,
+        rng,
+        galaxy_index,
+        ParticleComponent::Bulge,
+        galaxy.bulge_particle_count,
+        galaxy.bulge_mass_msun,
+        radius_kpc,
+        config.gravity.bulge_softening_kpc,
+        galaxy.color_rgba,
+        origin,
+        bulk_velocity,
+        velocity_dispersion_kms,
+        edge_rotation_speed_kms,
     )?;
 
     particles.push(Particle {
@@ -272,6 +376,64 @@ fn extend_nfw_halo(
         });
     }
 
+    Ok(())
+}
+
+fn extend_uniform_sphere_component(
+    particles: &mut Vec<Particle>,
+    rng: &mut SmallRng,
+    galaxy_index: u32,
+    component: ParticleComponent,
+    count: u32,
+    total_mass_msun: f64,
+    radius_kpc: f64,
+    softening_kpc: f64,
+    color_rgba: [f32; 4],
+    origin: Vec3,
+    bulk_velocity: Vec3,
+    velocity_dispersion_kms: f64,
+    edge_rotation_speed_kms: f64,
+) -> Result<(), InitialConditionError> {
+    if count == 0 {
+        return Ok(());
+    }
+    if !(total_mass_msun > 0.0) {
+        return Err(InitialConditionError::InvalidConfig(format!(
+            "uniform sphere component {:?} needs positive mass when particle_count > 0",
+            component
+        )));
+    }
+
+    let particle_mass = total_mass_msun / count as f64;
+    let angular_speed_kms_per_kpc = edge_rotation_speed_kms / radius_kpc.max(1.0e-6);
+    for _ in 0..count {
+        let radius = radius_kpc * rng.random::<f64>().cbrt();
+        let direction = sample_unit_vector(rng);
+        let local_position = direction * radius;
+        let cylindrical_radius = (local_position.x * local_position.x + local_position.y * local_position.y)
+            .sqrt();
+        let rotational_velocity = if cylindrical_radius > 1.0e-6 {
+            let tangential_speed = angular_speed_kms_per_kpc * cylindrical_radius;
+            Vec3::new(
+                -local_position.y / cylindrical_radius * tangential_speed,
+                local_position.x / cylindrical_radius * tangential_speed,
+                0.0,
+            )
+        } else {
+            Vec3::ZERO
+        };
+        particles.push(Particle {
+            galaxy_index,
+            component,
+            position_kpc: origin + local_position,
+            velocity_kms: bulk_velocity
+                + rotational_velocity
+                + sample_gaussian3(rng, velocity_dispersion_kms),
+            mass_msun: particle_mass,
+            softening_kpc,
+            color_rgba,
+        });
+    }
     Ok(())
 }
 

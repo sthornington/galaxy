@@ -6,8 +6,8 @@ pub mod preview;
 pub mod snapshot;
 
 pub use config::{
-    GalaxyConfig, GravityConfig, ObserverEffectsConfig, PreviewConfig, RelativityConfig,
-    SimulationConfig, SmbhConfig, SnapshotConfig, TimeIntegrationConfig,
+    GalaxyConfig, GalaxyInitialProfile, GravityConfig, ObserverEffectsConfig, PreviewConfig,
+    RelativityConfig, SimulationConfig, SmbhConfig, SnapshotConfig, TimeIntegrationConfig,
 };
 pub use init::{
     InitialConditionError, InitialConditions, Particle, ParticleComponent, generate_analytic_galaxy,
@@ -17,7 +17,8 @@ pub use math::Vec3;
 pub use preset::{MergerPreset, built_in_presets};
 pub use preview::{Diagnostics, PreviewFrame, PreviewParticle};
 pub use snapshot::{
-    SnapshotChunk, SnapshotManifest, load_particle_snapshot, write_particle_snapshot,
+    CURRENT_SNAPSHOT_SCHEMA_VERSION, SnapshotChunk, SnapshotManifest, load_particle_snapshot,
+    write_particle_snapshot,
 };
 
 #[cfg(test)]

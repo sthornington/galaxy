@@ -7,7 +7,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use sim_core::{
-    InitialConditions, Particle, ParticleComponent, SimulationConfig, Vec3, built_in_presets,
+    CURRENT_SNAPSHOT_SCHEMA_VERSION, InitialConditions, Particle, ParticleComponent,
+    SimulationConfig, SnapshotManifest, Vec3, built_in_presets,
 };
 use sim_cuda::GpuBackend;
 
@@ -145,13 +146,29 @@ fn ensure_equilibrium_snapshots_for_config(
         let Some(snapshot_path) = galaxy.equilibrium_snapshot.as_deref() else {
             continue;
         };
-        if Path::new(snapshot_path).exists() {
+        if equilibrium_snapshot_is_current(snapshot_path)? {
             continue;
         }
         generate_equilibrium_snapshot(preset_id, galaxy_index, snapshot_path, seed)
             .with_context(|| format!("generate equilibrium snapshot for {preset_id} galaxy {galaxy_index}"))?;
     }
     Ok(())
+}
+
+fn equilibrium_snapshot_is_current(snapshot_path: &str) -> Result<bool> {
+    let manifest_path = Path::new(snapshot_path);
+    if !manifest_path.exists() {
+        return Ok(false);
+    }
+    let bytes = std::fs::read(manifest_path)
+        .with_context(|| format!("failed to read equilibrium manifest {}", manifest_path.display()))?;
+    let manifest: SnapshotManifest = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed to decode equilibrium manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    Ok(manifest.schema_version >= CURRENT_SNAPSHOT_SCHEMA_VERSION)
 }
 
 fn generate_equilibrium_snapshot(
@@ -173,9 +190,9 @@ fn generate_equilibrium_snapshot(
         .arg("--galaxy")
         .arg(galaxy_index.to_string())
         .arg("--iterations")
-        .arg("2")
+        .arg("4")
         .arg("--settle-steps")
-        .arg("20")
+        .arg("32")
         .arg("--seed")
         .arg(seed.to_string())
         .arg("--output")

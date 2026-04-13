@@ -206,9 +206,11 @@ export function createUiApp({
       return null;
     }
 
-    const luminosity =
-      clamp((Math.log10(Math.max(1, particle.mass_msun ?? 1)) - 3.7) / 2.2, 0.25, 1.8) *
-      clamp(particle.intensity ?? 0.6, 0.35, 1.4);
+    const luminosity = clamp(
+      (Math.log10(Math.max(1, particle.mass_msun ?? 1)) - 3.7) / 2.2,
+      0.25,
+      1.8,
+    );
     const color = applyDopplerShift(baseColor, projected.radialVelocityKms);
 
     return {

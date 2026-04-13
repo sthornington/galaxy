@@ -1,6 +1,6 @@
 use crate::config::{
-    GalaxyConfig, GravityConfig, ObserverEffectsConfig, PreviewConfig, RelativityConfig,
-    SimulationConfig, SmbhConfig, SnapshotConfig, TimeIntegrationConfig,
+    GalaxyConfig, GalaxyInitialProfile, GravityConfig, ObserverEffectsConfig, PreviewConfig,
+    RelativityConfig, SimulationConfig, SmbhConfig, SnapshotConfig, TimeIntegrationConfig,
 };
 
 const GRAV_CONST_KPC_KMS2_PER_MSUN: f64 = 4.300_91e-6;
@@ -15,6 +15,7 @@ pub struct MergerPreset {
 
 pub fn built_in_presets() -> Vec<MergerPreset> {
     vec![
+        uniform_sphere_collapse(),
         major_merger_debug(),
         major_merger(),
         polar_flyby(),
@@ -68,7 +69,7 @@ fn snapshot_defaults() -> SnapshotConfig {
 
 fn integration_defaults() -> TimeIntegrationConfig {
     TimeIntegrationConfig {
-        base_timestep_myr: 0.1,
+        base_timestep_myr: 0.2,
         max_substeps: 8,
         cfl_safety_factor: 0.35,
     }
@@ -110,6 +111,7 @@ fn major_merger() -> MergerPreset {
     let mut primary = GalaxyConfig {
         label: "Primary".to_string(),
         equilibrium_snapshot: Some(generated_equilibrium_snapshot_path("major-merger", 0)),
+        initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
         halo_mass_msun: 1.2e12,
         halo_scale_radius_kpc: 18.0,
         halo_particle_count: 800_000,
@@ -133,6 +135,7 @@ fn major_merger() -> MergerPreset {
     let mut secondary = GalaxyConfig {
         label: "Secondary".to_string(),
         equilibrium_snapshot: Some(generated_equilibrium_snapshot_path("major-merger", 1)),
+        initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
         halo_mass_msun: 1.05e12,
         halo_scale_radius_kpc: 16.0,
         halo_particle_count: 720_000,
@@ -174,11 +177,69 @@ fn major_merger() -> MergerPreset {
     }
 }
 
+fn uniform_sphere_collapse() -> MergerPreset {
+    MergerPreset {
+        id: "uniform-sphere-collapse",
+        title: "Rotating Uniform Sphere Collapse",
+        summary: "A dense, evenly distributed stellar sphere with modest spin around +Z, for sanity-checking rotating collapse.",
+        config: SimulationConfig {
+            name: "uniform-sphere-collapse".to_string(),
+            gravity: GravityConfig {
+                mesh_resolution: [128, 128, 128],
+                ..gravity_defaults()
+            },
+            relativity: relativity_defaults(),
+            preview: PreviewConfig {
+                particle_budget: 131_072,
+                density_grid: [960, 540],
+                target_fps: 120,
+            },
+            snapshots: snapshot_defaults(),
+            integration: TimeIntegrationConfig {
+                base_timestep_myr: 0.05,
+                max_substeps: 16,
+                cfl_safety_factor: 0.2,
+            },
+            initial_separation_kpc: 0.0,
+            initial_relative_velocity_kms: 0.0,
+            output_directory: "output/uniform-sphere-collapse".to_string(),
+            galaxies: vec![GalaxyConfig {
+                label: "Cold Sphere".to_string(),
+                equilibrium_snapshot: None,
+                initial_profile: GalaxyInitialProfile::UniformSphere {
+                    radius_kpc: 3.0,
+                    velocity_dispersion_kms: 0.0,
+                    edge_rotation_speed_kms: 200.0,
+                },
+                halo_mass_msun: 0.0,
+                halo_scale_radius_kpc: 1.0,
+                halo_particle_count: 0,
+                disk_mass_msun: 0.0,
+                disk_scale_radius_kpc: 1.0,
+                disk_scale_height_kpc: 0.2,
+                disk_particle_count: 0,
+                bulge_mass_msun: 5.0e11,
+                bulge_scale_radius_kpc: 1.0,
+                bulge_particle_count: 200_000,
+                smbh: SmbhConfig {
+                    mass_msun: 0.0,
+                    softening_kpc: 0.01,
+                    substeps: 8,
+                },
+                position_kpc: [0.0, 0.0, 0.0],
+                velocity_kms: [0.0, 0.0, 0.0],
+                disk_tilt_deg: [0.0, 0.0, 0.0],
+                color_rgba: [1.0, 0.94, 0.86, 1.0],
+            }],
+        },
+    }
+}
+
 fn major_merger_debug() -> MergerPreset {
     let mut config = major_merger().config;
     config.name = "major-merger-debug".to_string();
     config.output_directory = "output/major-merger-debug".to_string();
-    config.integration.base_timestep_myr = 0.8;
+    config.integration.base_timestep_myr = 0.2;
     config.preview.particle_budget = 16_384;
     config.galaxies[0].halo_particle_count = 80_000;
     config.galaxies[0].disk_particle_count = 32_000;

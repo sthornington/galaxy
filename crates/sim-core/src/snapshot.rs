@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::Particle;
 
+pub const CURRENT_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotManifest {
     pub schema_version: u32,
@@ -43,7 +45,7 @@ pub fn write_particle_snapshot(
     .with_context(|| format!("failed to write particle snapshot {}", chunk_path.display()))?;
 
     let manifest = SnapshotManifest {
-        schema_version: 1,
+        schema_version: CURRENT_SNAPSHOT_SCHEMA_VERSION,
         simulation_name: simulation_name.to_string(),
         sim_time_myr,
         particle_count: particles.len() as u64,

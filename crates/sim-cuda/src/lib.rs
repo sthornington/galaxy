@@ -425,9 +425,10 @@ fn decode_error(bytes: &[i8]) -> String {
 #[cfg(test)]
 mod tests {
     use sim_core::{
-        Diagnostics, GalaxyConfig, InitialConditions, ObserverEffectsConfig, Particle,
-        ParticleComponent, PreviewConfig, RelativityConfig, SimulationConfig, SmbhConfig,
-        SnapshotConfig, TimeIntegrationConfig, Vec3, built_in_presets,
+        Diagnostics, GalaxyConfig, GalaxyInitialProfile, InitialConditions,
+        ObserverEffectsConfig, Particle, ParticleComponent, PreviewConfig, RelativityConfig,
+        SimulationConfig, SmbhConfig, SnapshotConfig, TimeIntegrationConfig, Vec3,
+        built_in_presets,
     };
     use uuid::Uuid;
 
@@ -643,6 +644,29 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "requires NVIDIA GPU"]
+    fn rotating_uniform_sphere_still_contracts() {
+        let config = built_in_presets()
+            .into_iter()
+            .find(|preset| preset.id == "uniform-sphere-collapse")
+            .unwrap()
+            .config;
+        let initial_conditions = InitialConditions::generate(&config, 42).unwrap();
+        let initial_r50 = non_smbh_quantile_radius(&initial_conditions.particles, 0.5);
+
+        let mut backend = GpuBackend::new(&config, &initial_conditions).unwrap();
+        let diagnostics = backend.advance(40).unwrap();
+        assert!(diagnostics.sim_time_myr >= 2.0 - 1.0e-6);
+
+        let particles = backend.download_particles().unwrap();
+        let final_r50 = non_smbh_quantile_radius(&particles, 0.5);
+        assert!(
+            final_r50 < initial_r50 * 0.95,
+            "rotating sphere should still contract overall: initial_r50={initial_r50:.3}, final_r50={final_r50:.3}"
+        );
+    }
+
     fn mean_disk_radius(particles: &[sim_core::Particle]) -> f64 {
         let center = particles
             .iter()
@@ -672,6 +696,25 @@ mod tests {
         let mut radii: Vec<f64> = particles
             .iter()
             .filter(|particle| matches!(particle.component, ParticleComponent::Disk))
+            .map(|particle| (particle.position_kpc - center).length())
+            .collect();
+        if radii.is_empty() {
+            return 0.0;
+        }
+        radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let index = ((radii.len() - 1) as f64 * quantile.clamp(0.0, 1.0)).round() as usize;
+        radii[index]
+    }
+
+    fn non_smbh_quantile_radius(particles: &[sim_core::Particle], quantile: f64) -> f64 {
+        let center = particles
+            .iter()
+            .find(|particle| matches!(particle.component, ParticleComponent::Smbh))
+            .map(|particle| particle.position_kpc)
+            .unwrap_or(Vec3::ZERO);
+        let mut radii: Vec<f64> = particles
+            .iter()
+            .filter(|particle| !matches!(particle.component, ParticleComponent::Smbh))
             .map(|particle| (particle.position_kpc - center).length())
             .collect();
         if radii.is_empty() {
@@ -842,6 +885,8 @@ mod tests {
             },
             galaxies: vec![GalaxyConfig {
                 label: "Test".to_string(),
+                equilibrium_snapshot: None,
+                initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
                 halo_mass_msun: 0.0,
                 halo_scale_radius_kpc: 10.0,
                 halo_particle_count: 0,

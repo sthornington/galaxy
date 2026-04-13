@@ -918,6 +918,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cmake",
+ "serde_json",
  "sim-core",
  "uuid",
 ]
