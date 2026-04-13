@@ -209,7 +209,7 @@ fn uniform_sphere_collapse() -> MergerPreset {
                 initial_profile: GalaxyInitialProfile::UniformSphere {
                     radius_kpc: 3.0,
                     velocity_dispersion_kms: 0.0,
-                    edge_rotation_speed_kms: 200.0,
+                    edge_rotation_speed_kms: 320.0,
                 },
                 halo_mass_msun: 0.0,
                 halo_scale_radius_kpc: 1.0,

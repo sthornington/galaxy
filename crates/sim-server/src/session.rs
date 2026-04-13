@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::HashMap,
+    env,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -523,16 +524,16 @@ async fn session_task(
         .map(u64::from)
         .product::<u64>()
         .max(1);
-    let target_particle_updates_per_tick = 96_000_000_u64;
-    let target_mesh_cells_per_tick = 12_000_000_u64;
+    let target_particle_updates_per_tick = 512_000_000_u64;
+    let target_mesh_cells_per_tick = 160_000_000_u64;
     let particle_limited_steps =
         (target_particle_updates_per_tick / particle_count.max(1)).max(1);
     let mesh_limited_steps = (target_mesh_cells_per_tick / mesh_cells).max(1);
     let max_steps_per_tick = particle_limited_steps
         .min(mesh_limited_steps)
-        .clamp(1, u64::from(config.integration.max_substeps.max(1))) as u32;
-    let target_tick_wall = Duration::from_millis(350);
-    let mut steps_per_tick = 1_u32;
+        .clamp(1, 64) as u32;
+    let target_tick_wall = Duration::from_millis(900);
+    let mut steps_per_tick = max_steps_per_tick.min(4).max(1);
     let mut per_step_wall_ema_s: Option<f64> = None;
     let mut backend = match GpuBackend::new(&config, &initial_conditions) {
         Ok(backend) => backend,
@@ -800,7 +801,7 @@ async fn session_task(
                 if let Some(per_step_wall_ema_s) = per_step_wall_ema_s {
                     let target_steps = (target_tick_wall.as_secs_f64()
                         / per_step_wall_ema_s.max(1.0e-6))
-                        .floor()
+                        .round()
                         .max(1.0) as u32;
                     steps_per_tick = target_steps.clamp(1, max_steps_per_tick.max(1));
                 }
@@ -818,12 +819,30 @@ fn session_rank(state: SessionState) -> u8 {
     }
 }
 
+fn profile_session_loop() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        env::var("SIM_SERVER_PROFILE_SESSION_LOOP")
+            .map(|value| value != "0")
+            .unwrap_or(false)
+    })
+}
+
 fn advance_without_publish(
     backend: &mut GpuBackend,
     steps: u32,
     summary: &Arc<RwLock<SessionSummary>>,
 ) -> anyhow::Result<()> {
+    let start = Instant::now();
     let diagnostics = run_backend_blocking(|| backend.advance(steps.max(1)))?;
+    if profile_session_loop() {
+        info!(
+            "session advance steps={} wall_ms={:.3} sim_time_myr={:.3}",
+            steps.max(1),
+            start.elapsed().as_secs_f64() * 1000.0,
+            diagnostics.sim_time_myr
+        );
+    }
     let mut summary = summary.write();
     summary.sim_time_myr = diagnostics.sim_time_myr;
     summary.diagnostics = diagnostics;
@@ -837,8 +856,18 @@ fn publish_frame(
     latest_frame: &Arc<RwLock<Option<Vec<u8>>>>,
     frame_tx: &broadcast::Sender<Vec<u8>>,
 ) -> anyhow::Result<()> {
+    let start = Instant::now();
     let preview = run_backend_blocking(|| backend.preview_frame(preview_budget))?;
     let payload = bincode::serialize(&preview).context("failed to serialize preview frame")?;
+    if profile_session_loop() {
+        info!(
+            "session publish preview_budget={} preview_count={} wall_ms={:.3} bytes={}",
+            preview_budget,
+            preview.diagnostics.preview_count,
+            start.elapsed().as_secs_f64() * 1000.0,
+            payload.len()
+        );
+    }
     *latest_frame.write() = Some(payload.clone());
     summary.write().diagnostics = preview.diagnostics.clone();
     let _ = frame_tx.send(payload);

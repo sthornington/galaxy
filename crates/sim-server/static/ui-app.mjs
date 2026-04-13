@@ -211,16 +211,17 @@ export function createUiApp({
       0.25,
       1.8,
     );
+    const renderLuminosity = Math.pow(luminosity, 0.58);
     const color = applyDopplerShift(baseColor, projected.radialVelocityKms);
 
     return {
       x: projected.x,
       y: projected.y,
       depth: projected.depth,
-      glowRadius: Math.max(0.7, 1.6 * luminosity * projected.perspective),
-      coreRadius: Math.max(0.45, 0.7 * luminosity * projected.perspective),
-      glowAlpha: clamp(0.05 * luminosity * projected.perspective, 0.02, 0.2),
-      coreAlpha: clamp(0.18 * luminosity * projected.perspective, 0.08, 0.42),
+      glowRadius: Math.max(0.6, 1.3 * renderLuminosity * projected.perspective),
+      coreRadius: Math.max(0.32, 0.42 * renderLuminosity * projected.perspective),
+      glowAlpha: clamp(0.012 * renderLuminosity * projected.perspective, 0.003, 0.03),
+      coreAlpha: clamp(0.032 * renderLuminosity * projected.perspective, 0.01, 0.08),
       color,
     };
   }

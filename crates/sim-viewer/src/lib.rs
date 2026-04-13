@@ -549,16 +549,17 @@ mod wasm {
         let base_color = stellar_base_color(&projected.particle)?;
         let mass_msun = f64::from(projected.particle.mass_msun).max(1.0);
         let luminosity = clamp((mass_msun.log10() - 3.7) / 2.2, 0.25, 1.8);
+        let render_luminosity = luminosity.powf(0.58);
         let color = apply_doppler_shift(base_color, projected.radial_velocity_kms);
 
         Some(RenderParticle {
             x: projected.x,
             y: projected.y,
             depth: projected.depth,
-            glow_radius: (1.6 * luminosity * projected.perspective).max(0.7),
-            core_radius: (0.7 * luminosity * projected.perspective).max(0.45),
-            glow_alpha: clamp(0.05 * luminosity * projected.perspective, 0.02, 0.2),
-            core_alpha: clamp(0.18 * luminosity * projected.perspective, 0.08, 0.42),
+            glow_radius: (1.3 * render_luminosity * projected.perspective).max(0.6),
+            core_radius: (0.42 * render_luminosity * projected.perspective).max(0.32),
+            glow_alpha: clamp(0.012 * render_luminosity * projected.perspective, 0.003, 0.03),
+            core_alpha: clamp(0.032 * render_luminosity * projected.perspective, 0.01, 0.08),
             color,
         })
     }
