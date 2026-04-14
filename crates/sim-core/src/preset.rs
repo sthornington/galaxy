@@ -79,6 +79,10 @@ fn total_galaxy_mass_msun(galaxy: &GalaxyConfig) -> f64 {
     galaxy.halo_mass_msun + galaxy.disk_mass_msun + galaxy.bulge_mass_msun + galaxy.smbh.mass_msun
 }
 
+fn circular_speed_kms(total_mass_msun: f64, radius_kpc: f64) -> f64 {
+    (GRAV_CONST_KPC_KMS2_PER_MSUN * total_mass_msun / radius_kpc.max(1.0e-6)).sqrt()
+}
+
 fn set_bound_pair_orbit(
     primary: &mut GalaxyConfig,
     secondary: &mut GalaxyConfig,
@@ -112,18 +116,18 @@ fn major_merger() -> MergerPreset {
         label: "Primary".to_string(),
         equilibrium_snapshot: Some(generated_equilibrium_snapshot_path("major-merger", 0)),
         initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
-        halo_mass_msun: 1.2e12,
+        halo_mass_msun: 3.0e12,
         halo_scale_radius_kpc: 18.0,
         halo_particle_count: 800_000,
-        disk_mass_msun: 6.0e10,
+        disk_mass_msun: 1.15e11,
         disk_scale_radius_kpc: 3.8,
         disk_scale_height_kpc: 0.35,
         disk_particle_count: 320_000,
-        bulge_mass_msun: 9.0e9,
+        bulge_mass_msun: 2.0e10,
         bulge_scale_radius_kpc: 0.8,
         bulge_particle_count: 64_000,
         smbh: SmbhConfig {
-            mass_msun: 4.3e6,
+            mass_msun: 8.0e6,
             softening_kpc: 0.002,
             substeps: 16,
         },
@@ -136,18 +140,18 @@ fn major_merger() -> MergerPreset {
         label: "Secondary".to_string(),
         equilibrium_snapshot: Some(generated_equilibrium_snapshot_path("major-merger", 1)),
         initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
-        halo_mass_msun: 1.05e12,
+        halo_mass_msun: 2.7e12,
         halo_scale_radius_kpc: 16.0,
         halo_particle_count: 720_000,
-        disk_mass_msun: 5.5e10,
+        disk_mass_msun: 1.0e11,
         disk_scale_radius_kpc: 3.2,
         disk_scale_height_kpc: 0.32,
         disk_particle_count: 280_000,
-        bulge_mass_msun: 8.0e9,
+        bulge_mass_msun: 1.7e10,
         bulge_scale_radius_kpc: 0.7,
         bulge_particle_count: 56_000,
         smbh: SmbhConfig {
-            mass_msun: 3.7e6,
+            mass_msun: 7.0e6,
             softening_kpc: 0.002,
             substeps: 16,
         },
@@ -156,7 +160,7 @@ fn major_merger() -> MergerPreset {
         disk_tilt_deg: [-35.0, 70.0, 18.0],
         color_rgba: [0.45, 0.76, 1.0, 1.0],
     };
-    let relative_speed = set_bound_pair_orbit(&mut primary, &mut secondary, 70.0, 14.0);
+    let relative_speed = set_bound_pair_orbit(&mut primary, &mut secondary, 40.0, 10.0);
 
     MergerPreset {
         id: "major-merger",
@@ -169,7 +173,7 @@ fn major_merger() -> MergerPreset {
             preview: preview_defaults(),
             snapshots: snapshot_defaults(),
             integration: integration_defaults(),
-            initial_separation_kpc: 70.0,
+            initial_separation_kpc: 40.0,
             initial_relative_velocity_kms: relative_speed,
             output_directory: "output/major-merger".to_string(),
             galaxies: vec![primary, secondary],
@@ -178,10 +182,14 @@ fn major_merger() -> MergerPreset {
 }
 
 fn uniform_sphere_collapse() -> MergerPreset {
+    let sphere_radius_kpc = 3.0;
+    let sphere_total_mass_msun = 1.75e11 + 3.25e11;
+    let sphere_edge_circular_speed_kms =
+        circular_speed_kms(sphere_total_mass_msun, sphere_radius_kpc);
     MergerPreset {
         id: "uniform-sphere-collapse",
         title: "Rotating Uniform Sphere Collapse",
-        summary: "A dense, evenly distributed halo+stellar sphere with stronger spin around +Z, for sanity-checking rotating collapse.",
+        summary: "A dense, evenly distributed halo+stellar sphere with near-circular rotational support around +Z, for sanity-checking rotating collapse.",
         config: SimulationConfig {
             name: "uniform-sphere-collapse".to_string(),
             gravity: GravityConfig {
@@ -207,9 +215,9 @@ fn uniform_sphere_collapse() -> MergerPreset {
                 label: "Cold Sphere".to_string(),
                 equilibrium_snapshot: None,
                 initial_profile: GalaxyInitialProfile::UniformSphere {
-                    radius_kpc: 3.0,
-                    velocity_dispersion_kms: 0.0,
-                    edge_rotation_speed_kms: 520.0,
+                    radius_kpc: sphere_radius_kpc,
+                    velocity_dispersion_kms: sphere_edge_circular_speed_kms * 0.035,
+                    edge_rotation_speed_kms: sphere_edge_circular_speed_kms * 0.98,
                 },
                 halo_mass_msun: 1.75e11,
                 halo_scale_radius_kpc: 1.0,
@@ -264,10 +272,10 @@ fn polar_flyby() -> MergerPreset {
     let mut config = major_merger().config;
     config.name = "polar-flyby".to_string();
     config.output_directory = "output/polar-flyby".to_string();
-    config.initial_separation_kpc = 100.0;
+    config.initial_separation_kpc = 55.0;
     let (primary, secondary) = config.galaxies.split_at_mut(1);
     config.initial_relative_velocity_kms =
-        set_bound_pair_orbit(&mut primary[0], &mut secondary[0], 100.0, 28.0);
+        set_bound_pair_orbit(&mut primary[0], &mut secondary[0], 55.0, 20.0);
     config.galaxies[1].disk_tilt_deg = [88.0, 10.0, 12.0];
     config.galaxies[1].color_rgba = [0.78, 0.54, 1.0, 1.0];
     config.galaxies[1].equilibrium_snapshot =
@@ -284,20 +292,20 @@ fn minor_merger() -> MergerPreset {
     let mut config = major_merger().config;
     config.name = "minor-merger".to_string();
     config.output_directory = "output/minor-merger".to_string();
-    config.initial_separation_kpc = 100.0;
-    config.galaxies[1].halo_mass_msun = 2.8e11;
+    config.initial_separation_kpc = 55.0;
+    config.galaxies[1].halo_mass_msun = 7.0e11;
     config.galaxies[1].halo_particle_count = 950_000;
-    config.galaxies[1].disk_mass_msun = 1.4e10;
+    config.galaxies[1].disk_mass_msun = 3.5e10;
     config.galaxies[1].disk_particle_count = 360_000;
-    config.galaxies[1].bulge_mass_msun = 1.2e9;
+    config.galaxies[1].bulge_mass_msun = 4.5e9;
     config.galaxies[1].bulge_particle_count = 48_000;
-    config.galaxies[1].smbh.mass_msun = 7.5e5;
+    config.galaxies[1].smbh.mass_msun = 2.0e6;
     config.galaxies[1].color_rgba = [0.59, 1.0, 0.74, 1.0];
     config.galaxies[1].equilibrium_snapshot =
         Some(generated_equilibrium_snapshot_path("minor-merger", 1));
     let (primary, secondary) = config.galaxies.split_at_mut(1);
     config.initial_relative_velocity_kms =
-        set_bound_pair_orbit(&mut primary[0], &mut secondary[0], 100.0, 18.0);
+        set_bound_pair_orbit(&mut primary[0], &mut secondary[0], 55.0, 14.0);
     MergerPreset {
         id: "minor-merger",
         title: "Minor Merger",
