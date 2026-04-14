@@ -130,7 +130,7 @@ export function createUiApp({
     const focalLength = (Math.min(width, height) * 0.5) / Math.tan(fov * 0.5);
     const x = width * 0.5 + (dot3(relative, right) * focalLength) / depth;
     const y = height * 0.5 - (dot3(relative, up) * focalLength) / depth;
-    const perspective = clamp((focalLength / depth) * 0.18, 0.35, 3.5);
+    const perspective = clamp((focalLength / depth) * 0.18, 0.08, 3.5);
 
     return { x, y, depth, perspective, forward };
   }
@@ -213,17 +213,165 @@ export function createUiApp({
     );
     const renderLuminosity = Math.pow(luminosity, 0.58);
     const color = applyDopplerShift(baseColor, projected.radialVelocityKms);
+    const sizeScale = Math.pow(projected.perspective, 1.28);
+    const alphaScale = Math.pow(projected.perspective, 1.42);
 
     return {
       x: projected.x,
       y: projected.y,
       depth: projected.depth,
-      glowRadius: Math.max(0.6, 1.3 * renderLuminosity * projected.perspective),
-      coreRadius: Math.max(0.32, 0.42 * renderLuminosity * projected.perspective),
-      glowAlpha: clamp(0.012 * renderLuminosity * projected.perspective, 0.003, 0.03),
-      coreAlpha: clamp(0.032 * renderLuminosity * projected.perspective, 0.01, 0.08),
+      glowRadius: Math.max(0.08, 0.52 * renderLuminosity * sizeScale),
+      coreRadius: Math.max(0.03, 0.12 * renderLuminosity * sizeScale),
+      glowAlpha: clamp(0.0024 * renderLuminosity * alphaScale, 0.00045, 0.009),
+      coreAlpha: clamp(0.06 * renderLuminosity * alphaScale, 0.006, 0.16),
       color,
     };
+  }
+
+  function buildHaloField(width, height, haloPoints) {
+    const gridWidth = Math.max(48, Math.floor(width / 10));
+    const gridHeight = Math.max(27, Math.floor(height / 10));
+    const density = new Float32Array(gridWidth * gridHeight);
+    let maxDensity = 0;
+
+    function accumulate(ix, iy, weight) {
+      if (ix < 0 || iy < 0 || ix >= gridWidth || iy >= gridHeight || weight <= 0) {
+        return;
+      }
+      const slot = iy * gridWidth + ix;
+      density[slot] += weight;
+      maxDensity = Math.max(maxDensity, density[slot]);
+    }
+
+    for (const point of haloPoints) {
+      const gx = clamp((point.x / width) * gridWidth, 0, gridWidth - 1.0001);
+      const gy = clamp((point.y / height) * gridHeight, 0, gridHeight - 1.0001);
+      const ix = Math.floor(gx);
+      const iy = Math.floor(gy);
+      const tx = gx - ix;
+      const ty = gy - iy;
+      const massWeight = clamp(Math.log10(Math.max(1, point.particle.mass_msun)) / 6.5, 0.18, 1.0);
+      const perspectiveWeight = Math.pow(Math.max(0.08, point.perspective), 0.85);
+      const weight = massWeight * perspectiveWeight;
+      accumulate(ix, iy, weight * (1 - tx) * (1 - ty));
+      accumulate(ix + 1, iy, weight * tx * (1 - ty));
+      accumulate(ix, iy + 1, weight * (1 - tx) * ty);
+      accumulate(ix + 1, iy + 1, weight * tx * ty);
+    }
+
+    return {
+      density,
+      gridWidth,
+      gridHeight,
+      cellWidth: width / gridWidth,
+      cellHeight: height / gridHeight,
+      maxDensity,
+    };
+  }
+
+  function drawHaloContours(field) {
+    if (field.maxDensity <= 0) {
+      return;
+    }
+
+    const thresholds = [
+      { level: 0.16, color: "rgba(110, 170, 255, 0.12)", width: 0.8 },
+      { level: 0.32, color: "rgba(130, 205, 255, 0.18)", width: 0.95 },
+      { level: 0.54, color: "rgba(185, 235, 255, 0.26)", width: 1.05 },
+    ];
+
+    function edgePoint(x0, y0, v0, x1, y1, v1, threshold) {
+      const dv = v1 - v0;
+      if (Math.abs(dv) <= 1.0e-8) {
+        return null;
+      }
+      const t = (threshold - v0) / dv;
+      if (t < 0 || t > 1) {
+        return null;
+      }
+      return [x0 + (x1 - x0) * t, y0 + (y1 - y0) * t];
+    }
+
+    for (const threshold of thresholds) {
+      context.save?.();
+      context.strokeStyle = threshold.color;
+      context.lineWidth = threshold.width;
+      for (let y = 0; y < field.gridHeight - 1; y += 1) {
+        for (let x = 0; x < field.gridWidth - 1; x += 1) {
+          const v00 = field.density[y * field.gridWidth + x] / field.maxDensity;
+          const v10 = field.density[y * field.gridWidth + x + 1] / field.maxDensity;
+          const v01 = field.density[(y + 1) * field.gridWidth + x] / field.maxDensity;
+          const v11 = field.density[(y + 1) * field.gridWidth + x + 1] / field.maxDensity;
+          const minValue = Math.min(v00, v10, v01, v11);
+          const maxValue = Math.max(v00, v10, v01, v11);
+          if (minValue > threshold.level || maxValue < threshold.level) {
+            continue;
+          }
+
+          const x0 = x * field.cellWidth;
+          const x1 = (x + 1) * field.cellWidth;
+          const y0 = y * field.cellHeight;
+          const y1 = (y + 1) * field.cellHeight;
+          const points = [];
+          const top = edgePoint(x0, y0, v00, x1, y0, v10, threshold.level);
+          const right = edgePoint(x1, y0, v10, x1, y1, v11, threshold.level);
+          const bottom = edgePoint(x1, y1, v11, x0, y1, v01, threshold.level);
+          const left = edgePoint(x0, y1, v01, x0, y0, v00, threshold.level);
+          if (top) points.push(top);
+          if (right) points.push(right);
+          if (bottom) points.push(bottom);
+          if (left) points.push(left);
+          if (points.length < 2) {
+            continue;
+          }
+          context.beginPath();
+          context.moveTo(points[0][0], points[0][1]);
+          context.lineTo(points[1][0], points[1][1]);
+          context.stroke();
+          if (points.length === 4) {
+            context.beginPath();
+            context.moveTo(points[2][0], points[2][1]);
+            context.lineTo(points[3][0], points[3][1]);
+            context.stroke();
+          }
+        }
+      }
+      context.restore?.();
+    }
+  }
+
+  function drawHaloFogAndContours(width, height, haloPoints) {
+    if (!haloPoints.length) {
+      return;
+    }
+    const field = buildHaloField(width, height, haloPoints);
+    if (!(field.maxDensity > 0)) {
+      return;
+    }
+
+    context.save?.();
+    for (let y = 0; y < field.gridHeight; y += 1) {
+      for (let x = 0; x < field.gridWidth; x += 1) {
+        const density = field.density[y * field.gridWidth + x] / field.maxDensity;
+        if (density < 0.03) {
+          continue;
+        }
+        const fog = Math.pow(density, 0.62);
+        const alpha = clamp(0.015 + 0.11 * fog, 0.0, 0.12);
+        const red = Math.floor(36 + 28 * fog);
+        const green = Math.floor(88 + 72 * fog);
+        const blue = Math.floor(132 + 108 * fog);
+        context.fillStyle = `rgba(${red}, ${green}, ${blue}, ${alpha})`;
+        context.fillRect(
+          x * field.cellWidth,
+          y * field.cellHeight,
+          field.cellWidth + 0.7,
+          field.cellHeight + 0.7
+        );
+      }
+    }
+    context.restore?.();
+    drawHaloContours(field);
   }
 
   let activeSessionId = null;
@@ -309,17 +457,23 @@ export function createUiApp({
     context.fillStyle = gradient;
     context.fillRect(0, 0, width, height);
 
-    const projected = [];
+    const stellarProjected = [];
     for (const particle of frame.particles) {
       const point = projectParticle(particle, width, height);
-      if (point) {
-        projected.push(point);
+      if (!point) {
+        continue;
+      }
+      if ((particle.component ?? 0) === 0) continue;
+      const style = stellarRenderStyle(point);
+      if (style) {
+        stellarProjected.push(style);
       }
     }
-    projected.sort((left, right) => right.depth - left.depth);
+
+    stellarProjected.sort((left, right) => right.depth - left.depth);
     context.globalCompositeOperation = "lighter";
 
-    for (const point of projected.map(stellarRenderStyle).filter(Boolean)) {
+    for (const point of stellarProjected) {
       const [r, g, b] = point.color;
       context.fillStyle = `rgba(${Math.floor(
         r * 255

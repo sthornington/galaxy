@@ -118,6 +118,15 @@ mod wasm {
         color: [f64; 3],
     }
 
+    struct HaloField {
+        density: Vec<f64>,
+        grid_w: usize,
+        grid_h: usize,
+        cell_w: f64,
+        cell_h: f64,
+        max_density: f64,
+    }
+
     struct CameraBasis {
         distance: f64,
         camera_position: [f64; 3],
@@ -498,7 +507,7 @@ mod wasm {
         let focal_length = (width.min(height) * 0.5) / (fov * 0.5).tan();
         let x = width * 0.5 + dot3(relative, basis.right) * focal_length / depth;
         let y = height * 0.5 - dot3(relative, basis.up) * focal_length / depth;
-        let perspective = clamp((focal_length / depth) * 0.18, 0.35, 3.5);
+        let perspective = clamp((focal_length / depth) * 0.18, 0.08, 3.5);
         Some((x, y, depth, perspective, basis.forward))
     }
 
@@ -579,17 +588,186 @@ mod wasm {
         let luminosity = clamp((mass_msun.log10() - 3.7) / 2.2, 0.25, 1.8);
         let render_luminosity = luminosity.powf(0.58);
         let color = apply_doppler_shift(base_color, projected.radial_velocity_kms);
+        let size_scale = projected.perspective.powf(1.28);
+        let alpha_scale = projected.perspective.powf(1.42);
 
         Some(RenderParticle {
             x: projected.x,
             y: projected.y,
             depth: projected.depth,
-            glow_radius: (1.3 * render_luminosity * projected.perspective).max(0.6),
-            core_radius: (0.42 * render_luminosity * projected.perspective).max(0.32),
-            glow_alpha: clamp(0.012 * render_luminosity * projected.perspective, 0.003, 0.03),
-            core_alpha: clamp(0.032 * render_luminosity * projected.perspective, 0.01, 0.08),
+            glow_radius: (0.52 * render_luminosity * size_scale).max(0.08),
+            core_radius: (0.12 * render_luminosity * size_scale).max(0.03),
+            glow_alpha: clamp(0.0024 * render_luminosity * alpha_scale, 0.00045, 0.009),
+            core_alpha: clamp(0.06 * render_luminosity * alpha_scale, 0.006, 0.16),
             color,
         })
+    }
+
+    fn build_halo_field(points: &[ProjectedParticle], width: f64, height: f64) -> HaloField {
+        let grid_w = ((width / 10.0).floor() as usize).max(48);
+        let grid_h = ((height / 10.0).floor() as usize).max(27);
+        let mut density = vec![0.0; grid_w * grid_h];
+        let mut max_density: f64 = 0.0;
+
+        let mut accumulate = |ix: isize, iy: isize, weight: f64| {
+            if ix < 0 || iy < 0 || weight <= 0.0 {
+                return;
+            }
+            let ix = ix as usize;
+            let iy = iy as usize;
+            if ix >= grid_w || iy >= grid_h {
+                return;
+            }
+            let slot = iy * grid_w + ix;
+            density[slot] += weight;
+            max_density = max_density.max(density[slot]);
+        };
+
+        for point in points {
+            let gx = clamp(point.x / width * grid_w as f64, 0.0, grid_w as f64 - 1.0001);
+            let gy = clamp(point.y / height * grid_h as f64, 0.0, grid_h as f64 - 1.0001);
+            let ix = gx.floor() as isize;
+            let iy = gy.floor() as isize;
+            let tx = gx - ix as f64;
+            let ty = gy - iy as f64;
+            let mass_weight = clamp(
+                f64::from(point.particle.mass_msun).max(1.0).log10() / 6.5,
+                0.18,
+                1.0,
+            );
+            let perspective_weight = point.perspective.max(0.08).powf(0.85);
+            let weight = mass_weight * perspective_weight;
+            accumulate(ix, iy, weight * (1.0 - tx) * (1.0 - ty));
+            accumulate(ix + 1, iy, weight * tx * (1.0 - ty));
+            accumulate(ix, iy + 1, weight * (1.0 - tx) * ty);
+            accumulate(ix + 1, iy + 1, weight * tx * ty);
+        }
+
+        HaloField {
+            density,
+            grid_w,
+            grid_h,
+            cell_w: width / grid_w as f64,
+            cell_h: height / grid_h as f64,
+            max_density,
+        }
+    }
+
+    fn edge_point(
+        x0: f64,
+        y0: f64,
+        v0: f64,
+        x1: f64,
+        y1: f64,
+        v1: f64,
+        threshold: f64,
+    ) -> Option<(f64, f64)> {
+        let dv = v1 - v0;
+        if dv.abs() <= 1.0e-8 {
+            return None;
+        }
+        let t = (threshold - v0) / dv;
+        if !(0.0..=1.0).contains(&t) {
+            return None;
+        }
+        Some((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
+    }
+
+    fn draw_halo_fog_and_contours(
+        context: &CanvasRenderingContext2d,
+        width: f64,
+        height: f64,
+        halo_points: &[ProjectedParticle],
+    ) {
+        if halo_points.is_empty() {
+            return;
+        }
+        let field = build_halo_field(halo_points, width, height);
+        if !(field.max_density > 0.0) {
+            return;
+        }
+
+        context.save();
+        for y in 0..field.grid_h {
+            for x in 0..field.grid_w {
+                let density = field.density[y * field.grid_w + x] / field.max_density;
+                if density < 0.03 {
+                    continue;
+                }
+                let fog = density.powf(0.62);
+                let alpha = clamp(0.015 + 0.11 * fog, 0.0, 0.12);
+                let red = (36.0 + 28.0 * fog) as u32;
+                let green = (88.0 + 72.0 * fog) as u32;
+                let blue = (132.0 + 108.0 * fog) as u32;
+                context.set_fill_style_str(&format!(
+                    "rgba({}, {}, {}, {})",
+                    red, green, blue, alpha
+                ));
+                context.fill_rect(
+                    x as f64 * field.cell_w,
+                    y as f64 * field.cell_h,
+                    field.cell_w + 0.7,
+                    field.cell_h + 0.7,
+                );
+            }
+        }
+        context.restore();
+
+        let thresholds = [
+            (0.16, "rgba(110, 170, 255, 0.12)", 0.8),
+            (0.32, "rgba(130, 205, 255, 0.18)", 0.95),
+            (0.54, "rgba(185, 235, 255, 0.26)", 1.05),
+        ];
+        for (level, color, line_width) in thresholds {
+            context.save();
+            context.set_stroke_style_str(color);
+            context.set_line_width(line_width);
+            for y in 0..field.grid_h.saturating_sub(1) {
+                for x in 0..field.grid_w.saturating_sub(1) {
+                    let v00 = field.density[y * field.grid_w + x] / field.max_density;
+                    let v10 = field.density[y * field.grid_w + x + 1] / field.max_density;
+                    let v01 = field.density[(y + 1) * field.grid_w + x] / field.max_density;
+                    let v11 = field.density[(y + 1) * field.grid_w + x + 1] / field.max_density;
+                    let min_value = v00.min(v10).min(v01).min(v11);
+                    let max_value = v00.max(v10).max(v01).max(v11);
+                    if min_value > level || max_value < level {
+                        continue;
+                    }
+
+                    let x0 = x as f64 * field.cell_w;
+                    let x1 = (x + 1) as f64 * field.cell_w;
+                    let y0 = y as f64 * field.cell_h;
+                    let y1 = (y + 1) as f64 * field.cell_h;
+                    let mut points = Vec::with_capacity(4);
+                    if let Some(point) = edge_point(x0, y0, v00, x1, y0, v10, level) {
+                        points.push(point);
+                    }
+                    if let Some(point) = edge_point(x1, y0, v10, x1, y1, v11, level) {
+                        points.push(point);
+                    }
+                    if let Some(point) = edge_point(x1, y1, v11, x0, y1, v01, level) {
+                        points.push(point);
+                    }
+                    if let Some(point) = edge_point(x0, y1, v01, x0, y0, v00, level) {
+                        points.push(point);
+                    }
+                    if points.len() < 2 {
+                        continue;
+                    }
+                    context.begin_path();
+                    context.move_to(points[0].0, points[0].1);
+                    context.line_to(points[1].0, points[1].1);
+                    context.stroke();
+                    if points.len() == 4 {
+                        context.begin_path();
+                        context.move_to(points[2].0, points[2].1);
+                        context.line_to(points[3].0, points[3].1);
+                        context.stroke();
+                    }
+                }
+            }
+            context.restore();
+        }
     }
 
     fn draw_frame(
@@ -605,12 +783,18 @@ mod wasm {
         context.set_fill_style_str("#020810");
         context.fill_rect(0.0, 0.0, width, height);
 
-        let mut projected: Vec<_> = frame
-            .particles
-            .iter()
-            .filter_map(|particle| project_particle(particle, width, height, camera))
-            .filter_map(render_style)
-            .collect();
+        let mut projected = Vec::new();
+        for particle in &frame.particles {
+            let Some(projected_particle) = project_particle(particle, width, height, camera) else {
+                continue;
+            };
+            if particle.component == 0 {
+                continue;
+            }
+            if let Some(rendered) = render_style(projected_particle) {
+                projected.push(rendered);
+            }
+        }
         projected.sort_by(|left, right| right.depth.total_cmp(&left.depth));
 
         let _ = context.set_global_composite_operation("lighter");
