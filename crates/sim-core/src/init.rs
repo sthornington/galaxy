@@ -405,7 +405,6 @@ fn extend_uniform_sphere_component(
     }
 
     let particle_mass = total_mass_msun / count as f64;
-    let angular_speed_kms_per_kpc = edge_rotation_speed_kms / radius_kpc.max(1.0e-6);
     for _ in 0..count {
         let radius = radius_kpc * rng.random::<f64>().cbrt();
         let direction = sample_unit_vector(rng);
@@ -413,7 +412,15 @@ fn extend_uniform_sphere_component(
         let cylindrical_radius = (local_position.x * local_position.x + local_position.y * local_position.y)
             .sqrt();
         let rotational_velocity = if cylindrical_radius > 1.0e-6 {
-            let tangential_speed = angular_speed_kms_per_kpc * cylindrical_radius;
+            // This is a collapsing protogalactic cloud, not a rigidly spinning solid body.
+            // Bias the initial spin toward a differential-rotation field with weaker polar support:
+            // outer equatorial material carries most of the angular momentum, while the interior
+            // and high-latitude material remain less centrifugally supported and can collapse inward.
+            let cylindrical_fraction = (cylindrical_radius / radius_kpc.max(1.0e-6)).clamp(0.0, 1.0);
+            let polar_alignment = (cylindrical_radius / radius.max(1.0e-6)).clamp(0.0, 1.0);
+            let tangential_speed = edge_rotation_speed_kms
+                * cylindrical_fraction.powf(0.65)
+                * polar_alignment.powf(0.75);
             Vec3::new(
                 -local_position.y / cylindrical_radius * tangential_speed,
                 local_position.x / cylindrical_radius * tangential_speed,

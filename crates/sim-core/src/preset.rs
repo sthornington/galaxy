@@ -189,7 +189,7 @@ fn uniform_sphere_collapse() -> MergerPreset {
     MergerPreset {
         id: "uniform-sphere-collapse",
         title: "Rotating Uniform Sphere Collapse",
-        summary: "A dense, evenly distributed halo+stellar sphere with near-circular rotational support around +Z, for sanity-checking rotating collapse.",
+        summary: "A dense protogalactic halo+stellar sphere with differential rotation about +Z, for sanity-checking rotating collapse into a disk-like remnant.",
         config: SimulationConfig {
             name: "uniform-sphere-collapse".to_string(),
             gravity: GravityConfig {
@@ -216,8 +216,8 @@ fn uniform_sphere_collapse() -> MergerPreset {
                 equilibrium_snapshot: None,
                 initial_profile: GalaxyInitialProfile::UniformSphere {
                     radius_kpc: sphere_radius_kpc,
-                    velocity_dispersion_kms: sphere_edge_circular_speed_kms * 0.035,
-                    edge_rotation_speed_kms: sphere_edge_circular_speed_kms * 0.98,
+                    velocity_dispersion_kms: sphere_edge_circular_speed_kms * 0.025,
+                    edge_rotation_speed_kms: sphere_edge_circular_speed_kms * 0.9,
                 },
                 halo_mass_msun: 1.75e11,
                 halo_scale_radius_kpc: 1.0,
