@@ -456,6 +456,9 @@ mod wasm {
         }
         camera.scene_radius = max_radius;
         camera.base_distance = (camera.scene_radius * 0.9) / std::f64::consts::FRAC_PI_8.tan();
+        if !force && particles.len() >= 32 && max_radius > 0.5 {
+            camera.auto_frame = false;
+        }
     }
 
     fn camera_basis(camera: &CameraState) -> CameraBasis {

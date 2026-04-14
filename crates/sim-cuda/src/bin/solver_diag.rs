@@ -190,9 +190,9 @@ fn generate_equilibrium_snapshot(
         .arg("--galaxy")
         .arg(galaxy_index.to_string())
         .arg("--iterations")
-        .arg("4")
+        .arg("0")
         .arg("--settle-steps")
-        .arg("32")
+        .arg("0")
         .arg("--seed")
         .arg(seed.to_string())
         .arg("--output")
@@ -221,7 +221,15 @@ fn resolve_equilibrate_command() -> Command {
     if let Ok(current_exe) = env::current_exe() {
         if let Some(parent) = current_exe.parent() {
             let sibling = parent.join("equilibrate");
-            if sibling.exists() {
+            let sibling_is_current = sibling.exists()
+                && match (
+                    sibling.metadata().and_then(|meta| meta.modified()),
+                    current_exe.metadata().and_then(|meta| meta.modified()),
+                ) {
+                    (Ok(sibling_time), Ok(current_time)) => sibling_time >= current_time,
+                    _ => false,
+                };
+            if sibling_is_current {
                 return Command::new(sibling);
             }
         }

@@ -539,9 +539,11 @@ fn extend_hernquist_bulge(
         ));
     }
     let particle_mass = total_mass_msun / count as f64;
+    let max_radius = scale_radius_kpc * 40.0;
+    let max_cumulative = (max_radius / (max_radius + scale_radius_kpc)).powi(2);
 
     for _ in 0..count {
-        let u = rng.random::<f64>().clamp(1.0e-8, 1.0 - 1.0e-8);
+        let u = (rng.random::<f64>() * max_cumulative).clamp(1.0e-8, max_cumulative);
         let root_u = u.sqrt();
         let radius = scale_radius_kpc * root_u / (1.0 - root_u);
         let direction = sample_unit_vector(rng);

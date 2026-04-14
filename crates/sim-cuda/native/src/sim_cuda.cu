@@ -112,13 +112,20 @@ double short_range_target_occupancy(const std::uint64_t particle_count) {
   if (override > 0.0) {
     return override;
   }
+  // Low-particle interactive runs were over-refining the short-range grid,
+  // which inflated the host-built cell tree/interactions far more than it
+  // improved force quality. Use coarser target occupancy at low N and a
+  // still-moderate occupancy at larger N.
+  if (particle_count <= 300'000u) {
+    return 64.0;
+  }
+  if (particle_count <= 1'000'000u) {
+    return 32.0;
+  }
   if (particle_count >= 2'000'000u) {
     return 32.0;
   }
-  if (particle_count >= 750'000u) {
-    return 16.0;
-  }
-  return kShortRangeTargetOccupancy;
+  return 24.0;
 }
 
 bool profile_force_stages() {
@@ -320,6 +327,7 @@ struct DeviceState {
   SimCudaPreviewParticle* preview_host_particles = nullptr;
   std::uint32_t preview_capacity = 0;
   std::uint32_t preview_in_flight_count = 0;
+  std::uint32_t preview_sample_offset = 0;
   bool preview_in_flight = false;
 };
 
@@ -329,6 +337,7 @@ __global__ void sample_preview(const SimCudaParticle* particles,
                                const int* anchor_indices,
                                const std::uint32_t anchor_count,
                                const std::uint32_t sampled_count,
+                               const std::uint32_t sample_offset,
                                const std::uint64_t stride,
                                SimCudaPreviewParticle* out_particles);
 
@@ -654,6 +663,12 @@ int schedule_preview_capture(DeviceState* state,
                                          1,
                                          static_cast<std::uint64_t>(visible_count) /
                                              static_cast<std::uint64_t>(sampled_count));
+  const std::uint32_t sample_offset =
+      visible_count == 0 ? 0 : (state->preview_sample_offset % visible_count);
+  if (visible_count > 0) {
+    const std::uint32_t hop = std::max<std::uint32_t>(1, visible_count / 17);
+    state->preview_sample_offset = (sample_offset + hop) % visible_count;
+  }
   if (ensure_preview_capacity(state, count, error_buffer, error_buffer_len) != 0) {
     return 1;
   }
@@ -667,6 +682,7 @@ int schedule_preview_capture(DeviceState* state,
       state->galaxy_smbh_indices,
       anchor_count,
       sampled_count,
+      sample_offset,
       stride,
       state->preview_particles);
   cudaError_t cuda_status = cudaGetLastError();
@@ -1676,117 +1692,8 @@ int build_short_range_tree(DeviceState* state,
     }
     return 0;
   }
-
-  state->short_cell_mass_host.resize(state->short_cell_count);
-  state->short_cell_com_x_host.resize(state->short_cell_count);
-  state->short_cell_com_y_host.resize(state->short_cell_count);
-  state->short_cell_com_z_host.resize(state->short_cell_count);
-
-  cudaError_t cuda_status = cudaMemcpyAsync(state->short_cell_mass_host.data(),
-                                            state->short_cell_mass,
-                                            sizeof(double) * state->short_cell_count,
-                                            cudaMemcpyDeviceToHost,
-                                            state->compute_stream);
-  if (cuda_status != cudaSuccess) {
-    fill_cuda_error(error_buffer, error_buffer_len, "short-range mass download failed", cuda_status);
-    return 1;
-  }
-  cuda_status = cudaMemcpyAsync(state->short_cell_com_x_host.data(),
-                                state->short_cell_com_x,
-                                sizeof(double) * state->short_cell_count,
-                                cudaMemcpyDeviceToHost,
-                                state->compute_stream);
-  if (cuda_status != cudaSuccess) {
-    fill_cuda_error(error_buffer, error_buffer_len, "short-range com_x download failed", cuda_status);
-    return 1;
-  }
-  cuda_status = cudaMemcpyAsync(state->short_cell_com_y_host.data(),
-                                state->short_cell_com_y,
-                                sizeof(double) * state->short_cell_count,
-                                cudaMemcpyDeviceToHost,
-                                state->compute_stream);
-  if (cuda_status != cudaSuccess) {
-    fill_cuda_error(error_buffer, error_buffer_len, "short-range com_y download failed", cuda_status);
-    return 1;
-  }
-  cuda_status = cudaMemcpyAsync(state->short_cell_com_z_host.data(),
-                                state->short_cell_com_z,
-                                sizeof(double) * state->short_cell_count,
-                                cudaMemcpyDeviceToHost,
-                                state->compute_stream);
-  if (cuda_status != cudaSuccess) {
-    fill_cuda_error(error_buffer, error_buffer_len, "short-range com_z download failed", cuda_status);
-    return 1;
-  }
-  cuda_status = cudaStreamSynchronize(state->compute_stream);
-  if (cuda_status != cudaSuccess) {
-    fill_cuda_error(error_buffer, error_buffer_len, "short-range cell download sync failed", cuda_status);
-    return 1;
-  }
-
-  std::vector<ShortRangeSourceCell> sources;
-  sources.reserve(state->short_cell_count);
-  double min_pos[3] = {
-      std::numeric_limits<double>::infinity(),
-      std::numeric_limits<double>::infinity(),
-      std::numeric_limits<double>::infinity(),
-  };
-  double max_pos[3] = {
-      -std::numeric_limits<double>::infinity(),
-      -std::numeric_limits<double>::infinity(),
-      -std::numeric_limits<double>::infinity(),
-  };
-  const double cell_softening =
-      std::max(state->max_softening_kpc,
-               0.75 * std::max(state->short_cell_size[0],
-                               std::max(state->short_cell_size[1], state->short_cell_size[2])));
-  for (std::size_t cell_id = 0; cell_id < state->short_cell_count; ++cell_id) {
-    const double mass = state->short_cell_mass_host[cell_id];
-    if (!(mass > 0.0)) {
-      continue;
-    }
-    ShortRangeSourceCell source;
-    source.cell_id = static_cast<int>(cell_id);
-    source.mass = mass;
-    source.com[0] = state->short_cell_com_x_host[cell_id];
-    source.com[1] = state->short_cell_com_y_host[cell_id];
-    source.com[2] = state->short_cell_com_z_host[cell_id];
-    source.softening_kpc = cell_softening;
-    sources.push_back(source);
-    for (int axis = 0; axis < 3; ++axis) {
-      min_pos[axis] = std::min(min_pos[axis], source.com[axis]);
-      max_pos[axis] = std::max(max_pos[axis], source.com[axis]);
-    }
-  }
-
-  if (sources.empty()) {
-    return build_short_range_cell_interactions(state, error_buffer, error_buffer_len);
-  }
-
-  double center[3] = {0.0, 0.0, 0.0};
-  double span = 0.0;
-  for (int axis = 0; axis < 3; ++axis) {
-    center[axis] = 0.5 * (min_pos[axis] + max_pos[axis]);
-    span = std::max(span, max_pos[axis] - min_pos[axis]);
-  }
-  const double half_size =
-      std::max(0.5 * span + std::max(state->short_cell_size[0],
-                                     std::max(state->short_cell_size[1], state->short_cell_size[2])),
-               2.0 * cell_softening);
-
-  std::vector<int> indices(sources.size());
-  for (std::size_t i = 0; i < sources.size(); ++i) {
-    indices[i] = static_cast<int>(i);
-  }
-  state->short_tree_host.reserve(sources.size() * 2);
-  state->short_tree_root =
-      build_short_range_tree_recursive(sources, indices, center, half_size, 0, state->short_tree_host);
-  state->short_tree_node_count = static_cast<std::uint32_t>(state->short_tree_host.size());
-
-  if (build_short_range_cell_interactions(state, error_buffer, error_buffer_len) != 0) {
-    return 1;
-  }
-  return 0;
+  return ensure_short_range_interaction_storage(
+      state, state->short_cell_count, 0, error_buffer, error_buffer_len);
 }
 
 int update_short_range_grid(DeviceState* state,
@@ -2870,6 +2777,9 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
   if (particle_component != 3u &&
       !(short_range_target_baryons_only != 0 && particle_component == 0u)) {
     int particle_cell = -1;
+    int particle_cell_x = -1;
+    int particle_cell_y = -1;
+    int particle_cell_z = -1;
     if (short_tree_particle_mode == 0) {
       const double gx = fmin(
           fmax((particle_pos_x - short_origin_x) / short_cell_x, 0.0),
@@ -2880,9 +2790,12 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
       const double gz = fmin(
           fmax((particle_pos_z - short_origin_z) / short_cell_z, 0.0),
           static_cast<double>(short_nz) - 1.000001);
-      particle_cell = short_cell_linear_index(static_cast<int>(floor(gx)),
-                                              static_cast<int>(floor(gy)),
-                                              static_cast<int>(floor(gz)),
+      particle_cell_x = static_cast<int>(floor(gx));
+      particle_cell_y = static_cast<int>(floor(gy));
+      particle_cell_z = static_cast<int>(floor(gz));
+      particle_cell = short_cell_linear_index(particle_cell_x,
+                                              particle_cell_y,
+                                              particle_cell_z,
                                               short_ny,
                                               short_nz);
       const int start = short_cell_start[particle_cell];
@@ -2922,16 +2835,16 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
           }
         } else {
           const int cell_plane = short_ny * short_nz;
-          const int cell_x = particle_cell / cell_plane;
-          const int rem = particle_cell - cell_x * cell_plane;
-          const int cell_y = rem / short_nz;
-          const int cell_z = rem - cell_y * short_nz;
+          const int cell_x_index = particle_cell / cell_plane;
+          const int rem = particle_cell - cell_x_index * cell_plane;
+          const int cell_y_index = rem / short_nz;
+          const int cell_z_index = rem - cell_y_index * short_nz;
           const double center_x =
-              short_origin_x + (static_cast<double>(cell_x) + 0.5) * short_cell_x;
+              short_origin_x + (static_cast<double>(cell_x_index) + 0.5) * short_cell_x;
           const double center_y =
-              short_origin_y + (static_cast<double>(cell_y) + 0.5) * short_cell_y;
+              short_origin_y + (static_cast<double>(cell_y_index) + 0.5) * short_cell_y;
           const double center_z =
-              short_origin_z + (static_cast<double>(cell_z) + 0.5) * short_cell_z;
+              short_origin_z + (static_cast<double>(cell_z_index) + 0.5) * short_cell_z;
           const int particle_octant =
               (particle_pos_x >= center_x ? 1 : 0) |
               (particle_pos_y >= center_y ? 2 : 0) |
@@ -2984,31 +2897,79 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
       }
     }
 
-    if (short_tree_particle_mode == 0 && short_cell_interaction_start != nullptr && particle_cell >= 0) {
-      const int interaction_start = short_cell_interaction_start[particle_cell];
-      const int interaction_end = short_cell_interaction_start[particle_cell + 1];
-      for (int interaction_index = interaction_start; interaction_index < interaction_end; ++interaction_index) {
-        const ShortRangeInteractionSource interaction = short_cell_interactions[interaction_index];
-        const double dx = interaction.com[0] - particle_pos_x;
-        const double dy = interaction.com[1] - particle_pos_y;
-        const double dz = interaction.com[2] - particle_pos_z;
-        const double r2 = dx * dx + dy * dy + dz * dz;
-        if (r2 <= 1.0e-12 || r2 > short_cutoff_sq) {
-          continue;
-        }
+    if (short_tree_particle_mode == 0 && particle_cell >= 0) {
+      const int neighbor_radius_x =
+          min(1, max(1, static_cast<int>(ceil(short_cutoff_kpc / fmax(short_cell_x, 1.0e-6)))));
+      const int neighbor_radius_y =
+          min(1, max(1, static_cast<int>(ceil(short_cutoff_kpc / fmax(short_cell_y, 1.0e-6)))));
+      const int neighbor_radius_z =
+          min(1, max(1, static_cast<int>(ceil(short_cutoff_kpc / fmax(short_cell_z, 1.0e-6)))));
+      const double cell_half_x = 0.5 * short_cell_x;
+      const double cell_half_y = 0.5 * short_cell_y;
+      const double cell_half_z = 0.5 * short_cell_z;
+      const double cell_softening =
+          fmax(particle_softening, 0.5 * fmax(short_cell_x, fmax(short_cell_y, short_cell_z)));
 
-        const double node_softening = fmax(particle_softening, interaction.softening_kpc);
-        const double direct_scale =
-            grav_const * interaction.mass * softened_inv_r3(dx, dy, dz, node_softening);
-        const double correction_scale =
-            direct_scale * treepm_short_range_force_factor_lookup(short_force_factor_lut,
-                                                                  short_force_factor_lut_size,
-                                                                  short_force_factor_lut_scale,
-                                                                  r2,
-                                                                  short_pm_softening_kpc);
-        ax += correction_scale * dx;
-        ay += correction_scale * dy;
-        az += correction_scale * dz;
+      for (int neighbor_x = max(0, particle_cell_x - neighbor_radius_x);
+           neighbor_x <= min(short_nx - 1, particle_cell_x + neighbor_radius_x);
+           ++neighbor_x) {
+        for (int neighbor_y = max(0, particle_cell_y - neighbor_radius_y);
+             neighbor_y <= min(short_ny - 1, particle_cell_y + neighbor_radius_y);
+             ++neighbor_y) {
+          for (int neighbor_z = max(0, particle_cell_z - neighbor_radius_z);
+               neighbor_z <= min(short_nz - 1, particle_cell_z + neighbor_radius_z);
+               ++neighbor_z) {
+            const int neighbor_cell =
+                short_cell_linear_index(neighbor_x, neighbor_y, neighbor_z, short_ny, short_nz);
+            if (neighbor_cell == particle_cell) {
+              continue;
+            }
+
+            const double center_x =
+                short_origin_x + (static_cast<double>(neighbor_x) + 0.5) * short_cell_x;
+            const double center_y =
+                short_origin_y + (static_cast<double>(neighbor_y) + 0.5) * short_cell_y;
+            const double center_z =
+                short_origin_z + (static_cast<double>(neighbor_z) + 0.5) * short_cell_z;
+            const double dx_aabb =
+                fmax(fabs(particle_pos_x - center_x) - cell_half_x, 0.0);
+            const double dy_aabb =
+                fmax(fabs(particle_pos_y - center_y) - cell_half_y, 0.0);
+            const double dz_aabb =
+                fmax(fabs(particle_pos_z - center_z) - cell_half_z, 0.0);
+            if (dx_aabb * dx_aabb + dy_aabb * dy_aabb + dz_aabb * dz_aabb > short_cutoff_sq) {
+              continue;
+            }
+
+            const int start = short_cell_start[neighbor_cell];
+            if (start < 0) {
+              continue;
+            }
+            const double mass = short_cell_mass[neighbor_cell];
+            if (!(mass > 0.0)) {
+              continue;
+            }
+            const double dx = short_cell_com_x[neighbor_cell] - particle_pos_x;
+            const double dy = short_cell_com_y[neighbor_cell] - particle_pos_y;
+            const double dz = short_cell_com_z[neighbor_cell] - particle_pos_z;
+            const double r2 = dx * dx + dy * dy + dz * dz;
+            if (r2 <= 1.0e-12 || r2 > short_cutoff_sq) {
+              continue;
+            }
+
+            const double direct_scale =
+                grav_const * mass * softened_inv_r3(dx, dy, dz, cell_softening);
+            const double correction_scale =
+                direct_scale * treepm_short_range_force_factor_lookup(short_force_factor_lut,
+                                                                      short_force_factor_lut_size,
+                                                                      short_force_factor_lut_scale,
+                                                                      r2,
+                                                                      short_pm_softening_kpc);
+            ax += correction_scale * dx;
+            ay += correction_scale * dy;
+            az += correction_scale * dz;
+          }
+        }
       }
     } else if (short_tree_nodes != nullptr && short_tree_root >= 0 && short_tree_node_count > 0) {
       int stack[64];
@@ -3254,6 +3215,7 @@ __global__ void sample_preview(const SimCudaParticle* particles,
                                const int* anchor_indices,
                                const std::uint32_t anchor_count,
                                const std::uint32_t sampled_count,
+                               const std::uint32_t sample_offset,
                                const std::uint64_t stride,
                                SimCudaPreviewParticle* out_particles) {
   const std::uint32_t preview_count = anchor_count + sampled_count;
@@ -3267,7 +3229,9 @@ __global__ void sample_preview(const SimCudaParticle* particles,
     source_index = static_cast<std::uint64_t>(anchor_indices[index] < 0 ? 0 : anchor_indices[index]);
   } else {
     const std::uint64_t sample_slot =
-        min(static_cast<std::uint64_t>(index - anchor_count) * stride,
+        min((static_cast<std::uint64_t>(sample_offset) +
+             static_cast<std::uint64_t>(index - anchor_count) * stride) %
+                static_cast<std::uint64_t>(visible_particle_count),
             static_cast<std::uint64_t>(visible_particle_count - 1));
     source_index = static_cast<std::uint64_t>(visible_particle_indices[sample_slot]);
   }

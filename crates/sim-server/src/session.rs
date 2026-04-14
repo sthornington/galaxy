@@ -304,9 +304,9 @@ fn generate_equilibrium_snapshot(
         .arg("--galaxy")
         .arg(galaxy_index.to_string())
         .arg("--iterations")
-        .arg("4")
+        .arg("0")
         .arg("--settle-steps")
-        .arg("32")
+        .arg("0")
         .arg("--seed")
         .arg(seed.to_string())
         .arg("--output")
@@ -337,7 +337,15 @@ fn resolve_equilibrate_command() -> Command {
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(parent) = current_exe.parent() {
             let sibling = parent.join("equilibrate");
-            if sibling.exists() {
+            let sibling_is_current = sibling.exists()
+                && match (
+                    sibling.metadata().and_then(|meta| meta.modified()),
+                    current_exe.metadata().and_then(|meta| meta.modified()),
+                ) {
+                    (Ok(sibling_time), Ok(current_time)) => sibling_time >= current_time,
+                    _ => false,
+                };
+            if sibling_is_current {
                 return Command::new(sibling);
             }
         }
@@ -533,6 +541,7 @@ async fn session_task(
     let max_steps_per_tick = particle_limited_steps
         .min(mesh_limited_steps)
         .clamp(1, 64) as u32;
+    let visual_max_steps_per_tick = 1_u32;
     let target_tick_wall = Duration::from_millis(125);
     let mut steps_per_tick = 1;
     let mut per_step_wall_ema_s: Option<f64> = None;
@@ -826,7 +835,7 @@ async fn session_task(
                     preview_pending = false;
                 }
             }
-            _ = tokio::task::yield_now() => {
+            _ = tokio::task::yield_now(), if !preview_pending => {
                 let advance_start = Instant::now();
                 if let Err(error) = advance_without_publish(
                     &mut backend,
@@ -848,20 +857,21 @@ async fn session_task(
                         / per_step_wall_ema_s.max(1.0e-6))
                         .round()
                         .max(1.0) as u32;
-                    steps_per_tick = target_steps.clamp(1, max_steps_per_tick.max(1));
+                    steps_per_tick = target_steps.clamp(
+                        1,
+                        max_steps_per_tick.min(visual_max_steps_per_tick).max(1),
+                    );
                 }
-                if !preview_pending {
-                    if let Err(error) = request_preview_capture(
-                        &mut backend,
-                        preview_budget,
-                        &summary,
-                    ) {
-                        error!("session {id} failed while queueing preview frame: {error:#}");
-                        summary.write().state = SessionState::Failed;
-                        return;
-                    }
-                    preview_pending = true;
+                if let Err(error) = request_preview_capture(
+                    &mut backend,
+                    preview_budget,
+                    &summary,
+                ) {
+                    error!("session {id} failed while queueing preview frame: {error:#}");
+                    summary.write().state = SessionState::Failed;
+                    return;
                 }
+                preview_pending = true;
             }
         }
     }

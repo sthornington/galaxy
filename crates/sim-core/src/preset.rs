@@ -156,7 +156,7 @@ fn major_merger() -> MergerPreset {
         disk_tilt_deg: [-35.0, 70.0, 18.0],
         color_rgba: [0.45, 0.76, 1.0, 1.0],
     };
-    let relative_speed = set_bound_pair_orbit(&mut primary, &mut secondary, 100.0, 14.0);
+    let relative_speed = set_bound_pair_orbit(&mut primary, &mut secondary, 70.0, 14.0);
 
     MergerPreset {
         id: "major-merger",
@@ -169,7 +169,7 @@ fn major_merger() -> MergerPreset {
             preview: preview_defaults(),
             snapshots: snapshot_defaults(),
             integration: integration_defaults(),
-            initial_separation_kpc: 100.0,
+            initial_separation_kpc: 70.0,
             initial_relative_velocity_kms: relative_speed,
             output_directory: "output/major-merger".to_string(),
             galaxies: vec![primary, secondary],
@@ -264,10 +264,10 @@ fn polar_flyby() -> MergerPreset {
     let mut config = major_merger().config;
     config.name = "polar-flyby".to_string();
     config.output_directory = "output/polar-flyby".to_string();
-    config.initial_separation_kpc = 140.0;
+    config.initial_separation_kpc = 100.0;
     let (primary, secondary) = config.galaxies.split_at_mut(1);
     config.initial_relative_velocity_kms =
-        set_bound_pair_orbit(&mut primary[0], &mut secondary[0], 140.0, 28.0);
+        set_bound_pair_orbit(&mut primary[0], &mut secondary[0], 100.0, 28.0);
     config.galaxies[1].disk_tilt_deg = [88.0, 10.0, 12.0];
     config.galaxies[1].color_rgba = [0.78, 0.54, 1.0, 1.0];
     config.galaxies[1].equilibrium_snapshot =
@@ -284,7 +284,7 @@ fn minor_merger() -> MergerPreset {
     let mut config = major_merger().config;
     config.name = "minor-merger".to_string();
     config.output_directory = "output/minor-merger".to_string();
-    config.initial_separation_kpc = 140.0;
+    config.initial_separation_kpc = 100.0;
     config.galaxies[1].halo_mass_msun = 2.8e11;
     config.galaxies[1].halo_particle_count = 950_000;
     config.galaxies[1].disk_mass_msun = 1.4e10;
@@ -297,7 +297,7 @@ fn minor_merger() -> MergerPreset {
         Some(generated_equilibrium_snapshot_path("minor-merger", 1));
     let (primary, secondary) = config.galaxies.split_at_mut(1);
     config.initial_relative_velocity_kms =
-        set_bound_pair_orbit(&mut primary[0], &mut secondary[0], 140.0, 18.0);
+        set_bound_pair_orbit(&mut primary[0], &mut secondary[0], 100.0, 18.0);
     MergerPreset {
         id: "minor-merger",
         title: "Minor Merger",

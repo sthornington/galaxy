@@ -99,6 +99,9 @@ export function createUiApp({
     }
     camera.sceneRadius = maxRadius;
     camera.baseDistance = (camera.sceneRadius * 0.9) / Math.tan(Math.PI / 8);
+    if (!force && particles.length >= 32 && maxRadius > 0.5) {
+      camera.autoFrame = false;
+    }
   }
 
   function projectParticle(particle, width, height) {

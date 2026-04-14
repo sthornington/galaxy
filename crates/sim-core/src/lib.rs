@@ -250,6 +250,41 @@ mod tests {
     }
 
     #[test]
+    fn major_merger_visible_particles_stay_within_physical_extent() {
+        let mut preset = built_in_presets()
+            .into_iter()
+            .find(|preset| preset.id == "major-merger")
+            .unwrap();
+        strip_equilibrium_snapshots(&mut preset);
+        let initial_conditions = InitialConditions::generate(&preset.config, 42).unwrap();
+
+        for (galaxy_index, galaxy) in preset.config.galaxies.iter().enumerate() {
+            let origin = Vec3::new(
+                galaxy.position_kpc[0],
+                galaxy.position_kpc[1],
+                galaxy.position_kpc[2],
+            );
+            let max_radius = initial_conditions
+                .particles
+                .iter()
+                .filter(|particle| {
+                    particle.galaxy_index == galaxy_index as u32
+                        && !matches!(particle.component, ParticleComponent::Halo | ParticleComponent::Smbh)
+                })
+                .map(|particle| (particle.position_kpc - origin).length())
+                .fold(0.0_f64, f64::max);
+            let expected_extent = (galaxy.disk_scale_radius_kpc * 20.0)
+                .max(galaxy.bulge_scale_radius_kpc * 40.0)
+                .max(galaxy.halo_scale_radius_kpc * 12.0);
+
+            assert!(
+                max_radius <= expected_extent * 1.05,
+                "galaxy {galaxy_index} visible extent is too large: max_radius={max_radius:.3} kpc"
+            );
+        }
+    }
+
+    #[test]
     fn galaxies_are_recentred_to_configured_origin_and_bulk_velocity() {
         let mut preset = built_in_presets()
             .into_iter()

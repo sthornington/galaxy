@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Particle;
 
-pub const CURRENT_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotManifest {
