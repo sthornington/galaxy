@@ -276,6 +276,11 @@ mod wasm {
                         let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
                         match decode_preview_packet(&bytes) {
                             Ok(decoded) => {
+                                if let Some(current) = frame.borrow().as_ref() {
+                                    if decoded.sim_time_myr <= current.sim_time_myr + 1.0e-9 {
+                                        return;
+                                    }
+                                }
                                 {
                                     let mut camera = camera.borrow_mut();
                                     update_scene_bounds(&mut camera, &decoded, false);

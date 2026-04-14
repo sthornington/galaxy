@@ -10,8 +10,11 @@ use crate::{
 
 const GRAV_CONST_KPC_KMS2_PER_MSUN: f64 = 4.300_91e-6;
 const NFW_CONCENTRATION: f64 = 12.0;
-const TOOMRE_Q_TARGET: f64 = 1.2;
+const TOOMRE_Q_TARGET: f64 = 1.0;
 const EQUILIBRIUM_SAMPLES: usize = 320;
+const DISK_TRUNCATION_SCALE_RADII: f64 = 5.5;
+const DISK_SIGMA_R_MAX_VC_FRACTION: f64 = 0.36;
+const DISK_SIGMA_Z_MAX_VC_FRACTION: f64 = 0.17;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParticleComponent {
@@ -470,12 +473,18 @@ fn extend_exponential_disk(
     }
     let particle_mass = total_mass_msun / count as f64;
 
+    let max_radius = scale_radius_kpc * DISK_TRUNCATION_SCALE_RADII;
     for _ in 0..count {
         // For a 2D exponential disk, p(R) dR ∝ R exp(-R/Rd) dR, i.e. a Gamma(k=2, theta=Rd).
         // Sampling a plain exponential overconcentrates the disk and destabilizes the live system.
-        let u1: f64 = rng.random::<f64>().clamp(1.0e-8, 1.0 - 1.0e-8);
-        let u2: f64 = rng.random::<f64>().clamp(1.0e-8, 1.0 - 1.0e-8);
-        let radius = -scale_radius_kpc * (u1 * u2).ln();
+        let radius = loop {
+            let u1: f64 = rng.random::<f64>().clamp(1.0e-8, 1.0 - 1.0e-8);
+            let u2: f64 = rng.random::<f64>().clamp(1.0e-8, 1.0 - 1.0e-8);
+            let sampled = -scale_radius_kpc * (u1 * u2).ln();
+            if sampled <= max_radius {
+                break sampled;
+            }
+        };
         let phi = rng.random::<f64>() * std::f64::consts::TAU;
         let z = sample_sech2_height(rng, scale_height_kpc);
         let local = Vec3::new(radius * phi.cos(), radius * phi.sin(), z);
@@ -709,7 +718,7 @@ fn build_equilibrium_table(
                 softening.smbh_kpc,
             ),
         );
-        surface_density.push(exponential_disk_surface_density_msun_per_kpc2(
+        surface_density.push(tapered_exponential_disk_surface_density_msun_per_kpc2(
             potential.disk_mass_msun,
             potential.disk_scale_radius_kpc,
             radius,
@@ -753,20 +762,20 @@ fn build_equilibrium_table(
         let sigma_r = if surface_density[i] > 0.0 {
             (TOOMRE_Q_TARGET * 3.36 * GRAV_CONST_KPC_KMS2_PER_MSUN * surface_density[i]
                 / kappa.max(1.0e-4))
-                .max(12.0)
-                .min(circular_speed_sq[i].max(0.0).sqrt() * 0.6)
+                .max(8.0)
+                .min(circular_speed_sq[i].max(0.0).sqrt() * DISK_SIGMA_R_MAX_VC_FRACTION)
         } else {
             0.0
         };
         let sigma_phi =
-            (sigma_r * kappa / (2.0 * omega.max(1.0e-4))).max(0.35 * sigma_r).min(0.95 * sigma_r);
+            (sigma_r * kappa / (2.0 * omega.max(1.0e-4))).max(0.3 * sigma_r).min(0.7 * sigma_r);
         let sigma_z = (std::f64::consts::PI
             * GRAV_CONST_KPC_KMS2_PER_MSUN
             * surface_density[i]
             * potential.disk_scale_height_kpc.max(1.0e-3))
         .sqrt()
-        .max(8.0)
-        .min(circular_speed_sq[i].max(0.0).sqrt() * 0.45);
+        .max(4.0)
+        .min(circular_speed_sq[i].max(0.0).sqrt() * DISK_SIGMA_Z_MAX_VC_FRACTION);
 
         disk_sigma_r_sq[i] = sigma_r * sigma_r;
         disk_sigma_phi_sq[i] = sigma_phi * sigma_phi;
@@ -1031,6 +1040,25 @@ fn exponential_disk_surface_density_msun_per_kpc2(
     }
     mass_msun / (2.0 * std::f64::consts::PI * scale_radius_kpc.powi(2))
         * (-radius_kpc / scale_radius_kpc).exp()
+}
+
+fn tapered_exponential_disk_surface_density_msun_per_kpc2(
+    mass_msun: f64,
+    scale_radius_kpc: f64,
+    radius_kpc: f64,
+) -> f64 {
+    let base = exponential_disk_surface_density_msun_per_kpc2(
+        mass_msun,
+        scale_radius_kpc,
+        radius_kpc,
+    );
+    if base <= 0.0 {
+        return 0.0;
+    }
+    let cutoff_radius = 4.4 * scale_radius_kpc;
+    let taper_width = 0.35 * scale_radius_kpc.max(1.0e-6);
+    let taper = 1.0 / (1.0 + ((radius_kpc - cutoff_radius) / taper_width).exp());
+    base * taper
 }
 
 fn exponential_disk_enclosed_mass_msun(

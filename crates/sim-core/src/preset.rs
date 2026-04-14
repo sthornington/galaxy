@@ -92,22 +92,77 @@ fn set_bound_pair_orbit(
     let primary_mass = total_galaxy_mass_msun(primary);
     let secondary_mass = total_galaxy_mass_msun(secondary);
     let total_mass = primary_mass + secondary_mass;
-    let apocenter = separation_kpc.max(pericenter_kpc * 1.05);
-    let semi_major_axis = 0.5 * (apocenter + pericenter_kpc);
-    let relative_speed =
-        (GRAV_CONST_KPC_KMS2_PER_MSUN * total_mass * (2.0 / apocenter - 1.0 / semi_major_axis))
-            .max(0.0)
-            .sqrt();
+    let current_radius = separation_kpc.max(pericenter_kpc * 1.01);
 
-    let primary_offset = -apocenter * secondary_mass / total_mass;
-    let secondary_offset = apocenter * primary_mass / total_mass;
-    let primary_speed = -relative_speed * secondary_mass / total_mass;
-    let secondary_speed = relative_speed * primary_mass / total_mass;
+    // Start on the inbound leg of a bound ellipse instead of at apocenter so the galaxies
+    // are already moving toward each other when the viewer opens.
+    let start_true_anomaly = (-130.0_f64).to_radians();
+    let cos_f = start_true_anomaly.cos();
+    let sin_f = start_true_anomaly.sin();
+    let eccentricity =
+        ((pericenter_kpc - current_radius) / (current_radius * cos_f - pericenter_kpc))
+            .clamp(0.05, 0.92);
+    let semi_latus_rectum = pericenter_kpc * (1.0 + eccentricity);
+    let orbital_speed_scale =
+        (GRAV_CONST_KPC_KMS2_PER_MSUN * total_mass / semi_latus_rectum.max(1.0e-6)).sqrt();
+    let relative_radial_speed = orbital_speed_scale * eccentricity * sin_f;
+    let relative_tangential_speed = orbital_speed_scale * (1.0 + eccentricity * cos_f);
+
+    let primary_offset = -current_radius * secondary_mass / total_mass;
+    let secondary_offset = current_radius * primary_mass / total_mass;
+    let relative_velocity = [relative_radial_speed, relative_tangential_speed, 0.0];
 
     primary.position_kpc = [primary_offset, 0.0, 0.0];
     secondary.position_kpc = [secondary_offset, 0.0, 0.0];
-    primary.velocity_kms = [0.0, primary_speed, 0.0];
-    secondary.velocity_kms = [0.0, secondary_speed, 0.0];
+    primary.velocity_kms = [
+        -relative_velocity[0] * secondary_mass / total_mass,
+        -relative_velocity[1] * secondary_mass / total_mass,
+        0.0,
+    ];
+    secondary.velocity_kms = [
+        relative_velocity[0] * primary_mass / total_mass,
+        relative_velocity[1] * primary_mass / total_mass,
+        0.0,
+    ];
+    (relative_radial_speed * relative_radial_speed
+        + relative_tangential_speed * relative_tangential_speed)
+        .sqrt()
+}
+
+fn set_direct_infall_pair_orbit(
+    primary: &mut GalaxyConfig,
+    secondary: &mut GalaxyConfig,
+    separation_kpc: f64,
+    speed_fraction_of_escape: f64,
+    tangential_fraction_of_total: f64,
+) -> f64 {
+    let primary_mass = total_galaxy_mass_msun(primary);
+    let secondary_mass = total_galaxy_mass_msun(secondary);
+    let total_mass = primary_mass + secondary_mass;
+    let separation = separation_kpc.max(1.0e-6);
+    let escape_speed =
+        (2.0 * GRAV_CONST_KPC_KMS2_PER_MSUN * total_mass / separation).sqrt();
+    let relative_speed = escape_speed * speed_fraction_of_escape.clamp(0.0, 0.999);
+    let tangential_speed = relative_speed * tangential_fraction_of_total.clamp(0.0, 0.95);
+    let radial_speed = -(relative_speed * relative_speed - tangential_speed * tangential_speed)
+        .max(0.0)
+        .sqrt();
+
+    let primary_offset = -separation * secondary_mass / total_mass;
+    let secondary_offset = separation * primary_mass / total_mass;
+
+    primary.position_kpc = [primary_offset, 0.0, 0.0];
+    secondary.position_kpc = [secondary_offset, 0.0, 0.0];
+    primary.velocity_kms = [
+        -radial_speed * secondary_mass / total_mass,
+        -tangential_speed * secondary_mass / total_mass,
+        0.0,
+    ];
+    secondary.velocity_kms = [
+        radial_speed * primary_mass / total_mass,
+        tangential_speed * primary_mass / total_mass,
+        0.0,
+    ];
     relative_speed
 }
 
@@ -116,18 +171,18 @@ fn major_merger() -> MergerPreset {
         label: "Primary".to_string(),
         equilibrium_snapshot: Some(generated_equilibrium_snapshot_path("major-merger", 0)),
         initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
-        halo_mass_msun: 3.0e12,
-        halo_scale_radius_kpc: 18.0,
+        halo_mass_msun: 4.2e12,
+        halo_scale_radius_kpc: 14.0,
         halo_particle_count: 800_000,
-        disk_mass_msun: 1.15e11,
-        disk_scale_radius_kpc: 3.8,
-        disk_scale_height_kpc: 0.35,
+        disk_mass_msun: 1.35e11,
+        disk_scale_radius_kpc: 2.8,
+        disk_scale_height_kpc: 0.3,
         disk_particle_count: 320_000,
-        bulge_mass_msun: 2.0e10,
-        bulge_scale_radius_kpc: 0.8,
+        bulge_mass_msun: 3.6e10,
+        bulge_scale_radius_kpc: 0.55,
         bulge_particle_count: 64_000,
         smbh: SmbhConfig {
-            mass_msun: 8.0e6,
+            mass_msun: 1.0e7,
             softening_kpc: 0.002,
             substeps: 16,
         },
@@ -140,18 +195,18 @@ fn major_merger() -> MergerPreset {
         label: "Secondary".to_string(),
         equilibrium_snapshot: Some(generated_equilibrium_snapshot_path("major-merger", 1)),
         initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
-        halo_mass_msun: 2.7e12,
-        halo_scale_radius_kpc: 16.0,
+        halo_mass_msun: 3.8e12,
+        halo_scale_radius_kpc: 12.0,
         halo_particle_count: 720_000,
-        disk_mass_msun: 1.0e11,
-        disk_scale_radius_kpc: 3.2,
-        disk_scale_height_kpc: 0.32,
+        disk_mass_msun: 1.2e11,
+        disk_scale_radius_kpc: 2.4,
+        disk_scale_height_kpc: 0.28,
         disk_particle_count: 280_000,
-        bulge_mass_msun: 1.7e10,
-        bulge_scale_radius_kpc: 0.7,
+        bulge_mass_msun: 3.0e10,
+        bulge_scale_radius_kpc: 0.5,
         bulge_particle_count: 56_000,
         smbh: SmbhConfig {
-            mass_msun: 7.0e6,
+            mass_msun: 8.5e6,
             softening_kpc: 0.002,
             substeps: 16,
         },
@@ -160,7 +215,8 @@ fn major_merger() -> MergerPreset {
         disk_tilt_deg: [-35.0, 70.0, 18.0],
         color_rgba: [0.45, 0.76, 1.0, 1.0],
     };
-    let relative_speed = set_bound_pair_orbit(&mut primary, &mut secondary, 40.0, 10.0);
+    let relative_speed =
+        set_direct_infall_pair_orbit(&mut primary, &mut secondary, 24.0, 0.28, 0.16);
 
     MergerPreset {
         id: "major-merger",
@@ -173,7 +229,7 @@ fn major_merger() -> MergerPreset {
             preview: preview_defaults(),
             snapshots: snapshot_defaults(),
             integration: integration_defaults(),
-            initial_separation_kpc: 40.0,
+            initial_separation_kpc: 24.0,
             initial_relative_velocity_kms: relative_speed,
             output_directory: "output/major-merger".to_string(),
             galaxies: vec![primary, secondary],
@@ -272,10 +328,10 @@ fn polar_flyby() -> MergerPreset {
     let mut config = major_merger().config;
     config.name = "polar-flyby".to_string();
     config.output_directory = "output/polar-flyby".to_string();
-    config.initial_separation_kpc = 55.0;
+    config.initial_separation_kpc = 30.0;
     let (primary, secondary) = config.galaxies.split_at_mut(1);
     config.initial_relative_velocity_kms =
-        set_bound_pair_orbit(&mut primary[0], &mut secondary[0], 55.0, 20.0);
+        set_bound_pair_orbit(&mut primary[0], &mut secondary[0], 30.0, 14.0);
     config.galaxies[1].disk_tilt_deg = [88.0, 10.0, 12.0];
     config.galaxies[1].color_rgba = [0.78, 0.54, 1.0, 1.0];
     config.galaxies[1].equilibrium_snapshot =
@@ -292,20 +348,20 @@ fn minor_merger() -> MergerPreset {
     let mut config = major_merger().config;
     config.name = "minor-merger".to_string();
     config.output_directory = "output/minor-merger".to_string();
-    config.initial_separation_kpc = 55.0;
-    config.galaxies[1].halo_mass_msun = 7.0e11;
+    config.initial_separation_kpc = 32.0;
+    config.galaxies[1].halo_mass_msun = 1.0e12;
     config.galaxies[1].halo_particle_count = 950_000;
-    config.galaxies[1].disk_mass_msun = 3.5e10;
+    config.galaxies[1].disk_mass_msun = 4.6e10;
     config.galaxies[1].disk_particle_count = 360_000;
-    config.galaxies[1].bulge_mass_msun = 4.5e9;
+    config.galaxies[1].bulge_mass_msun = 7.5e9;
     config.galaxies[1].bulge_particle_count = 48_000;
-    config.galaxies[1].smbh.mass_msun = 2.0e6;
+    config.galaxies[1].smbh.mass_msun = 3.0e6;
     config.galaxies[1].color_rgba = [0.59, 1.0, 0.74, 1.0];
     config.galaxies[1].equilibrium_snapshot =
         Some(generated_equilibrium_snapshot_path("minor-merger", 1));
     let (primary, secondary) = config.galaxies.split_at_mut(1);
     config.initial_relative_velocity_kms =
-        set_bound_pair_orbit(&mut primary[0], &mut secondary[0], 55.0, 14.0);
+        set_direct_infall_pair_orbit(&mut primary[0], &mut secondary[0], 32.0, 0.30, 0.20);
     MergerPreset {
         id: "minor-merger",
         title: "Minor Merger",

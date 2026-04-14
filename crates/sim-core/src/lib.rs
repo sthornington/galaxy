@@ -357,6 +357,7 @@ mod tests {
         let baryvelocity = (velocity1 * m1 + velocity2 * m2) / total_mass;
         let separation = (position2 - position1).length();
         let relative_speed = (velocity2 - velocity1).length();
+        let local_escape_speed = (2.0 * 4.300_91e-6 * total_mass / separation).sqrt();
         let specific_orbital_energy =
             0.5 * relative_speed * relative_speed - 4.300_91e-6 * total_mass / separation;
 
@@ -366,6 +367,14 @@ mod tests {
             "orbit should start with zero net linear momentum"
         );
         assert!(specific_orbital_energy < 0.0, "major merger should start on a bound orbit");
+        assert!(
+            relative_speed < local_escape_speed,
+            "major merger should start below local escape speed"
+        );
+        assert!(
+            (position2 - position1).dot(velocity2 - velocity1) < 0.0,
+            "major merger should start on the inbound leg so the pair is already converging"
+        );
     }
 
     #[test]

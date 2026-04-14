@@ -13,7 +13,7 @@ use axum::{
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sim_core::{MergerPreset, SimulationConfig, built_in_presets, decode_preview_packet};
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -316,6 +316,23 @@ async fn frame_socket(
                 if let Err(error) = result {
                     warn!("frame websocket resync send failed: {error}");
                     return;
+                }
+
+                loop {
+                    match receiver.try_recv() {
+                        Ok(_) => continue,
+                        Err(TryRecvError::Lagged(skipped_more)) => {
+                            warn!(
+                                "frame websocket discarded additional stale backlog after lag: {skipped_more}"
+                            );
+                            continue;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Closed) => {
+                            warn!("frame broadcast channel closed while draining lag backlog");
+                            return;
+                        }
+                    }
                 }
             }
             Err(RecvError::Closed) => {

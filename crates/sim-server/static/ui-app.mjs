@@ -568,6 +568,14 @@ export function createUiApp({
   }
 
   function queueFrame(frame) {
+    if (
+      renderState.targetFrame &&
+      Number.isFinite(renderState.targetFrame.sim_time_myr) &&
+      Number.isFinite(frame.sim_time_myr) &&
+      frame.sim_time_myr <= renderState.targetFrame.sim_time_myr + 1e-9
+    ) {
+      return;
+    }
     updateSceneBounds(frame);
     camera.lastFrame = frame;
     if (renderState.targetFrame) {
