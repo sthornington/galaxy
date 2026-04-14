@@ -33,6 +33,11 @@ struct GalaxyMetrics {
     disk_count: usize,
 }
 
+#[derive(Clone, Debug)]
+struct SystemMetrics {
+    center_of_mass_kpc: Vec3,
+}
+
 fn main() -> Result<()> {
     let args = parse_args()?;
     let preset = built_in_presets()
@@ -60,7 +65,18 @@ fn main() -> Result<()> {
     }
 
     let initial_metrics = compute_all_metrics(&initial_conditions.particles, &config);
-    print_metrics("initial", 0.0, 0.0, 0.0, 1.0, &initial_metrics, &initial_metrics);
+    let initial_system = compute_system_metrics(&initial_conditions.particles);
+    print_metrics(
+        "initial",
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        Vec3::ZERO,
+        &initial_system,
+        &initial_metrics,
+        &initial_metrics,
+    );
 
     let mut backend = GpuBackend::new(&config, &initial_conditions).context("create backend")?;
     let mut completed = 0_u32;
@@ -79,12 +95,15 @@ fn main() -> Result<()> {
         };
         let particles = backend.download_particles().context("download particles")?;
         let metrics = compute_all_metrics(&particles, &config);
+        let system = compute_system_metrics(&particles);
         print_metrics(
             &format!("step+{run_steps}"),
             diagnostics.sim_time_myr,
             wall_seconds,
             total_energy,
             energy_ratio,
+            diagnostics.total_momentum,
+            &system,
             &metrics,
             &initial_metrics,
         );
@@ -440,13 +459,22 @@ fn compute_galaxy_metrics(particles: &[Particle], galaxy_index: u32) -> GalaxyMe
         bulk_velocity = smbh.velocity_kms;
     }
 
-    let disk_particles: Vec<&Particle> = particles
+    let mut tracer_particles: Vec<&Particle> = particles
         .iter()
         .filter(|particle| {
             particle.galaxy_index == galaxy_index && matches!(particle.component, ParticleComponent::Disk)
         })
         .collect();
-    if disk_particles.is_empty() {
+    if tracer_particles.is_empty() {
+        tracer_particles = particles
+            .iter()
+            .filter(|particle| {
+                particle.galaxy_index == galaxy_index
+                    && !matches!(particle.component, ParticleComponent::Halo | ParticleComponent::Smbh)
+            })
+            .collect();
+    }
+    if tracer_particles.is_empty() {
         return GalaxyMetrics {
             disk_r50_kpc: 0.0,
             disk_r90_kpc: 0.0,
@@ -457,7 +485,7 @@ fn compute_galaxy_metrics(particles: &[Particle], galaxy_index: u32) -> GalaxyMe
         };
     }
 
-    let total_angular_momentum = disk_particles.iter().fold(Vec3::ZERO, |accum, particle| {
+    let total_angular_momentum = tracer_particles.iter().fold(Vec3::ZERO, |accum, particle| {
         let r = particle.position_kpc - center;
         let v = particle.velocity_kms - bulk_velocity;
         accum
@@ -470,10 +498,10 @@ fn compute_galaxy_metrics(particles: &[Particle], galaxy_index: u32) -> GalaxyMe
     let disk_normal = total_angular_momentum.normalized();
     let spin = total_angular_momentum.length();
 
-    let mut cylindrical_radii = Vec::with_capacity(disk_particles.len());
+    let mut cylindrical_radii = Vec::with_capacity(tracer_particles.len());
     let mut height_sq_sum = 0.0;
     let mut radial_velocity_sum = 0.0;
-    for particle in &disk_particles {
+    for particle in &tracer_particles {
         let r = particle.position_kpc - center;
         let v = particle.velocity_kms - bulk_velocity;
         let height = r.dot(disk_normal);
@@ -490,10 +518,10 @@ fn compute_galaxy_metrics(particles: &[Particle], galaxy_index: u32) -> GalaxyMe
     GalaxyMetrics {
         disk_r50_kpc: quantile(&cylindrical_radii, 0.5),
         disk_r90_kpc: quantile(&cylindrical_radii, 0.9),
-        disk_rms_height_kpc: (height_sq_sum / disk_particles.len() as f64).sqrt(),
+        disk_rms_height_kpc: (height_sq_sum / tracer_particles.len() as f64).sqrt(),
         disk_spin: spin,
-        disk_mean_radial_velocity_kms: radial_velocity_sum / disk_particles.len() as f64,
-        disk_count: disk_particles.len(),
+        disk_mean_radial_velocity_kms: radial_velocity_sum / tracer_particles.len() as f64,
+        disk_count: tracer_particles.len(),
     }
 }
 
@@ -505,17 +533,38 @@ fn quantile(sorted: &[f64], q: f64) -> f64 {
     sorted[index]
 }
 
+fn compute_system_metrics(particles: &[Particle]) -> SystemMetrics {
+    let mut total_mass = 0.0;
+    let mut weighted_position = Vec3::ZERO;
+    for particle in particles {
+        total_mass += particle.mass_msun;
+        weighted_position += particle.position_kpc * particle.mass_msun;
+    }
+    let center_of_mass_kpc = if total_mass > 0.0 {
+        weighted_position / total_mass
+    } else {
+        Vec3::ZERO
+    };
+    SystemMetrics { center_of_mass_kpc }
+}
+
 fn print_metrics(
     label: &str,
     sim_time_myr: f64,
     wall_seconds: f64,
     total_energy: f64,
     energy_ratio: f64,
+    total_momentum: Vec3,
+    system: &SystemMetrics,
     metrics: &[GalaxyMetrics],
     baseline: &[GalaxyMetrics],
 ) {
+    let momentum_mag = total_momentum.length();
     println!(
-        "label={label} sim_time_myr={sim_time_myr:.3} wall_s={wall_seconds:.3} total_energy={total_energy:.6e} total_energy_ratio={energy_ratio:.6}"
+        "label={label} sim_time_myr={sim_time_myr:.3} wall_s={wall_seconds:.3} total_energy={total_energy:.6e} total_energy_ratio={energy_ratio:.6} momentum_mag={momentum_mag:.6e} com=({:.4},{:.4},{:.4})",
+        system.center_of_mass_kpc.x,
+        system.center_of_mass_kpc.y,
+        system.center_of_mass_kpc.z,
     );
     for (index, (current, initial)) in metrics.iter().zip(baseline.iter()).enumerate() {
         let r50_ratio = current.disk_r50_kpc / initial.disk_r50_kpc.max(1.0e-6);

@@ -37,7 +37,9 @@ constexpr double kShortRangeTargetOccupancy = 8.0;
 constexpr std::uint32_t kShortRangeForceFactorLutSize = 4096;
 constexpr std::size_t kMaxShortRangeCells = 4u * 1024u * 1024u;
 constexpr int kMaxShortRangeAxisCells = 1024;
-constexpr int kShortRangeDirectCellThreshold = 64;
+constexpr int kShortRangeDirectCellThreshold = 192;
+constexpr int kShortRangeDirectNeighborhoodThresholdLowN = 768;
+constexpr int kShortRangeDirectNeighborhoodThresholdDefault = 256;
 // Shipped presets should all exercise the same solver path.
 // The host-built particle tree remains available as an opt-in diagnostic path via
 // SIM_CUDA_PARTICLE_TREE_THRESHOLD, but the default runtime stays on the large-run cell tree.
@@ -112,15 +114,15 @@ double short_range_target_occupancy(const std::uint64_t particle_count) {
   if (override > 0.0) {
     return override;
   }
-  // Low-particle interactive runs were over-refining the short-range grid,
-  // which inflated the host-built cell tree/interactions far more than it
-  // improved force quality. Use coarser target occupancy at low N and a
-  // still-moderate occupancy at larger N.
+  // Dense low-particle collapses are especially sensitive to close-force
+  // quantization. Keep the low-N grid noticeably finer so more local
+  // interactions stay in the direct path instead of collapsing into coarse
+  // octant COM approximations.
   if (particle_count <= 300'000u) {
-    return 64.0;
+    return 16.0;
   }
   if (particle_count <= 1'000'000u) {
-    return 32.0;
+    return 24.0;
   }
   if (particle_count >= 2'000'000u) {
     return 32.0;
@@ -242,6 +244,7 @@ struct DeviceState {
   bool short_tree_particle_mode = false;
   bool short_range_target_baryons_only = false;
   bool force_state_valid = false;
+  double last_max_accel_sq = 0.0;
 
   int nx = 0;
   int ny = 0;
@@ -289,6 +292,7 @@ struct DeviceState {
   double* short_cell_octant_com_y = nullptr;
   double* short_cell_octant_com_z = nullptr;
   float* short_force_factor_lut = nullptr;
+  double* max_accel_sq = nullptr;
   ShortRangeInteractionSource* short_cell_interactions = nullptr;
   ShortRangeTreeNode* short_tree_nodes = nullptr;
   std::uint32_t short_source_particle_count = 0;
@@ -401,6 +405,27 @@ void fill_cufft_error(char* buffer,
     return;
   }
   std::snprintf(buffer, len, "%s: %s", context, cufft_error_string(err));
+}
+
+__device__ inline void atomic_max_positive_double(double* address, const double value) {
+  if (!(value > 0.0)) {
+    return;
+  }
+  auto* address_as_ull = reinterpret_cast<unsigned long long*>(address);
+  unsigned long long observed = *address_as_ull;
+  while (true) {
+    const double current = __longlong_as_double(static_cast<long long>(observed));
+    if (current >= value) {
+      return;
+    }
+    const unsigned long long desired =
+        static_cast<unsigned long long>(__double_as_longlong(value));
+    const unsigned long long prior = atomicCAS(address_as_ull, observed, desired);
+    if (prior == observed) {
+      return;
+    }
+    observed = prior;
+  }
 }
 
 void destroy_mesh_buffers(MeshBuffers& mesh) {
@@ -533,6 +558,7 @@ void destroy_state(DeviceState* state) {
   cudaFree(state->short_cell_octant_com_x);
   cudaFree(state->short_cell_octant_mass);
   cudaFree(state->short_force_factor_lut);
+  cudaFree(state->max_accel_sq);
   cudaFree(state->short_tree_nodes);
   cudaFree(state->short_cell_end);
   cudaFree(state->short_cell_start);
@@ -553,6 +579,40 @@ void destroy_state(DeviceState* state) {
   delete state;
 }
 
+struct DiagnosticsTotals {
+  double kinetic_energy = 0.0;
+  double momentum_x = 0.0;
+  double momentum_y = 0.0;
+  double momentum_z = 0.0;
+};
+
+struct DiagnosticsTotalsAccessor {
+  __host__ __device__ DiagnosticsTotals operator()(const SimCudaParticle& particle) const {
+    const double vx = particle.velocity_kms[0];
+    const double vy = particle.velocity_kms[1];
+    const double vz = particle.velocity_kms[2];
+    const double mass = particle.mass_msun;
+    DiagnosticsTotals totals{};
+    totals.kinetic_energy = 0.5 * mass * (vx * vx + vy * vy + vz * vz);
+    totals.momentum_x = mass * vx;
+    totals.momentum_y = mass * vy;
+    totals.momentum_z = mass * vz;
+    return totals;
+  }
+};
+
+struct MergeDiagnosticsTotals {
+  __host__ __device__ DiagnosticsTotals operator()(const DiagnosticsTotals& lhs,
+                                                   const DiagnosticsTotals& rhs) const {
+    DiagnosticsTotals totals{};
+    totals.kinetic_energy = lhs.kinetic_energy + rhs.kinetic_energy;
+    totals.momentum_x = lhs.momentum_x + rhs.momentum_x;
+    totals.momentum_y = lhs.momentum_y + rhs.momentum_y;
+    totals.momentum_z = lhs.momentum_z + rhs.momentum_z;
+    return totals;
+  }
+};
+
 void fill_basic_diagnostics(const DeviceState& state,
                             const double dt_myr,
                             SimCudaDiagnostics* diagnostics) {
@@ -560,11 +620,20 @@ void fill_basic_diagnostics(const DeviceState& state,
   diagnostics->preview_count = 0;
   diagnostics->sim_time_myr = state.sim_time_myr;
   diagnostics->dt_myr = dt_myr;
-  diagnostics->kinetic_energy = 0.0;
+  thrust::device_ptr<SimCudaParticle> begin(state.particles);
+  thrust::device_ptr<SimCudaParticle> end = begin + state.particle_count;
+  const DiagnosticsTotals totals = thrust::transform_reduce(
+      thrust::cuda::par.on(state.compute_stream),
+      begin,
+      end,
+      DiagnosticsTotalsAccessor{},
+      DiagnosticsTotals{},
+      MergeDiagnosticsTotals{});
+  diagnostics->kinetic_energy = totals.kinetic_energy;
   diagnostics->estimated_potential_energy = 0.0;
-  diagnostics->total_momentum[0] = 0.0;
-  diagnostics->total_momentum[1] = 0.0;
-  diagnostics->total_momentum[2] = 0.0;
+  diagnostics->total_momentum[0] = totals.momentum_x;
+  diagnostics->total_momentum[1] = totals.momentum_y;
+  diagnostics->total_momentum[2] = totals.momentum_z;
 }
 
 int ensure_preview_capacity(DeviceState* state,
@@ -1847,6 +1916,13 @@ std::uint32_t estimate_substeps_for_step(DeviceState* state,
         SpeedAccessor{},
         0.0,
         thrust::maximum<double>());
+    const cudaError_t accel_status =
+        cudaMemcpy(&state->last_max_accel_sq, state->max_accel_sq, sizeof(double), cudaMemcpyDeviceToHost);
+    if (accel_status != cudaSuccess) {
+      fill_cuda_error(
+          error_buffer, error_buffer_len, "max acceleration download failed", accel_status);
+      return std::max(1u, state->max_substeps);
+    }
     const double min_global_cell = std::max(
         1.0e-4, std::min(state->cell_size[0], std::min(state->cell_size[1], state->cell_size[2])));
     double integration_scale = min_global_cell;
@@ -1862,7 +1938,11 @@ std::uint32_t estimate_substeps_for_step(DeviceState* state,
     }
     const double allowed_displacement =
         state->cfl_safety_factor * std::max(1.0e-4, integration_scale);
-    const double predicted_displacement = max_speed_kms * dt_myr * kKpcPerKmPerMyr;
+    const double max_accel_kpc_per_myr2 =
+        std::sqrt(std::max(0.0, state->last_max_accel_sq)) * kKpcPerKmPerMyr * kKpcPerKmPerMyr;
+    const double predicted_displacement =
+        max_speed_kms * dt_myr * kKpcPerKmPerMyr +
+        0.5 * max_accel_kpc_per_myr2 * dt_myr * dt_myr;
     const double raw_substeps = predicted_displacement / std::max(allowed_displacement, 1.0e-6);
     const std::uint32_t substeps = static_cast<std::uint32_t>(
         std::clamp(std::ceil(raw_substeps), 1.0, static_cast<double>(std::max(1u, state->max_substeps))));
@@ -2721,6 +2801,7 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
                                       const std::uint32_t galaxy_count,
                                       const double grav_const,
                                       const int enable_smbh_post_newtonian,
+                                      double* __restrict__ max_accel_sq,
                                       const double dt_myr) {
   const std::uint64_t index =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -2775,6 +2856,10 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
     int particle_cell_x = -1;
     int particle_cell_y = -1;
     int particle_cell_z = -1;
+    int neighbor_radius_x = 0;
+    int neighbor_radius_y = 0;
+    int neighbor_radius_z = 0;
+    bool use_direct_neighborhood = false;
     if (short_tree_particle_mode == 0) {
       const double gx = fmin(
           fmax((particle_pos_x - short_origin_x) / short_cell_x, 0.0),
@@ -2793,8 +2878,131 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
                                               particle_cell_z,
                                               short_ny,
                                               short_nz);
+      neighbor_radius_x =
+          min(1, max(1, static_cast<int>(ceil(short_cutoff_kpc / fmax(short_cell_x, 1.0e-6)))));
+      neighbor_radius_y =
+          min(1, max(1, static_cast<int>(ceil(short_cutoff_kpc / fmax(short_cell_y, 1.0e-6)))));
+      neighbor_radius_z =
+          min(1, max(1, static_cast<int>(ceil(short_cutoff_kpc / fmax(short_cell_z, 1.0e-6)))));
       const int start = short_cell_start[particle_cell];
       if (start >= 0) {
+        const int direct_neighborhood_threshold =
+            particle_count <= 300'000u ? kShortRangeDirectNeighborhoodThresholdLowN
+                                       : kShortRangeDirectNeighborhoodThresholdDefault;
+        const double cell_half_x = 0.5 * short_cell_x;
+        const double cell_half_y = 0.5 * short_cell_y;
+        const double cell_half_z = 0.5 * short_cell_z;
+        int local_occupancy = 0;
+        bool neighborhood_too_dense = false;
+        for (int neighbor_x = max(0, particle_cell_x - neighbor_radius_x);
+             neighbor_x <= min(short_nx - 1, particle_cell_x + neighbor_radius_x) &&
+             !neighborhood_too_dense;
+             ++neighbor_x) {
+          for (int neighbor_y = max(0, particle_cell_y - neighbor_radius_y);
+               neighbor_y <= min(short_ny - 1, particle_cell_y + neighbor_radius_y) &&
+               !neighborhood_too_dense;
+               ++neighbor_y) {
+            for (int neighbor_z = max(0, particle_cell_z - neighbor_radius_z);
+                 neighbor_z <= min(short_nz - 1, particle_cell_z + neighbor_radius_z);
+                 ++neighbor_z) {
+              const double center_x =
+                  short_origin_x + (static_cast<double>(neighbor_x) + 0.5) * short_cell_x;
+              const double center_y =
+                  short_origin_y + (static_cast<double>(neighbor_y) + 0.5) * short_cell_y;
+              const double center_z =
+                  short_origin_z + (static_cast<double>(neighbor_z) + 0.5) * short_cell_z;
+              const double dx_aabb =
+                  fmax(fabs(particle_pos_x - center_x) - cell_half_x, 0.0);
+              const double dy_aabb =
+                  fmax(fabs(particle_pos_y - center_y) - cell_half_y, 0.0);
+              const double dz_aabb =
+                  fmax(fabs(particle_pos_z - center_z) - cell_half_z, 0.0);
+              if (dx_aabb * dx_aabb + dy_aabb * dy_aabb + dz_aabb * dz_aabb > short_cutoff_sq) {
+                continue;
+              }
+              const int neighbor_cell =
+                  short_cell_linear_index(neighbor_x, neighbor_y, neighbor_z, short_ny, short_nz);
+              const int neighbor_start = short_cell_start[neighbor_cell];
+              if (neighbor_start < 0) {
+                continue;
+              }
+              local_occupancy += short_cell_end[neighbor_cell] - neighbor_start;
+              if (local_occupancy > direct_neighborhood_threshold) {
+                neighborhood_too_dense = true;
+                break;
+              }
+            }
+          }
+        }
+        use_direct_neighborhood = !neighborhood_too_dense;
+        if (use_direct_neighborhood) {
+          for (int neighbor_x = max(0, particle_cell_x - neighbor_radius_x);
+               neighbor_x <= min(short_nx - 1, particle_cell_x + neighbor_radius_x);
+               ++neighbor_x) {
+            for (int neighbor_y = max(0, particle_cell_y - neighbor_radius_y);
+                 neighbor_y <= min(short_ny - 1, particle_cell_y + neighbor_radius_y);
+                 ++neighbor_y) {
+              for (int neighbor_z = max(0, particle_cell_z - neighbor_radius_z);
+                   neighbor_z <= min(short_nz - 1, particle_cell_z + neighbor_radius_z);
+                   ++neighbor_z) {
+                const double center_x =
+                    short_origin_x + (static_cast<double>(neighbor_x) + 0.5) * short_cell_x;
+                const double center_y =
+                    short_origin_y + (static_cast<double>(neighbor_y) + 0.5) * short_cell_y;
+                const double center_z =
+                    short_origin_z + (static_cast<double>(neighbor_z) + 0.5) * short_cell_z;
+                const double dx_aabb =
+                    fmax(fabs(particle_pos_x - center_x) - cell_half_x, 0.0);
+                const double dy_aabb =
+                    fmax(fabs(particle_pos_y - center_y) - cell_half_y, 0.0);
+                const double dz_aabb =
+                    fmax(fabs(particle_pos_z - center_z) - cell_half_z, 0.0);
+                if (dx_aabb * dx_aabb + dy_aabb * dy_aabb + dz_aabb * dz_aabb >
+                    short_cutoff_sq) {
+                  continue;
+                }
+
+                const int neighbor_cell = short_cell_linear_index(
+                    neighbor_x, neighbor_y, neighbor_z, short_ny, short_nz);
+                const int neighbor_start = short_cell_start[neighbor_cell];
+                if (neighbor_start < 0) {
+                  continue;
+                }
+                const int neighbor_end = short_cell_end[neighbor_cell];
+                for (int sorted_index = neighbor_start; sorted_index < neighbor_end; ++sorted_index) {
+                  const int source_index = short_sorted_particle_indices[sorted_index];
+                  if (source_index < 0 ||
+                      static_cast<std::uint64_t>(source_index) >= particle_count ||
+                      source_index == static_cast<int>(index)) {
+                    continue;
+                  }
+
+                  const SimCudaParticle source = particles[source_index];
+                  const double dx = source.position_kpc[0] - particle_pos_x;
+                  const double dy = source.position_kpc[1] - particle_pos_y;
+                  const double dz = source.position_kpc[2] - particle_pos_z;
+                  const double r2 = dx * dx + dy * dy + dz * dz;
+                  if (r2 <= 1.0e-12 || r2 > short_cutoff_sq) {
+                    continue;
+                  }
+
+                  const double short_softening = fmax(particle_softening, source.softening_kpc);
+                  const double direct_scale =
+                      grav_const * source.mass_msun * softened_inv_r3(dx, dy, dz, short_softening);
+                  const double correction_scale =
+                      direct_scale * treepm_short_range_force_factor_lookup(short_force_factor_lut,
+                                                                            short_force_factor_lut_size,
+                                                                            short_force_factor_lut_scale,
+                                                                            r2,
+                                                                            short_pm_softening_kpc);
+                  ax += correction_scale * dx;
+                  ay += correction_scale * dy;
+                  az += correction_scale * dz;
+                }
+              }
+            }
+          }
+        } else {
         const int end = short_cell_end[particle_cell];
         const int occupancy = end - start;
         if (occupancy <= kShortRangeDirectCellThreshold) {
@@ -2889,16 +3097,11 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
             az += correction_scale * dz;
           }
         }
+        }
       }
     }
 
-    if (short_tree_particle_mode == 0 && particle_cell >= 0) {
-      const int neighbor_radius_x =
-          min(1, max(1, static_cast<int>(ceil(short_cutoff_kpc / fmax(short_cell_x, 1.0e-6)))));
-      const int neighbor_radius_y =
-          min(1, max(1, static_cast<int>(ceil(short_cutoff_kpc / fmax(short_cell_y, 1.0e-6)))));
-      const int neighbor_radius_z =
-          min(1, max(1, static_cast<int>(ceil(short_cutoff_kpc / fmax(short_cell_z, 1.0e-6)))));
+    if (!use_direct_neighborhood && short_tree_particle_mode == 0 && particle_cell >= 0) {
       const double cell_half_x = 0.5 * short_cell_x;
       const double cell_half_y = 0.5 * short_cell_y;
       const double cell_half_z = 0.5 * short_cell_z;
@@ -3069,6 +3272,9 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
     }
   }
 
+  if (max_accel_sq != nullptr) {
+    atomic_max_positive_double(max_accel_sq, ax * ax + ay * ay + az * az);
+  }
   particle.velocity_kms[0] = particle_vel_x + ax * dt_myr * kKpcPerKmPerMyr;
   particle.velocity_kms[1] = particle_vel_y + ay * dt_myr * kKpcPerKmPerMyr;
   particle.velocity_kms[2] = particle_vel_z + az * dt_myr * kKpcPerKmPerMyr;
@@ -3752,6 +3958,12 @@ int apply_force_kick_from_state(DeviceState* state,
                                 const double dt_myr,
                                 char* error_buffer,
                                 const std::size_t error_buffer_len) {
+  cudaError_t cuda_status =
+      cudaMemsetAsync(state->max_accel_sq, 0, sizeof(double), state->compute_stream);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "max acceleration clear failed", cuda_status);
+    return 1;
+  }
   kick_particles_global<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
       state->particles,
       state->particle_count,
@@ -3808,8 +4020,9 @@ int apply_force_kick_from_state(DeviceState* state,
       state->galaxy_count,
       state->grav_const,
       state->enable_smbh_post_newtonian ? 1 : 0,
+      state->max_accel_sq,
       dt_myr);
-  cudaError_t cuda_status = cudaGetLastError();
+  cuda_status = cudaGetLastError();
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer, error_buffer_len, "global particle kick kernel failed", cuda_status);
     return 1;
@@ -4050,6 +4263,24 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
       static_cast<std::uint32_t>(short_source_particle_indices_host.size());
   state->preview_visible_particle_count =
       static_cast<std::uint32_t>(preview_visible_particle_indices_host.size());
+  cuda_status = cudaMalloc(reinterpret_cast<void**>(&state->max_accel_sq), sizeof(double));
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer,
+                    error_buffer_len,
+                    "cudaMalloc for max acceleration failed",
+                    cuda_status);
+    destroy_state(state);
+    return 1;
+  }
+  cuda_status = cudaMemset(state->max_accel_sq, 0, sizeof(double));
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer,
+                    error_buffer_len,
+                    "cudaMemset for max acceleration failed",
+                    cuda_status);
+    destroy_state(state);
+    return 1;
+  }
   if (state->short_source_particle_count > 0) {
     cuda_status = cudaMalloc(reinterpret_cast<void**>(&state->short_source_particle_indices),
                              sizeof(int) * state->short_source_particle_count);

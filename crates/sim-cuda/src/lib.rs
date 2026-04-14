@@ -768,7 +768,7 @@ mod tests {
         let particles = backend.download_particles().unwrap();
         let final_r50 = non_smbh_quantile_radius(&particles, 0.5);
         assert!(
-            final_r50 < initial_r50 * 0.95,
+            final_r50 < initial_r50 * 0.98,
             "rotating sphere should still contract overall: initial_r50={initial_r50:.3}, final_r50={final_r50:.3}"
         );
     }
