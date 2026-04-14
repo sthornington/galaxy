@@ -40,6 +40,17 @@ export function createUiApp({
     sceneRadius: 120,
     lastFrame: null,
   };
+  const renderState = {
+    previousFrame: null,
+    targetFrame: null,
+    blendStartMs: 0,
+    blendDurationMs: 90,
+    rafHandle: null,
+  };
+  const requestAnimationFrameImpl =
+    typeof window.requestAnimationFrame === "function"
+      ? window.requestAnimationFrame.bind(window)
+      : (callback) => globalThis.setTimeout(() => callback(Date.now()), 16);
 
   function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
@@ -216,8 +227,8 @@ export function createUiApp({
     );
     const renderLuminosity = Math.pow(luminosity, 0.58);
     const color = applyDopplerShift(baseColor, projected.radialVelocityKms);
-    const sizeScale = Math.pow(projected.perspective, 1.28);
-    const alphaScale = Math.pow(projected.perspective, 1.42);
+    const sizeScale = Math.pow(projected.perspective, 1.18);
+    const alphaScale = Math.pow(projected.perspective, 0.92);
 
     return {
       x: projected.x,
@@ -225,8 +236,8 @@ export function createUiApp({
       depth: projected.depth,
       glowRadius: Math.max(0.08, 0.52 * renderLuminosity * sizeScale),
       coreRadius: Math.max(0.03, 0.12 * renderLuminosity * sizeScale),
-      glowAlpha: clamp(0.0024 * renderLuminosity * alphaScale, 0.00045, 0.009),
-      coreAlpha: clamp(0.06 * renderLuminosity * alphaScale, 0.006, 0.16),
+      glowAlpha: clamp(0.0032 * renderLuminosity * alphaScale, 0.0012, 0.012),
+      coreAlpha: clamp(0.072 * renderLuminosity * alphaScale, 0.012, 0.18),
       color,
     };
   }
@@ -447,9 +458,9 @@ export function createUiApp({
     return sessionPoll;
   }
 
-  function drawFrame(frame) {
-    camera.lastFrame = frame;
-    updateSceneBounds(frame);
+  function drawFrameInternal(frameA, frameB = null, alpha = 1) {
+    const targetFrame = frameB ?? frameA;
+    camera.lastFrame = targetFrame;
     const width = nodes.canvas.width;
     const height = nodes.canvas.height;
     context.clearRect(0, 0, width, height);
@@ -461,12 +472,19 @@ export function createUiApp({
     context.fillRect(0, 0, width, height);
 
     const stellarProjected = [];
-    for (const particle of frame.particles) {
-      const point = projectParticle(particle, width, height);
+    const count = frameB
+      ? Math.min(frameA.particles.length, frameB.particles.length)
+      : frameA.particles.length;
+    for (let index = 0; index < count; index += 1) {
+      const particle = frameA.particles[index];
+      const targetParticle = frameB ? frameB.particles[index] : particle;
+      const point = frameB
+        ? projectInterpolatedParticle(particle, targetParticle, alpha, width, height)
+        : projectParticle(particle, width, height);
       if (!point) {
         continue;
       }
-      if ((particle.component ?? 0) === 0) continue;
+      if ((point.particle.component ?? 0) === 0) continue;
       const style = stellarRenderStyle(point);
       if (style) {
         stellarProjected.push(style);
@@ -497,6 +515,72 @@ export function createUiApp({
       drawXyPlaneGrid(width, height);
     }
     drawOriginAxes(width, height);
+  }
+
+  function drawFrame(frame) {
+    updateSceneBounds(frame);
+    drawFrameInternal(frame);
+  }
+
+  function projectInterpolatedParticle(particleA, particleB, alpha, width, height) {
+    if ((particleA.component ?? 0) !== (particleB.component ?? 0)) {
+      return projectParticle(particleB, width, height);
+    }
+    const position = [
+      particleA.position_kpc[0] + (particleB.position_kpc[0] - particleA.position_kpc[0]) * alpha,
+      particleA.position_kpc[1] + (particleB.position_kpc[1] - particleA.position_kpc[1]) * alpha,
+      particleA.position_kpc[2] + (particleB.position_kpc[2] - particleA.position_kpc[2]) * alpha,
+    ];
+    const projected = projectPoint(position, width, height);
+    if (!projected) {
+      return null;
+    }
+    const velocity = [
+      particleA.velocity_kms[0] + (particleB.velocity_kms[0] - particleA.velocity_kms[0]) * alpha,
+      particleA.velocity_kms[1] + (particleB.velocity_kms[1] - particleA.velocity_kms[1]) * alpha,
+      particleA.velocity_kms[2] + (particleB.velocity_kms[2] - particleA.velocity_kms[2]) * alpha,
+    ];
+    return {
+      ...projected,
+      radialVelocityKms: dot3(velocity, projected.forward),
+      particle: particleB,
+    };
+  }
+
+  function renderLatestFrame(now = window.performance?.now?.() ?? Date.now()) {
+    renderState.rafHandle = null;
+    if (!renderState.targetFrame) {
+      return;
+    }
+    if (!renderState.previousFrame) {
+      drawFrame(renderState.targetFrame);
+      return;
+    }
+    const alpha = clamp(
+      (now - renderState.blendStartMs) / renderState.blendDurationMs,
+      0,
+      1
+    );
+    drawFrameInternal(renderState.previousFrame, renderState.targetFrame, alpha);
+    if (alpha < 1) {
+      renderState.rafHandle = requestAnimationFrameImpl(renderLatestFrame);
+    }
+  }
+
+  function queueFrame(frame) {
+    updateSceneBounds(frame);
+    camera.lastFrame = frame;
+    if (renderState.targetFrame) {
+      renderState.previousFrame = renderState.targetFrame;
+    } else {
+      renderState.previousFrame = frame;
+    }
+    renderState.targetFrame = frame;
+    renderState.blendStartMs = window.performance?.now?.() ?? Date.now();
+    renderLatestFrame(renderState.blendStartMs);
+    if (renderState.rafHandle === null) {
+      renderState.rafHandle = requestAnimationFrameImpl(renderLatestFrame);
+    }
   }
 
   function niceGridSpacing(target) {
@@ -601,7 +685,9 @@ export function createUiApp({
   }
 
   function redrawFrame() {
-    if (camera.lastFrame) {
+    if (renderState.targetFrame) {
+      renderLatestFrame(window.performance?.now?.() ?? Date.now());
+    } else if (camera.lastFrame) {
       drawFrame(camera.lastFrame);
     }
   }
@@ -690,7 +776,7 @@ export function createUiApp({
     };
     frameSocket.onmessage = (event) => {
       const frame = JSON.parse(event.data);
-      drawFrame(frame);
+      queueFrame(frame);
       nodes.previewCount.textContent =
         frame.diagnostics.preview_count.toLocaleString();
       nodes.simTime.textContent = `${frame.sim_time_myr.toFixed(2)} Myr`;

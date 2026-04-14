@@ -13,6 +13,7 @@ use axum::{
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sim_core::{MergerPreset, SimulationConfig, built_in_presets, decode_preview_packet};
+use tokio::sync::broadcast::error::RecvError;
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -288,8 +289,37 @@ async fn frame_socket(
                     return;
                 }
             }
-            Err(error) => {
-                warn!("frame broadcast channel closed: {error}");
+            Err(RecvError::Lagged(skipped)) => {
+                warn!("frame websocket lagged by {skipped}; resynchronizing to latest frame");
+                let Some(frame) = session.latest_frame() else {
+                    continue;
+                };
+                let result = if as_json {
+                    match decode_preview_packet(&frame) {
+                        Ok(decoded) => {
+                            socket
+                                .send(Message::Text(
+                                    serde_json::to_string(&decoded)
+                                        .unwrap_or_else(|_| "{}".to_string())
+                                        .into(),
+                                ))
+                                .await
+                        }
+                        Err(error) => {
+                            warn!("failed to decode latest frame while resynchronizing: {error}");
+                            continue;
+                        }
+                    }
+                } else {
+                    socket.send(Message::Binary(frame.into())).await
+                };
+                if let Err(error) = result {
+                    warn!("frame websocket resync send failed: {error}");
+                    return;
+                }
+            }
+            Err(RecvError::Closed) => {
+                warn!("frame broadcast channel closed");
                 return;
             }
         }

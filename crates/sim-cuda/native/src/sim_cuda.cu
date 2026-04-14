@@ -663,12 +663,7 @@ int schedule_preview_capture(DeviceState* state,
                                          1,
                                          static_cast<std::uint64_t>(visible_count) /
                                              static_cast<std::uint64_t>(sampled_count));
-  const std::uint32_t sample_offset =
-      visible_count == 0 ? 0 : (state->preview_sample_offset % visible_count);
-  if (visible_count > 0) {
-    const std::uint32_t hop = std::max<std::uint32_t>(1, visible_count / 17);
-    state->preview_sample_offset = (sample_offset + hop) % visible_count;
-  }
+  const std::uint32_t sample_offset = 0;
   if (ensure_preview_capacity(state, count, error_buffer, error_buffer_len) != 0) {
     return 1;
   }

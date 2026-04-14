@@ -52,8 +52,12 @@ mod wasm {
         websocket: WebSocket,
         canvas: HtmlCanvasElement,
         _frame: Rc<RefCell<Option<PreviewFrame>>>,
+        _previous_frame: Rc<RefCell<Option<PreviewFrame>>>,
         _camera: Rc<RefCell<CameraState>>,
+        _blend_started_ms: Rc<RefCell<f64>>,
+        _blend_scheduled: Rc<RefCell<bool>>,
         _onmessage: Closure<dyn FnMut(MessageEvent)>,
+        _animation: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>,
         oncontextmenu: Closure<dyn FnMut(MouseEvent)>,
         onmousedown: Closure<dyn FnMut(MouseEvent)>,
         onmousemove: Closure<dyn FnMut(MouseEvent)>,
@@ -172,8 +176,13 @@ mod wasm {
             .dyn_into::<CanvasRenderingContext2d>()?;
 
         let frame = Rc::new(RefCell::new(None));
+        let previous_frame = Rc::new(RefCell::new(None));
         let camera = Rc::new(RefCell::new(CameraState::default()));
         let saw_first_frame = Rc::new(RefCell::new(false));
+        let blend_started_ms = Rc::new(RefCell::new(0.0));
+        let blend_scheduled = Rc::new(RefCell::new(false));
+        let animation: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> =
+            Rc::new(RefCell::new(None));
 
         let location = window.location();
         let scheme = if location.protocol()?.starts_with("https") {
@@ -185,13 +194,82 @@ mod wasm {
         let ws = WebSocket::new(&format!("{scheme}://{host}/ws/frames/{session_id}"))?;
         ws.set_binary_type(BinaryType::Arraybuffer);
 
+        let schedule_blend = {
+            let window = window.clone();
+            let context = context.clone();
+            let canvas = canvas.clone();
+            let frame = frame.clone();
+            let previous_frame = previous_frame.clone();
+            let camera = camera.clone();
+            let blend_started_ms = blend_started_ms.clone();
+            let blend_scheduled = blend_scheduled.clone();
+            let animation = animation.clone();
+
+            move || {
+                if *blend_scheduled.borrow() {
+                    return;
+                }
+                *blend_scheduled.borrow_mut() = true;
+                if animation.borrow().is_none() {
+                    let window_for_anim = window.clone();
+                    let context_for_anim = context.clone();
+                    let canvas_for_anim = canvas.clone();
+                    let frame_for_anim = frame.clone();
+                    let previous_for_anim = previous_frame.clone();
+                    let camera_for_anim = camera.clone();
+                    let blend_started_for_anim = blend_started_ms.clone();
+                    let blend_scheduled_for_anim = blend_scheduled.clone();
+                    let animation_for_anim = animation.clone();
+                    *animation.borrow_mut() = Some(Closure::<dyn FnMut(f64)>::new(move |timestamp: f64| {
+                        let maybe_current = frame_for_anim.borrow().clone();
+                        let maybe_previous = previous_for_anim.borrow().clone();
+                        let Some(current) = maybe_current else {
+                            *blend_scheduled_for_anim.borrow_mut() = false;
+                            return;
+                        };
+                        let alpha = clamp((timestamp - *blend_started_for_anim.borrow()) / 90.0, 0.0, 1.0);
+                        {
+                            let camera = camera_for_anim.borrow();
+                            if let Some(previous) = maybe_previous.as_ref() {
+                                draw_frame_blended(
+                                    &context_for_anim,
+                                    &canvas_for_anim,
+                                    previous,
+                                    &current,
+                                    alpha,
+                                    &camera,
+                                );
+                            } else {
+                                draw_frame(&context_for_anim, &canvas_for_anim, &current, &camera);
+                            }
+                        }
+                        if alpha < 1.0 {
+                            if let Some(callback) = animation_for_anim.borrow().as_ref() {
+                                let _ = window_for_anim.request_animation_frame(
+                                    callback.as_ref().unchecked_ref(),
+                                );
+                            }
+                        } else {
+                            *blend_scheduled_for_anim.borrow_mut() = false;
+                        }
+                    }));
+                }
+                if let Some(callback) = animation.borrow().as_ref() {
+                    let _ = window.request_animation_frame(callback.as_ref().unchecked_ref());
+                }
+            }
+        };
+
         let onmessage = {
             let context = context.clone();
             let canvas = canvas.clone();
             let frame = frame.clone();
+            let previous_frame = previous_frame.clone();
             let camera = camera.clone();
             let window = window.clone();
             let saw_first_frame = saw_first_frame.clone();
+            let blend_started_ms = blend_started_ms.clone();
+            let schedule_blend = schedule_blend.clone();
             Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
                 match event.data().dyn_into::<js_sys::ArrayBuffer>() {
                     Ok(buffer) => {
@@ -201,9 +279,15 @@ mod wasm {
                                 {
                                     let mut camera = camera.borrow_mut();
                                     update_scene_bounds(&mut camera, &decoded, false);
-                                    draw_frame(&context, &canvas, &decoded, &camera);
+                                }
+                                if let Some(current) = frame.borrow().as_ref() {
+                                    *previous_frame.borrow_mut() = Some(current.clone());
+                                } else {
+                                    *previous_frame.borrow_mut() = Some(decoded.clone());
                                 }
                                 *frame.borrow_mut() = Some(decoded);
+                                *blend_started_ms.borrow_mut() = js_sys::Date::now();
+                                schedule_blend();
                                 if !*saw_first_frame.borrow() {
                                     *saw_first_frame.borrow_mut() = true;
                                     dispatch_window_event(&window, "galaxy-viewer-frame");
@@ -253,7 +337,9 @@ mod wasm {
             let context = context.clone();
             let canvas = canvas.clone();
             let frame = frame.clone();
+            let previous_frame = previous_frame.clone();
             let camera = camera.clone();
+            let blend_started_ms = blend_started_ms.clone();
             Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
                 let mut camera_state = camera.borrow_mut();
                 if !camera_state.dragging {
@@ -285,7 +371,13 @@ mod wasm {
                 camera_state.last_x = next_x;
                 camera_state.last_y = next_y;
                 if let Some(frame) = frame.borrow().as_ref() {
-                    draw_frame(&context, &canvas, frame, &camera_state);
+                    let alpha =
+                        clamp((js_sys::Date::now() - *blend_started_ms.borrow()) / 90.0, 0.0, 1.0);
+                    if let Some(previous) = previous_frame.borrow().as_ref() {
+                        draw_frame_blended(&context, &canvas, previous, frame, alpha, &camera_state);
+                    } else {
+                        draw_frame(&context, &canvas, frame, &camera_state);
+                    }
                 }
             })
         };
@@ -319,7 +411,9 @@ mod wasm {
             let context = context.clone();
             let canvas = canvas.clone();
             let frame = frame.clone();
+            let previous_frame = previous_frame.clone();
             let camera = camera.clone();
+            let blend_started_ms = blend_started_ms.clone();
             Closure::<dyn FnMut(WheelEvent)>::new(move |event: WheelEvent| {
                 event.prevent_default();
                 let mut camera_state = camera.borrow_mut();
@@ -328,7 +422,13 @@ mod wasm {
                 camera_state.distance_scale =
                     clamp(camera_state.distance_scale * factor, 0.003, 20.0);
                 if let Some(frame) = frame.borrow().as_ref() {
-                    draw_frame(&context, &canvas, frame, &camera_state);
+                    let alpha =
+                        clamp((js_sys::Date::now() - *blend_started_ms.borrow()) / 90.0, 0.0, 1.0);
+                    if let Some(previous) = previous_frame.borrow().as_ref() {
+                        draw_frame_blended(&context, &canvas, previous, frame, alpha, &camera_state);
+                    } else {
+                        draw_frame(&context, &canvas, frame, &camera_state);
+                    }
                 }
             })
         };
@@ -355,8 +455,12 @@ mod wasm {
                 websocket: ws,
                 canvas,
                 _frame: frame,
+                _previous_frame: previous_frame,
                 _camera: camera,
+                _blend_started_ms: blend_started_ms,
+                _blend_scheduled: blend_scheduled,
                 _onmessage: onmessage,
+                _animation: animation,
                 oncontextmenu,
                 onmousedown,
                 onmousemove,
@@ -591,8 +695,8 @@ mod wasm {
         let luminosity = clamp((mass_msun.log10() - 3.7) / 2.2, 0.25, 1.8);
         let render_luminosity = luminosity.powf(0.58);
         let color = apply_doppler_shift(base_color, projected.radial_velocity_kms);
-        let size_scale = projected.perspective.powf(1.28);
-        let alpha_scale = projected.perspective.powf(1.42);
+        let size_scale = projected.perspective.powf(1.18);
+        let alpha_scale = projected.perspective.powf(0.92);
 
         Some(RenderParticle {
             x: projected.x,
@@ -600,9 +704,50 @@ mod wasm {
             depth: projected.depth,
             glow_radius: (0.52 * render_luminosity * size_scale).max(0.08),
             core_radius: (0.12 * render_luminosity * size_scale).max(0.03),
-            glow_alpha: clamp(0.0024 * render_luminosity * alpha_scale, 0.00045, 0.009),
-            core_alpha: clamp(0.06 * render_luminosity * alpha_scale, 0.006, 0.16),
+            glow_alpha: clamp(0.0032 * render_luminosity * alpha_scale, 0.0012, 0.012),
+            core_alpha: clamp(0.072 * render_luminosity * alpha_scale, 0.012, 0.18),
             color,
+        })
+    }
+
+    fn project_interpolated_particle(
+        previous: &PreviewParticle,
+        current: &PreviewParticle,
+        alpha: f64,
+        width: f64,
+        height: f64,
+        camera: &CameraState,
+    ) -> Option<ProjectedParticle> {
+        if previous.component != current.component {
+            return project_particle(current, width, height, camera);
+        }
+
+        let position = [
+            f64::from(previous.position_kpc[0])
+                + (f64::from(current.position_kpc[0]) - f64::from(previous.position_kpc[0])) * alpha,
+            f64::from(previous.position_kpc[1])
+                + (f64::from(current.position_kpc[1]) - f64::from(previous.position_kpc[1])) * alpha,
+            f64::from(previous.position_kpc[2])
+                + (f64::from(current.position_kpc[2]) - f64::from(previous.position_kpc[2])) * alpha,
+        ];
+        let (x, y, depth, perspective, forward) =
+            project_point(position, width, height, camera)?;
+        let velocity = [
+            f64::from(previous.velocity_kms[0])
+                + (f64::from(current.velocity_kms[0]) - f64::from(previous.velocity_kms[0])) * alpha,
+            f64::from(previous.velocity_kms[1])
+                + (f64::from(current.velocity_kms[1]) - f64::from(previous.velocity_kms[1])) * alpha,
+            f64::from(previous.velocity_kms[2])
+                + (f64::from(current.velocity_kms[2]) - f64::from(previous.velocity_kms[2])) * alpha,
+        ];
+
+        Some(ProjectedParticle {
+            x,
+            y,
+            depth,
+            perspective,
+            radial_velocity_kms: dot3(velocity, forward),
+            particle: current.clone(),
         })
     }
 
@@ -792,6 +937,77 @@ mod wasm {
                 continue;
             };
             if particle.component == 0 {
+                continue;
+            }
+            if let Some(rendered) = render_style(projected_particle) {
+                projected.push(rendered);
+            }
+        }
+        projected.sort_by(|left, right| right.depth.total_cmp(&left.depth));
+
+        let _ = context.set_global_composite_operation("lighter");
+        for point in projected {
+            let [r, g, b] = point.color;
+            context.begin_path();
+            context.set_fill_style_str(&format!(
+                "rgba({}, {}, {}, {})",
+                (r * 255.0) as u32,
+                (g * 255.0) as u32,
+                (b * 255.0) as u32,
+                point.glow_alpha
+            ));
+            let _ = context.arc(point.x, point.y, point.glow_radius, 0.0, std::f64::consts::TAU);
+            context.fill();
+
+            context.begin_path();
+            context.set_fill_style_str(&format!(
+                "rgba({}, {}, {}, {})",
+                (r * 255.0) as u32,
+                (g * 255.0) as u32,
+                (b * 255.0) as u32,
+                point.core_alpha
+            ));
+            let _ = context.arc(point.x, point.y, point.core_radius, 0.0, std::f64::consts::TAU);
+            context.fill();
+        }
+        let _ = context.set_global_composite_operation("source-over");
+        if camera.dragging {
+            draw_xy_plane_grid(context, width, height, camera);
+        }
+        draw_origin_axes(context, width, height, camera);
+    }
+
+    fn draw_frame_blended(
+        context: &CanvasRenderingContext2d,
+        canvas: &HtmlCanvasElement,
+        previous: &PreviewFrame,
+        current: &PreviewFrame,
+        alpha: f64,
+        camera: &CameraState,
+    ) {
+        let width = canvas.width() as f64;
+        let height = canvas.height() as f64;
+        context.clear_rect(0.0, 0.0, width, height);
+
+        context.set_fill_style_str("#020810");
+        context.fill_rect(0.0, 0.0, width, height);
+
+        let mut projected = Vec::new();
+        let count = previous.particles.len().min(current.particles.len());
+        for index in 0..count {
+            let previous_particle = &previous.particles[index];
+            let current_particle = &current.particles[index];
+            let Some(projected_particle) = project_interpolated_particle(
+                previous_particle,
+                current_particle,
+                alpha,
+                width,
+                height,
+                camera,
+            ) else {
+                continue;
+            };
+            if current_particle.component == 0 {
                 continue;
             }
             if let Some(rendered) = render_style(projected_particle) {
