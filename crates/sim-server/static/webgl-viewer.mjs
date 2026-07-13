@@ -305,12 +305,29 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     : null;
   const lineUniforms = { viewProj: gl.getUniformLocation(lineProgram, "u_viewProj") };
 
-  const currentBuffer = gl.createBuffer();
-  const previousBuffer = gl.createBuffer();
+  // Jitter buffer: physics frames arrive at an irregular ~5 Hz (the substep
+  // count varies step to step), so playback runs against a smoothed sim-time
+  // clock that lags the newest frame by ~2.5 frame intervals and interpolates
+  // inside whichever pair of buffered frames brackets it. Roughly half a
+  // second of latency in exchange for stutter-free motion.
+  const RING_SIZE = 12;
+  const ring = [];
+  for (let i = 0; i < RING_SIZE; i += 1) {
+    ring.push({ buffer: gl.createBuffer(), simTime: -Infinity, count: 0 });
+  }
+  let ringHead = -1;
+  let ringFrames = 0;
   const lineBuffer = gl.createBuffer();
   const vao = gl.createVertexArray();
+  let boundPrevBuffer = null;
+  let boundCurBuffer = null;
 
   function bindParticleAttributes(prevBuffer, curBuffer) {
+    if (boundPrevBuffer === prevBuffer && boundCurBuffer === curBuffer) {
+      return;
+    }
+    boundPrevBuffer = prevBuffer;
+    boundCurBuffer = curBuffer;
     gl.bindVertexArray(vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, prevBuffer);
     gl.enableVertexAttribArray(0);
@@ -376,15 +393,18 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
   };
 
   const state = {
-    particleCount: 0,
-    blendStartMs: 0,
-    blendDurationMs: 120,
-    lastArrivalMs: 0,
     simTimeMyr: -Infinity,
     sawFirstFrame: false,
     rafHandle: null,
     disposed: false,
     latestPacket: null,
+    latestCount: 0,
+    // Playback clock in sim-time units.
+    playbackSimTime: null,
+    playbackRate: 0, // Myr per wall ms, EMA over arrivals
+    frameIntervalMyr: 0, // EMA of sim-time spacing between frames
+    lastArrivalWallMs: 0,
+    lastRafMs: 0,
   };
 
   function clamp(value, min, max) {
@@ -504,19 +524,77 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     gl.disableVertexAttribArray(1);
   }
 
+  // Chooses the buffered frame pair bracketing the playback clock and the
+  // interpolation fraction between them.
+  function selectFramePair(nowMs) {
+    if (ringFrames === 0) {
+      return null;
+    }
+    const dtWall = clamp(nowMs - (state.lastRafMs || nowMs), 0, 100);
+    state.lastRafMs = nowMs;
+
+    const ordered = [];
+    for (let i = ringFrames - 1; i >= 0; i -= 1) {
+      ordered.push(ring[(ringHead - i + RING_SIZE * 2) % RING_SIZE]);
+    }
+    const latest = ordered[ordered.length - 1];
+    if (ordered.length === 1 || state.playbackRate <= 0) {
+      state.playbackSimTime = latest.simTime;
+      return { previous: latest, current: latest, alpha: 1 };
+    }
+
+    // Advance the clock at the observed sim rate, then ease it toward the
+    // target lag point so rate drift never accumulates into a visible jump.
+    const target = latest.simTime - 2.5 * state.frameIntervalMyr;
+    if (state.playbackSimTime === null) {
+      state.playbackSimTime = target;
+    }
+    state.playbackSimTime += state.playbackRate * dtWall;
+    state.playbackSimTime += (target - state.playbackSimTime) * 0.04;
+    state.playbackSimTime = clamp(
+      state.playbackSimTime,
+      ordered[0].simTime,
+      latest.simTime
+    );
+
+    let previous = ordered[0];
+    let current = latest;
+    for (let i = 0; i < ordered.length - 1; i += 1) {
+      if (
+        state.playbackSimTime >= ordered[i].simTime &&
+        state.playbackSimTime <= ordered[i + 1].simTime
+      ) {
+        previous = ordered[i];
+        current = ordered[i + 1];
+        break;
+      }
+    }
+    if (previous.count !== current.count) {
+      // Index-paired interpolation is meaningless across a budget change.
+      return { previous: current, current, alpha: 1 };
+    }
+    const span = current.simTime - previous.simTime;
+    const alpha = span > 0
+      ? clamp((state.playbackSimTime - previous.simTime) / span, 0, 1)
+      : 1;
+    return { previous, current, alpha };
+  }
+
   function render(nowMs) {
     if (state.disposed) {
       return;
     }
     state.rafHandle = window.requestAnimationFrame(render);
-    if (state.particleCount === 0) {
+    const pair = selectFramePair(nowMs);
+    if (!pair || pair.current.count === 0) {
       return;
     }
+    bindParticleAttributes(pair.previous.buffer, pair.current.buffer);
 
     resizeToDisplay();
     const width = canvas.width;
     const height = canvas.height;
-    const alpha = clamp((nowMs - state.blendStartMs) / state.blendDurationMs, 0, 1);
+    const alpha = pair.alpha;
 
     const basis = cameraBasis();
     const projection = perspectiveMatrix(
@@ -544,7 +622,7 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE);
     gl.bindVertexArray(vao);
-    gl.drawArrays(gl.POINTS, 0, state.particleCount);
+    gl.drawArrays(gl.POINTS, 0, pair.current.count);
     gl.bindVertexArray(null);
 
     if (useHdr) {
@@ -591,49 +669,39 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     if (simTime <= state.simTimeMyr + 1e-9) {
       return;
     }
-    state.simTimeMyr = simTime;
 
     const particleBytes = new Uint8Array(event.data, HEADER_BYTES);
     updateSceneBounds(particleBytes, previewCount);
 
-    const countChanged = previewCount !== state.particleCount;
-    if (countChanged) {
-      // Index-paired interpolation is meaningless across a budget change:
-      // load both endpoints with the same frame.
-      gl.bindBuffer(gl.ARRAY_BUFFER, previousBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, particleBytes, gl.DYNAMIC_DRAW);
-      gl.bindBuffer(gl.ARRAY_BUFFER, currentBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, particleBytes, gl.DYNAMIC_DRAW);
-    } else {
-      // GPU-side copy of the old current frame into the previous endpoint,
-      // then upload the fresh frame.
-      gl.bindBuffer(gl.COPY_READ_BUFFER, currentBuffer);
-      gl.bindBuffer(gl.COPY_WRITE_BUFFER, previousBuffer);
-      gl.copyBufferSubData(
-        gl.COPY_READ_BUFFER,
-        gl.COPY_WRITE_BUFFER,
-        0,
-        0,
-        previewCount * PARTICLE_STRIDE
-      );
-      gl.bindBuffer(gl.COPY_READ_BUFFER, null);
-      gl.bindBuffer(gl.COPY_WRITE_BUFFER, null);
-      gl.bindBuffer(gl.ARRAY_BUFFER, currentBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, particleBytes, gl.DYNAMIC_DRAW);
-    }
-    state.latestPacket = particleBytes;
-    state.particleCount = previewCount;
-    bindParticleAttributes(previousBuffer, currentBuffer);
+    // Write into the next ring slot; the playback clock lags far enough
+    // behind that the overwritten slot is never part of the active pair.
+    ringHead = (ringHead + 1) % RING_SIZE;
+    const slot = ring[ringHead];
+    gl.bindBuffer(gl.ARRAY_BUFFER, slot.buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, particleBytes, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    slot.simTime = simTime;
+    slot.count = previewCount;
+    ringFrames = Math.min(ringFrames + 1, RING_SIZE);
 
-    // Stretch the interpolation window toward the observed frame cadence so
-    // slow full-scale simulations still animate smoothly.
+    // Track the sim-time playback rate and frame spacing (EMAs) that drive
+    // the jitter-buffered clock in render().
     const now = performance.now();
-    if (state.lastArrivalMs > 0) {
-      const gap = now - state.lastArrivalMs;
-      state.blendDurationMs = clamp(gap * 0.9, 90, 1500);
+    if (state.lastArrivalWallMs > 0 && state.simTimeMyr > -Infinity) {
+      const wallGap = Math.max(1, now - state.lastArrivalWallMs);
+      const simGap = simTime - state.simTimeMyr;
+      const instantaneousRate = simGap / wallGap;
+      state.playbackRate = state.playbackRate > 0
+        ? state.playbackRate * 0.75 + instantaneousRate * 0.25
+        : instantaneousRate;
+      state.frameIntervalMyr = state.frameIntervalMyr > 0
+        ? state.frameIntervalMyr * 0.75 + simGap * 0.25
+        : simGap;
     }
-    state.lastArrivalMs = now;
-    state.blendStartMs = now;
+    state.lastArrivalWallMs = now;
+    state.simTimeMyr = simTime;
+    state.latestPacket = particleBytes;
+    state.latestCount = previewCount;
 
     if (!state.sawFirstFrame) {
       state.sawFirstFrame = true;
@@ -741,7 +809,7 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
       camera.distanceScale = 1.2;
       camera.autoFrame = true;
       if (state.latestPacket) {
-        updateSceneBounds(state.latestPacket, state.particleCount, true);
+        updateSceneBounds(state.latestPacket, state.latestCount, true);
       }
     },
   };

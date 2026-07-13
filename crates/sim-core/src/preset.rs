@@ -14,10 +14,12 @@ pub struct MergerPreset {
 
 pub fn built_in_presets() -> Vec<MergerPreset> {
     vec![
+        isolated_spiral(),
         uniform_sphere_collapse(),
         triple_sphere_orbit_debug(),
         major_merger_debug(),
         major_merger(),
+        major_merger_distant(),
         polar_flyby(),
         minor_merger(),
     ]
@@ -253,6 +255,46 @@ fn major_merger() -> MergerPreset {
             output_directory: "output/major-merger".to_string(),
             galaxies: vec![primary, secondary],
         },
+    }
+}
+
+/// The major merger's primary galaxy alone: a Milky-Way-like disk left to
+/// evolve in isolation so spiral structure can develop undisturbed.
+fn isolated_spiral() -> MergerPreset {
+    let mut config = major_merger().config;
+    config.name = "isolated-spiral".to_string();
+    config.output_directory = "output/isolated-spiral".to_string();
+    config.galaxies.truncate(1);
+    config.galaxies[0].position_kpc = [0.0, 0.0, 0.0];
+    config.galaxies[0].velocity_kms = [0.0, 0.0, 0.0];
+    config.initial_separation_kpc = 0.0;
+    config.initial_relative_velocity_kms = 0.0;
+
+    MergerPreset {
+        id: "isolated-spiral",
+        title: "Isolated Spiral Galaxy",
+        summary: "A single Milky-Way-like disk galaxy in equilibrium — watch swing-amplified spiral arms wind up undisturbed.",
+        config,
+    }
+}
+
+/// The same equal-mass pair as `major-merger`, but starting five times
+/// further out on a slow infall: both disks get a few hundred Myr to develop
+/// spiral structure before the first passage disturbs them.
+fn major_merger_distant() -> MergerPreset {
+    let mut config = major_merger().config;
+    config.name = "major-merger-distant".to_string();
+    config.output_directory = "output/major-merger-distant".to_string();
+    config.initial_separation_kpc = 120.0;
+    let (primary, secondary) = config.galaxies.split_at_mut(1);
+    config.initial_relative_velocity_kms =
+        set_direct_infall_pair_orbit(&mut primary[0], &mut secondary[0], 120.0, 0.35, 0.35);
+
+    MergerPreset {
+        id: "major-merger-distant",
+        title: "Distant Major Merger",
+        summary: "The equal-mass encounter started 120 kpc apart: spiral arms wind up in both disks long before the collision.",
+        config,
     }
 }
 

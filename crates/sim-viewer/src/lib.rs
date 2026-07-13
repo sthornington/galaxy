@@ -9,8 +9,11 @@ mod wasm {
         WebSocket, WheelEvent, Window,
     };
 
-    /// Frame-to-frame interpolation window in milliseconds.
-    const BLEND_WINDOW_MS: f64 = 90.0;
+    /// Minimum frame-to-frame interpolation window in milliseconds; the live
+    /// window stretches toward the observed frame cadence so slow full-scale
+    /// simulations still animate smoothly instead of moving and freezing.
+    const MIN_BLEND_WINDOW_MS: f64 = 90.0;
+    const MAX_BLEND_WINDOW_MS: f64 = 1500.0;
 
     type FrameSlot = Rc<RefCell<Option<Rc<PreviewFrame>>>>;
 
@@ -213,6 +216,7 @@ mod wasm {
         let camera = Rc::new(RefCell::new(CameraState::default()));
         let saw_first_frame = Rc::new(RefCell::new(false));
         let blend_started_ms = Rc::new(RefCell::new(0.0));
+        let blend_window_ms = Rc::new(RefCell::new(MIN_BLEND_WINDOW_MS));
         let blend_scheduled = Rc::new(RefCell::new(false));
         let animation: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> =
             Rc::new(RefCell::new(None));
@@ -235,12 +239,13 @@ mod wasm {
             let frame = frame.clone();
             let previous_frame = previous_frame.clone();
             let blend_started_ms = blend_started_ms.clone();
+            let blend_window_ms = blend_window_ms.clone();
             move |camera: &CameraState| {
                 let Some(current) = frame.borrow().clone() else {
                     return;
                 };
                 let alpha = clamp(
-                    (now_ms(&window) - *blend_started_ms.borrow()) / BLEND_WINDOW_MS,
+                    (now_ms(&window) - *blend_started_ms.borrow()) / *blend_window_ms.borrow(),
                     0.0,
                     1.0,
                 );
@@ -257,6 +262,7 @@ mod wasm {
             let previous_frame = previous_frame.clone();
             let camera = camera.clone();
             let blend_started_ms = blend_started_ms.clone();
+            let blend_window_ms = blend_window_ms.clone();
             let blend_scheduled = blend_scheduled.clone();
             let animation = animation.clone();
             let raf_handle = raf_handle.clone();
@@ -274,6 +280,7 @@ mod wasm {
                     let previous_for_anim = previous_frame.clone();
                     let camera_for_anim = camera.clone();
                     let blend_started_for_anim = blend_started_ms.clone();
+                    let blend_window_for_anim = blend_window_ms.clone();
                     let blend_scheduled_for_anim = blend_scheduled.clone();
                     let animation_for_anim = animation.clone();
                     let raf_handle_for_anim = raf_handle.clone();
@@ -285,7 +292,8 @@ mod wasm {
                                 return;
                             };
                             let alpha = clamp(
-                                (timestamp - *blend_started_for_anim.borrow()) / BLEND_WINDOW_MS,
+                                (timestamp - *blend_started_for_anim.borrow())
+                                    / *blend_window_for_anim.borrow(),
                                 0.0,
                                 1.0,
                             );
@@ -331,6 +339,7 @@ mod wasm {
             let window = window.clone();
             let saw_first_frame = saw_first_frame.clone();
             let blend_started_ms = blend_started_ms.clone();
+            let blend_window_ms = blend_window_ms.clone();
             let schedule_blend = schedule_blend.clone();
             Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
                 match event.data().dyn_into::<js_sys::ArrayBuffer>() {
@@ -361,7 +370,14 @@ mod wasm {
                                 *previous_frame.borrow_mut() =
                                     Some(blendable_previous.unwrap_or_else(|| decoded.clone()));
                                 *frame.borrow_mut() = Some(decoded);
-                                *blend_started_ms.borrow_mut() = now_ms(&window);
+                                let now = now_ms(&window);
+                                let previous_start = *blend_started_ms.borrow();
+                                if previous_start > 0.0 {
+                                    let gap = now - previous_start;
+                                    *blend_window_ms.borrow_mut() =
+                                        clamp(gap * 0.9, MIN_BLEND_WINDOW_MS, MAX_BLEND_WINDOW_MS);
+                                }
+                                *blend_started_ms.borrow_mut() = now;
                                 schedule_blend();
                                 if !*saw_first_frame.borrow() {
                                     *saw_first_frame.borrow_mut() = true;
