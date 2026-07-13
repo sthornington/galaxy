@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/pytorch:26.03-py3
+FROM nvcr.io/nvidia/pytorch:26.06-py3
 WORKDIR /opt/project/build/
 SHELL ["/bin/bash", "-c"]
 

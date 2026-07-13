@@ -16,6 +16,7 @@ pub struct MergerPreset {
 pub fn built_in_presets() -> Vec<MergerPreset> {
     vec![
         uniform_sphere_collapse(),
+        triple_sphere_orbit_debug(),
         major_merger_debug(),
         major_merger(),
         polar_flyby(),
@@ -166,6 +167,24 @@ fn set_direct_infall_pair_orbit(
     relative_speed
 }
 
+fn set_equal_triple_ring_orbit(galaxies: &mut [GalaxyConfig], orbital_radius_kpc: f64) -> f64 {
+    debug_assert!(galaxies.len() == 3);
+    let per_galaxy_mass = total_galaxy_mass_msun(&galaxies[0]);
+    let orbital_speed =
+        (GRAV_CONST_KPC_KMS2_PER_MSUN * per_galaxy_mass * (3.0_f64).sqrt() / (3.0 * orbital_radius_kpc.max(1.0e-6)))
+            .sqrt();
+
+    for (index, galaxy) in galaxies.iter_mut().enumerate() {
+        let angle = index as f64 * (2.0 * std::f64::consts::PI / 3.0);
+        let cos_angle = angle.cos();
+        let sin_angle = angle.sin();
+        galaxy.position_kpc = [orbital_radius_kpc * cos_angle, orbital_radius_kpc * sin_angle, 0.0];
+        galaxy.velocity_kms = [-orbital_speed * sin_angle, orbital_speed * cos_angle, 0.0];
+    }
+
+    orbital_speed
+}
+
 fn major_merger() -> MergerPreset {
     let mut primary = GalaxyConfig {
         label: "Primary".to_string(),
@@ -295,6 +314,82 @@ fn uniform_sphere_collapse() -> MergerPreset {
                 disk_tilt_deg: [0.0, 0.0, 0.0],
                 color_rgba: [1.0, 0.94, 0.86, 1.0],
             }],
+        },
+    }
+}
+
+fn triple_sphere_orbit_debug() -> MergerPreset {
+    let sphere_radius_kpc = 2.2;
+    let orbital_radius_kpc = 6.5;
+    let halo_mass_msun = 8.5e10;
+    let stellar_mass_msun = 1.65e11;
+    let smbh_mass_msun = 2.5e8;
+    let sphere_total_mass_msun = halo_mass_msun + stellar_mass_msun + smbh_mass_msun;
+    let sphere_edge_circular_speed_kms =
+        circular_speed_kms(sphere_total_mass_msun, sphere_radius_kpc);
+
+    let make_galaxy = |label: &str, color_rgba: [f32; 4]| GalaxyConfig {
+        label: label.to_string(),
+        equilibrium_snapshot: None,
+        initial_profile: GalaxyInitialProfile::UniformSphere {
+            radius_kpc: sphere_radius_kpc,
+            velocity_dispersion_kms: sphere_edge_circular_speed_kms * 0.03,
+            edge_rotation_speed_kms: sphere_edge_circular_speed_kms * 0.92,
+        },
+        halo_mass_msun,
+        halo_scale_radius_kpc: 0.9,
+        halo_particle_count: 20_000,
+        disk_mass_msun: 0.0,
+        disk_scale_radius_kpc: 1.0,
+        disk_scale_height_kpc: 0.2,
+        disk_particle_count: 0,
+        bulge_mass_msun: stellar_mass_msun,
+        bulge_scale_radius_kpc: 0.9,
+        bulge_particle_count: 80_000,
+        smbh: SmbhConfig {
+            mass_msun: smbh_mass_msun,
+            softening_kpc: 0.002,
+            substeps: 16,
+        },
+        position_kpc: [0.0, 0.0, 0.0],
+        velocity_kms: [0.0, 0.0, 0.0],
+        disk_tilt_deg: [0.0, 0.0, 0.0],
+        color_rgba,
+    };
+
+    let mut galaxies = vec![
+        make_galaxy("Sphere A", [1.0, 0.88, 0.76, 1.0]),
+        make_galaxy("Sphere B", [0.72, 0.84, 1.0, 1.0]),
+        make_galaxy("Sphere C", [0.92, 0.74, 1.0, 1.0]),
+    ];
+    let orbital_speed = set_equal_triple_ring_orbit(&mut galaxies, orbital_radius_kpc);
+
+    MergerPreset {
+        id: "triple-sphere-orbit-debug",
+        title: "Triple Sphere Orbit Debug",
+        summary: "Three close rotating stellar spheres with central SMBHs, orbiting the origin in a symmetric three-body ring.",
+        config: SimulationConfig {
+            name: "triple-sphere-orbit-debug".to_string(),
+            gravity: GravityConfig {
+                mesh_resolution: [160, 160, 128],
+                ..gravity_defaults()
+            },
+            relativity: relativity_defaults(),
+            preview: PreviewConfig {
+                particle_budget: 98_304,
+                density_grid: [960, 540],
+                target_fps: 120,
+            },
+            snapshots: snapshot_defaults(),
+            integration: TimeIntegrationConfig {
+                base_timestep_myr: 0.05,
+                max_substeps: 16,
+                cfl_safety_factor: 0.2,
+            },
+            initial_separation_kpc: orbital_radius_kpc * 2.0,
+            initial_relative_velocity_kms: orbital_speed,
+            output_directory: "output/triple-sphere-orbit-debug".to_string(),
+            galaxies,
         },
     }
 }
