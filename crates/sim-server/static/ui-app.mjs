@@ -826,19 +826,21 @@ export function createUiApp({
     }
     if (tier) {
       startSessionPolling(session.id);
-      if (tier === "webgl") {
-        nodes.viewerStatus.textContent =
-          "Streaming binary preview frames into the WebGL renderer.";
-      } else {
-        nodes.viewerStatus.textContent =
-          "Streaming binary preview frames into the Rust/WASM viewer.";
-        if (session.preview_particle_budget > PREVIEW_BUDGETS.wasm) {
-          sendPreviewBudget(session.id, PREVIEW_BUDGETS.wasm);
-        }
+      // Converge the session's preview budget to the active tier's budget in
+      // BOTH directions: a session demoted to 32k by one slow/failed attach
+      // must be promoted back to the full sample when WebGL attaches again.
+      const desiredBudget = PREVIEW_BUDGETS[tier] ?? PREVIEW_BUDGETS.wasm;
+      if (session.preview_particle_budget !== desiredBudget) {
+        sendPreviewBudget(session.id, desiredBudget);
       }
+      const tierLabel =
+        tier === "webgl" ? "WebGL renderer" : "Rust/WASM viewer";
+      nodes.viewerStatus.textContent =
+        `Streaming binary preview frames into the ${tierLabel} ` +
+        `(${desiredBudget.toLocaleString()} sampled particles).`;
       return session;
     }
-    if (session.preview_particle_budget > PREVIEW_BUDGETS.json) {
+    if (session.preview_particle_budget !== PREVIEW_BUDGETS.json) {
       sendPreviewBudget(session.id, PREVIEW_BUDGETS.json);
     }
     openFrameSocket(session.id);

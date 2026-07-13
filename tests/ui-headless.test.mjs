@@ -176,7 +176,12 @@ class FakeWebSocket {
   constructor(url) {
     this.url = url;
     this.closed = false;
+    this.sent = [];
     FakeWebSocket.instances.push(this);
+  }
+
+  send(data) {
+    this.sent.push(data);
   }
 
   close() {
@@ -238,6 +243,7 @@ function createHarness({ useRustViewer = false, existingSessions = [] } = {}) {
         state: "paused",
         sim_time_myr: 0,
         particle_count: 208,
+        preview_particle_budget: 262144,
         diagnostics: { preview_count: 0 },
       });
     }
@@ -317,19 +323,31 @@ test("headless UI renders presets and falls back to JSON websocket streaming", a
     preview_particle_budget: 262144,
   });
   assert.equal(document.getElementById("session-id").textContent, "session-1");
-  assert.equal(FakeWebSocket.instances.length, 1);
+  assert.equal(FakeWebSocket.instances.length, 2);
+  const controlSocket = FakeWebSocket.instances.find((ws) =>
+    ws.url.includes("/ws/control/")
+  );
+  assert.ok(controlSocket, "renegotiates the oversized budget down for JSON tier");
+  controlSocket.emitOpen();
+  assert.deepEqual(JSON.parse(controlSocket.sent[0]), {
+    kind: "set_preview_budget",
+    particle_budget: 12288,
+  });
+  const framesSocket = FakeWebSocket.instances.find((ws) =>
+    ws.url.includes("/ws/frames/")
+  );
   assert.equal(
-    FakeWebSocket.instances[0].url,
+    framesSocket.url,
     "ws://127.0.0.1:8080/ws/frames/session-1?format=json"
   );
 
-  FakeWebSocket.instances[0].emitOpen();
+  framesSocket.emitOpen();
   assert.equal(
     document.getElementById("viewer-status").textContent,
     "Streaming JSON preview frames."
   );
 
-  FakeWebSocket.instances[0].emitMessage(
+  framesSocket.emitMessage(
     JSON.stringify({
       sim_time_myr: 1.25,
       diagnostics: { preview_count: 1 },
@@ -358,7 +376,14 @@ test("headless UI prefers the Rust viewer path when it is available", async () =
   launchButton.click();
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(FakeWebSocket.instances.length, 0);
+  assert.equal(FakeWebSocket.instances.length, 1);
+  const controlSocket = FakeWebSocket.instances[0];
+  assert.ok(controlSocket.url.includes("/ws/control/session-1"));
+  controlSocket.emitOpen();
+  assert.deepEqual(JSON.parse(controlSocket.sent[0]), {
+    kind: "set_preview_budget",
+    particle_budget: 32768,
+  });
   assert.deepEqual(JSON.parse(fetchCalls[2].options.body), {
     preset_id: "minor-merger",
     seed: 42,
@@ -367,7 +392,7 @@ test("headless UI prefers the Rust viewer path when it is available", async () =
   assert.equal(intervals.size, 1);
   assert.equal(
     document.getElementById("viewer-status").textContent,
-    "Streaming binary preview frames into the Rust/WASM viewer."
+    "Streaming binary preview frames into the Rust/WASM viewer (32,768 sampled particles)."
   );
 
   const poll = [...intervals.values()][0];
@@ -384,6 +409,7 @@ test("headless UI reattaches to an existing session and can stop it", async () =
     state: "running",
     sim_time_myr: 1.75,
     particle_count: 208,
+    preview_particle_budget: 12288,
     diagnostics: { preview_count: 32 },
   };
   const { app, document, fetchCalls } = createHarness({

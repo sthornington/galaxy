@@ -1,9 +1,9 @@
-const VIEWER_BUNDLE_VERSION = "20260713-9";
+const VIEWER_BUNDLE_VERSION = "20260713-10";
 
 // A freshly created session may take a moment before its first frame is
 // published; give the GPU-backed paths a generous window before demoting to
 // the heavier JSON fallback (an explicit galaxy-viewer-error still fails fast).
-const FIRST_FRAME_TIMEOUT_MS = 4000;
+const FIRST_FRAME_TIMEOUT_MS = 15000;
 
 function waitForFirstFrame() {
   return new Promise((resolve) => {
