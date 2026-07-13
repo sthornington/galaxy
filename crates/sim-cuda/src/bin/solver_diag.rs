@@ -1,14 +1,8 @@
-use std::{
-    env,
-    path::{Path, PathBuf},
-    process::Command,
-    time::Instant,
-};
+use std::{env, time::Instant};
 
 use anyhow::{Context, Result, bail};
 use sim_core::{
-    CURRENT_SNAPSHOT_SCHEMA_VERSION, InitialConditions, Particle, ParticleComponent,
-    SimulationConfig, SnapshotManifest, Vec3, built_in_presets,
+    InitialConditions, Particle, ParticleComponent, SimulationConfig, Vec3, built_in_presets,
 };
 use sim_cuda::GpuBackend;
 
@@ -21,6 +15,7 @@ struct DiagArgs {
     seed: u64,
     isolate_galaxy: Option<usize>,
     base_timestep_myr: Option<f64>,
+    analytic_ics: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -40,12 +35,15 @@ struct SystemMetrics {
 
 fn main() -> Result<()> {
     let args = parse_args()?;
-    let preset = built_in_presets()
+    let mut preset = built_in_presets()
         .into_iter()
         .find(|preset| preset.id == args.preset_id)
         .with_context(|| format!("unknown preset `{}`", args.preset_id))?;
-    ensure_equilibrium_snapshots_for_config(&preset.config, &args.preset_id, args.seed)
-        .context("prepare equilibrium snapshot cache")?;
+    if args.analytic_ics {
+        for galaxy in &mut preset.config.galaxies {
+            galaxy.equilibrium_snapshot = None;
+        }
+    }
 
     let mut initial_conditions =
         InitialConditions::generate(&preset.config, args.seed).context("generate ICs")?;
@@ -122,6 +120,7 @@ fn parse_args() -> Result<DiagArgs> {
         seed: 42,
         isolate_galaxy: None,
         base_timestep_myr: None,
+        analytic_ics: false,
     };
 
     let mut it = env::args().skip(1);
@@ -139,9 +138,10 @@ fn parse_args() -> Result<DiagArgs> {
                 args.isolate_galaxy = Some(next_value(&mut it, "--isolate-galaxy")?.parse()?)
             }
             "--no-relax" => args.relax_steps = 0,
+            "--analytic-ics" => args.analytic_ics = true,
             "--help" | "-h" => {
                 println!(
-                    "usage: cargo run -p sim-cuda --bin solver_diag -- [--preset ID] [--steps N] [--batch N] [--relax-steps N] [--seed N] [--base-timestep-myr DT] [--isolate-galaxy INDEX]"
+                    "usage: cargo run -p sim-cuda --bin solver_diag -- [--preset ID] [--steps N] [--batch N] [--relax-steps N] [--seed N] [--base-timestep-myr DT] [--isolate-galaxy INDEX] [--analytic-ics] [--no-relax]"
                 );
                 std::process::exit(0);
             }
@@ -154,117 +154,6 @@ fn parse_args() -> Result<DiagArgs> {
 
 fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
     it.next().with_context(|| format!("missing value for {flag}"))
-}
-
-fn ensure_equilibrium_snapshots_for_config(
-    config: &SimulationConfig,
-    preset_id: &str,
-    seed: u64,
-) -> Result<()> {
-    for (galaxy_index, galaxy) in config.galaxies.iter().enumerate() {
-        let Some(snapshot_path) = galaxy.equilibrium_snapshot.as_deref() else {
-            continue;
-        };
-        if equilibrium_snapshot_is_current(snapshot_path)? {
-            continue;
-        }
-        generate_equilibrium_snapshot(preset_id, galaxy_index, snapshot_path, seed)
-            .with_context(|| format!("generate equilibrium snapshot for {preset_id} galaxy {galaxy_index}"))?;
-    }
-    Ok(())
-}
-
-fn equilibrium_snapshot_is_current(snapshot_path: &str) -> Result<bool> {
-    let manifest_path = Path::new(snapshot_path);
-    if !manifest_path.exists() {
-        return Ok(false);
-    }
-    let bytes = std::fs::read(manifest_path)
-        .with_context(|| format!("failed to read equilibrium manifest {}", manifest_path.display()))?;
-    let manifest: SnapshotManifest = serde_json::from_slice(&bytes).with_context(|| {
-        format!(
-            "failed to decode equilibrium manifest {}",
-            manifest_path.display()
-        )
-    })?;
-    Ok(manifest.schema_version >= CURRENT_SNAPSHOT_SCHEMA_VERSION)
-}
-
-fn generate_equilibrium_snapshot(
-    preset_id: &str,
-    galaxy_index: usize,
-    snapshot_path: &str,
-    seed: u64,
-) -> Result<()> {
-    let snapshot_path = PathBuf::from(snapshot_path);
-    if let Some(parent) = snapshot_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create equilibrium snapshot directory {}", parent.display()))?;
-    }
-
-    let mut command = resolve_equilibrate_command();
-    command
-        .arg("--preset")
-        .arg(preset_id)
-        .arg("--galaxy")
-        .arg(galaxy_index.to_string())
-        .arg("--iterations")
-        .arg("4")
-        .arg("--settle-steps")
-        .arg("12")
-        .arg("--seed")
-        .arg(seed.to_string())
-        .arg("--output")
-        .arg(&snapshot_path);
-
-    let output = command
-        .output()
-        .with_context(|| format!("spawn equilibrium generator for {preset_id} galaxy {galaxy_index}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    bail!(
-        "equilibrium generator failed with status {}:\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout).trim(),
-        String::from_utf8_lossy(&output.stderr).trim()
-    )
-}
-
-fn resolve_equilibrate_command() -> Command {
-    if let Ok(explicit) = env::var("GALAXY_EQUILIBRATE_BIN") {
-        return Command::new(explicit);
-    }
-
-    if let Ok(current_exe) = env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            let sibling = parent.join("equilibrate");
-            let sibling_is_current = sibling.exists()
-                && match (
-                    sibling.metadata().and_then(|meta| meta.modified()),
-                    current_exe.metadata().and_then(|meta| meta.modified()),
-                ) {
-                    (Ok(sibling_time), Ok(current_time)) => sibling_time >= current_time,
-                    _ => false,
-                };
-            if sibling_is_current {
-                return Command::new(sibling);
-            }
-        }
-    }
-
-    let mut command = Command::new("cargo");
-    command
-        .arg("run")
-        .arg("--release")
-        .arg("-p")
-        .arg("sim-cuda")
-        .arg("--bin")
-        .arg("equilibrate")
-        .arg("--");
-    command.current_dir("/galaxy");
-    command
 }
 
 fn relax_initial_conditions(
@@ -328,17 +217,23 @@ fn relax_initial_conditions(
         let mut particles = backend
             .download_particles()
             .with_context(|| format!("download relaxed galaxy {galaxy_index}"))?;
-        recenter_particles(&mut particles, galaxy_index as u32, target_origin, target_velocity);
+        // The isolated backend was fed particles re-tagged with galaxy_index 0,
+        // so search the SMBH under that index, not the original one.
+        recenter_particles(&mut particles, 0, target_origin, target_velocity);
         relaxed_particles.extend(particles.into_iter().map(|mut particle| {
             particle.galaxy_index = galaxy_index as u32;
             particle
         }));
     }
 
+    let total_mass_msun = relaxed_particles
+        .iter()
+        .map(|particle| particle.mass_msun)
+        .sum();
     Ok(InitialConditions {
         seed: initial_conditions.seed,
         particles: relaxed_particles,
-        total_mass_msun: initial_conditions.total_mass_msun,
+        total_mass_msun,
     })
 }
 

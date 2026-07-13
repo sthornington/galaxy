@@ -3,6 +3,12 @@ use std::ops::{Add, AddAssign, Div, Mul, Sub, SubAssign};
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
 
+/// Newton's constant in kpc (km/s)^2 / Msun — the single source of truth for
+/// every crate in the workspace. IC generation, preset orbits, and the CUDA
+/// integrator must all agree on G or "equilibrium" galaxies are equilibrated
+/// for a different force law than the one integrated.
+pub const GRAV_CONST_KPC_KMS2_PER_MSUN: f64 = 4.300_91e-6;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, Pod, Zeroable)]
 #[repr(C)]
 pub struct Vec3 {

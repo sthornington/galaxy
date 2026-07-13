@@ -42,7 +42,6 @@ pub struct ObserverEffectsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreviewConfig {
     pub particle_budget: u32,
-    pub density_grid: [u32; 2],
     pub target_fps: u32,
 }
 
@@ -50,7 +49,6 @@ pub struct PreviewConfig {
 pub struct SnapshotConfig {
     pub directory: String,
     pub cadence_steps: u32,
-    pub compress: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

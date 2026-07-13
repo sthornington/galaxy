@@ -9,6 +9,11 @@ mod wasm {
         WebSocket, WheelEvent, Window,
     };
 
+    /// Frame-to-frame interpolation window in milliseconds.
+    const BLEND_WINDOW_MS: f64 = 90.0;
+
+    type FrameSlot = Rc<RefCell<Option<Rc<PreviewFrame>>>>;
+
     #[derive(Clone, Copy)]
     enum DragMode {
         Orbit,
@@ -51,13 +56,16 @@ mod wasm {
     struct ViewerState {
         websocket: WebSocket,
         canvas: HtmlCanvasElement,
-        _frame: Rc<RefCell<Option<PreviewFrame>>>,
-        _previous_frame: Rc<RefCell<Option<PreviewFrame>>>,
+        raf_handle: Rc<RefCell<Option<i32>>>,
+        animation: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>,
+        _frame: FrameSlot,
+        _previous_frame: FrameSlot,
         _camera: Rc<RefCell<CameraState>>,
         _blend_started_ms: Rc<RefCell<f64>>,
         _blend_scheduled: Rc<RefCell<bool>>,
         _onmessage: Closure<dyn FnMut(MessageEvent)>,
-        _animation: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>,
+        _onclose: Closure<dyn FnMut(Event)>,
+        _onerror: Closure<dyn FnMut(Event)>,
         oncontextmenu: Closure<dyn FnMut(MouseEvent)>,
         onmousedown: Closure<dyn FnMut(MouseEvent)>,
         onmousemove: Closure<dyn FnMut(MouseEvent)>,
@@ -70,7 +78,19 @@ mod wasm {
     impl ViewerState {
         fn dispose(self) {
             self.websocket.set_onmessage(None);
+            self.websocket.set_onclose(None);
+            self.websocket.set_onerror(None);
             let _ = self.websocket.close();
+            // Cancel any queued animation frame before dropping the closure it
+            // points at, then break the closure's Rc self-cycle; otherwise
+            // every boot leaks a permanently running render loop that keeps
+            // painting stale frames over the next session.
+            if let Some(handle) = self.raf_handle.borrow_mut().take() {
+                if let Some(window) = web_sys::window() {
+                    let _ = window.cancel_animation_frame(handle);
+                }
+            }
+            self.animation.borrow_mut().take();
             let _ = self.canvas.remove_event_listener_with_callback(
                 "contextmenu",
                 self.oncontextmenu.as_ref().unchecked_ref(),
@@ -108,7 +128,8 @@ mod wasm {
         depth: f64,
         perspective: f64,
         radial_velocity_kms: f64,
-        particle: PreviewParticle,
+        component: u32,
+        mass_msun: f32,
     }
 
     struct RenderParticle {
@@ -120,15 +141,6 @@ mod wasm {
         glow_alpha: f64,
         core_alpha: f64,
         color: [f64; 3],
-    }
-
-    struct HaloField {
-        density: Vec<f64>,
-        grid_w: usize,
-        grid_h: usize,
-        cell_w: f64,
-        cell_h: f64,
-        max_density: f64,
     }
 
     struct CameraBasis {
@@ -158,6 +170,27 @@ mod wasm {
         }
     }
 
+    /// Monotonic milliseconds on the same timebase as requestAnimationFrame
+    /// timestamps; mixing Date.now() with rAF timestamps silently breaks the
+    /// blend alpha.
+    fn now_ms(window: &Window) -> f64 {
+        window
+            .performance()
+            .map(|performance| performance.now())
+            .unwrap_or(0.0)
+    }
+
+    /// Ratio of canvas backbuffer pixels to CSS pixels; mouse deltas arrive in
+    /// CSS pixels while all drawing happens in backbuffer pixels.
+    fn css_to_buffer_scale(canvas: &HtmlCanvasElement) -> f64 {
+        let rect = canvas.get_bounding_client_rect();
+        if rect.width() > 0.0 {
+            f64::from(canvas.width()) / rect.width()
+        } else {
+            1.0
+        }
+    }
+
     #[wasm_bindgen]
     pub fn boot(canvas_id: &str, session_id: &str) -> Result<(), JsValue> {
         shutdown();
@@ -175,14 +208,15 @@ mod wasm {
             .ok_or_else(|| JsValue::from_str("missing 2d context"))?
             .dyn_into::<CanvasRenderingContext2d>()?;
 
-        let frame = Rc::new(RefCell::new(None));
-        let previous_frame = Rc::new(RefCell::new(None));
+        let frame: FrameSlot = Rc::new(RefCell::new(None));
+        let previous_frame: FrameSlot = Rc::new(RefCell::new(None));
         let camera = Rc::new(RefCell::new(CameraState::default()));
         let saw_first_frame = Rc::new(RefCell::new(false));
         let blend_started_ms = Rc::new(RefCell::new(0.0));
         let blend_scheduled = Rc::new(RefCell::new(false));
         let animation: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> =
             Rc::new(RefCell::new(None));
+        let raf_handle: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
 
         let location = window.location();
         let scheme = if location.protocol()?.starts_with("https") {
@@ -194,6 +228,27 @@ mod wasm {
         let ws = WebSocket::new(&format!("{scheme}://{host}/ws/frames/{session_id}"))?;
         ws.set_binary_type(BinaryType::Arraybuffer);
 
+        let redraw_now = {
+            let window = window.clone();
+            let context = context.clone();
+            let canvas = canvas.clone();
+            let frame = frame.clone();
+            let previous_frame = previous_frame.clone();
+            let blend_started_ms = blend_started_ms.clone();
+            move |camera: &CameraState| {
+                let Some(current) = frame.borrow().clone() else {
+                    return;
+                };
+                let alpha = clamp(
+                    (now_ms(&window) - *blend_started_ms.borrow()) / BLEND_WINDOW_MS,
+                    0.0,
+                    1.0,
+                );
+                let previous = previous_frame.borrow().clone();
+                draw_scene(&context, &canvas, previous.as_deref(), &current, alpha, camera);
+            }
+        };
+
         let schedule_blend = {
             let window = window.clone();
             let context = context.clone();
@@ -204,6 +259,7 @@ mod wasm {
             let blend_started_ms = blend_started_ms.clone();
             let blend_scheduled = blend_scheduled.clone();
             let animation = animation.clone();
+            let raf_handle = raf_handle.clone();
 
             move || {
                 if *blend_scheduled.borrow() {
@@ -220,49 +276,55 @@ mod wasm {
                     let blend_started_for_anim = blend_started_ms.clone();
                     let blend_scheduled_for_anim = blend_scheduled.clone();
                     let animation_for_anim = animation.clone();
-                    *animation.borrow_mut() = Some(Closure::<dyn FnMut(f64)>::new(move |timestamp: f64| {
-                        let maybe_current = frame_for_anim.borrow().clone();
-                        let maybe_previous = previous_for_anim.borrow().clone();
-                        let Some(current) = maybe_current else {
-                            *blend_scheduled_for_anim.borrow_mut() = false;
-                            return;
-                        };
-                        let alpha = clamp((timestamp - *blend_started_for_anim.borrow()) / 90.0, 0.0, 1.0);
-                        {
-                            let camera = camera_for_anim.borrow();
-                            if let Some(previous) = maybe_previous.as_ref() {
-                                draw_frame_blended(
+                    let raf_handle_for_anim = raf_handle.clone();
+                    *animation.borrow_mut() =
+                        Some(Closure::<dyn FnMut(f64)>::new(move |timestamp: f64| {
+                            raf_handle_for_anim.borrow_mut().take();
+                            let Some(current) = frame_for_anim.borrow().clone() else {
+                                *blend_scheduled_for_anim.borrow_mut() = false;
+                                return;
+                            };
+                            let alpha = clamp(
+                                (timestamp - *blend_started_for_anim.borrow()) / BLEND_WINDOW_MS,
+                                0.0,
+                                1.0,
+                            );
+                            {
+                                let camera = camera_for_anim.borrow();
+                                let previous = previous_for_anim.borrow().clone();
+                                draw_scene(
                                     &context_for_anim,
                                     &canvas_for_anim,
-                                    previous,
+                                    previous.as_deref(),
                                     &current,
                                     alpha,
                                     &camera,
                                 );
+                            }
+                            if alpha < 1.0 {
+                                if let Some(callback) = animation_for_anim.borrow().as_ref() {
+                                    if let Ok(handle) = window_for_anim.request_animation_frame(
+                                        callback.as_ref().unchecked_ref(),
+                                    ) {
+                                        *raf_handle_for_anim.borrow_mut() = Some(handle);
+                                    }
+                                }
                             } else {
-                                draw_frame(&context_for_anim, &canvas_for_anim, &current, &camera);
+                                *blend_scheduled_for_anim.borrow_mut() = false;
                             }
-                        }
-                        if alpha < 1.0 {
-                            if let Some(callback) = animation_for_anim.borrow().as_ref() {
-                                let _ = window_for_anim.request_animation_frame(
-                                    callback.as_ref().unchecked_ref(),
-                                );
-                            }
-                        } else {
-                            *blend_scheduled_for_anim.borrow_mut() = false;
-                        }
-                    }));
+                        }));
                 }
                 if let Some(callback) = animation.borrow().as_ref() {
-                    let _ = window.request_animation_frame(callback.as_ref().unchecked_ref());
+                    if let Ok(handle) =
+                        window.request_animation_frame(callback.as_ref().unchecked_ref())
+                    {
+                        *raf_handle.borrow_mut() = Some(handle);
+                    }
                 }
             }
         };
 
         let onmessage = {
-            let context = context.clone();
-            let canvas = canvas.clone();
             let frame = frame.clone();
             let previous_frame = previous_frame.clone();
             let camera = camera.clone();
@@ -285,13 +347,21 @@ mod wasm {
                                     let mut camera = camera.borrow_mut();
                                     update_scene_bounds(&mut camera, &decoded, false);
                                 }
-                                if let Some(current) = frame.borrow().as_ref() {
-                                    *previous_frame.borrow_mut() = Some(current.clone());
-                                } else {
-                                    *previous_frame.borrow_mut() = Some(decoded.clone());
-                                }
+                                let decoded = Rc::new(decoded);
+                                let blendable_previous = frame
+                                    .borrow()
+                                    .as_ref()
+                                    // Interpolation pairs particles by index,
+                                    // which is only meaningful when the budget
+                                    // did not change between frames.
+                                    .filter(|current| {
+                                        current.particles.len() == decoded.particles.len()
+                                    })
+                                    .cloned();
+                                *previous_frame.borrow_mut() =
+                                    Some(blendable_previous.unwrap_or_else(|| decoded.clone()));
                                 *frame.borrow_mut() = Some(decoded);
-                                *blend_started_ms.borrow_mut() = js_sys::Date::now();
+                                *blend_started_ms.borrow_mut() = now_ms(&window);
                                 schedule_blend();
                                 if !*saw_first_frame.borrow() {
                                     *saw_first_frame.borrow_mut() = true;
@@ -310,6 +380,23 @@ mod wasm {
             })
         };
         ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+
+        // Surface socket loss to the JS shell so it can fall back or reconnect
+        // instead of freezing on the last frame.
+        let onclose = {
+            let window = window.clone();
+            Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+                dispatch_window_event(&window, "galaxy-viewer-error");
+            })
+        };
+        ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+        let onerror = {
+            let window = window.clone();
+            Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+                dispatch_window_event(&window, "galaxy-viewer-error");
+            })
+        };
+        ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
 
         let oncontextmenu = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
             event.prevent_default();
@@ -339,12 +426,9 @@ mod wasm {
             .add_event_listener_with_callback("mousedown", onmousedown.as_ref().unchecked_ref())?;
 
         let onmousemove = {
-            let context = context.clone();
             let canvas = canvas.clone();
-            let frame = frame.clone();
-            let previous_frame = previous_frame.clone();
             let camera = camera.clone();
-            let blend_started_ms = blend_started_ms.clone();
+            let redraw_now = redraw_now.clone();
             Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
                 let mut camera_state = camera.borrow_mut();
                 if !camera_state.dragging {
@@ -352,8 +436,9 @@ mod wasm {
                 }
                 let next_x = f64::from(event.client_x());
                 let next_y = f64::from(event.client_y());
-                let dx = next_x - camera_state.last_x;
-                let dy = next_y - camera_state.last_y;
+                let buffer_scale = css_to_buffer_scale(&canvas);
+                let dx = (next_x - camera_state.last_x) * buffer_scale;
+                let dy = (next_y - camera_state.last_y) * buffer_scale;
                 match camera_state.drag_mode {
                     DragMode::Pan => {
                         let basis = camera_basis(&camera_state);
@@ -375,15 +460,7 @@ mod wasm {
                 }
                 camera_state.last_x = next_x;
                 camera_state.last_y = next_y;
-                if let Some(frame) = frame.borrow().as_ref() {
-                    let alpha =
-                        clamp((js_sys::Date::now() - *blend_started_ms.borrow()) / 90.0, 0.0, 1.0);
-                    if let Some(previous) = previous_frame.borrow().as_ref() {
-                        draw_frame_blended(&context, &canvas, previous, frame, alpha, &camera_state);
-                    } else {
-                        draw_frame(&context, &canvas, frame, &camera_state);
-                    }
-                }
+                redraw_now(&camera_state);
             })
         };
         canvas
@@ -413,28 +490,36 @@ mod wasm {
         )?;
 
         let onwheel = {
-            let context = context.clone();
             let canvas = canvas.clone();
-            let frame = frame.clone();
-            let previous_frame = previous_frame.clone();
             let camera = camera.clone();
-            let blend_started_ms = blend_started_ms.clone();
+            let redraw_now = redraw_now.clone();
             Closure::<dyn FnMut(WheelEvent)>::new(move |event: WheelEvent| {
                 event.prevent_default();
                 let mut camera_state = camera.borrow_mut();
                 camera_state.auto_frame = false;
                 let factor = if event.delta_y() < 0.0 { 0.78 } else { 1.0 / 0.78 };
+
+                // Zoom toward the cursor: keep the world point under the
+                // pointer roughly fixed on screen by sliding the focus toward
+                // it as the distance shrinks (and away as it grows).
+                let buffer_scale = css_to_buffer_scale(&canvas);
+                let cursor_x = f64::from(event.offset_x()) * buffer_scale;
+                let cursor_y = f64::from(event.offset_y()) * buffer_scale;
+                if let Some(target) = cursor_world_point(
+                    &camera_state,
+                    cursor_x,
+                    cursor_y,
+                    f64::from(canvas.width()),
+                    f64::from(canvas.height()),
+                ) {
+                    let pull = 1.0 - factor;
+                    camera_state.focus[0] += (target[0] - camera_state.focus[0]) * pull;
+                    camera_state.focus[1] += (target[1] - camera_state.focus[1]) * pull;
+                    camera_state.focus[2] += (target[2] - camera_state.focus[2]) * pull;
+                }
                 camera_state.distance_scale =
                     clamp(camera_state.distance_scale * factor, 0.003, 20.0);
-                if let Some(frame) = frame.borrow().as_ref() {
-                    let alpha =
-                        clamp((js_sys::Date::now() - *blend_started_ms.borrow()) / 90.0, 0.0, 1.0);
-                    if let Some(previous) = previous_frame.borrow().as_ref() {
-                        draw_frame_blended(&context, &canvas, previous, frame, alpha, &camera_state);
-                    } else {
-                        draw_frame(&context, &canvas, frame, &camera_state);
-                    }
-                }
+                redraw_now(&camera_state);
             })
         };
         canvas.add_event_listener_with_callback("wheel", onwheel.as_ref().unchecked_ref())?;
@@ -449,7 +534,7 @@ mod wasm {
                 *camera_state = CameraState::default();
                 if let Some(frame) = frame.borrow().as_ref() {
                     update_scene_bounds(&mut camera_state, frame, true);
-                    draw_frame(&context, &canvas, frame, &camera_state);
+                    draw_scene(&context, &canvas, None, frame, 1.0, &camera_state);
                 }
             })
         };
@@ -459,13 +544,16 @@ mod wasm {
             *state.borrow_mut() = Some(ViewerState {
                 websocket: ws,
                 canvas,
+                raf_handle,
+                animation,
                 _frame: frame,
                 _previous_frame: previous_frame,
                 _camera: camera,
                 _blend_started_ms: blend_started_ms,
                 _blend_scheduled: blend_scheduled,
                 _onmessage: onmessage,
-                _animation: animation,
+                _onclose: onclose,
+                _onerror: onerror,
                 oncontextmenu,
                 onmousedown,
                 onmousemove,
@@ -521,6 +609,10 @@ mod wasm {
         ]
     }
 
+    fn is_luminous(component: u32) -> bool {
+        component != 0 && component != 3
+    }
+
     fn update_scene_bounds(camera: &mut CameraState, frame: &PreviewFrame, force: bool) {
         if !camera.auto_frame && !force {
             return;
@@ -529,7 +621,7 @@ mod wasm {
         let luminous: Vec<_> = frame
             .particles
             .iter()
-            .filter(|particle| particle.component != 0 && particle.component != 3)
+            .filter(|particle| is_luminous(particle.component))
             .collect();
         let particles: Vec<_> = if luminous.is_empty() {
             frame.particles.iter().collect()
@@ -598,6 +690,44 @@ mod wasm {
         }
     }
 
+    /// World-space point under the given canvas pixel at the focus-plane
+    /// depth; used for zoom-to-cursor.
+    fn cursor_world_point(
+        camera: &CameraState,
+        cursor_x: f64,
+        cursor_y: f64,
+        width: f64,
+        height: f64,
+    ) -> Option<[f64; 3]> {
+        if width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        let fov = std::f64::consts::FRAC_PI_4;
+        let basis = camera_basis(camera);
+        let focal_length = (width.min(height) * 0.5) / (fov * 0.5).tan();
+        let dir = normalize3([
+            basis.forward[0]
+                + basis.right[0] * ((cursor_x - width * 0.5) / focal_length)
+                - basis.up[0] * ((cursor_y - height * 0.5) / focal_length),
+            basis.forward[1]
+                + basis.right[1] * ((cursor_x - width * 0.5) / focal_length)
+                - basis.up[1] * ((cursor_y - height * 0.5) / focal_length),
+            basis.forward[2]
+                + basis.right[2] * ((cursor_x - width * 0.5) / focal_length)
+                - basis.up[2] * ((cursor_y - height * 0.5) / focal_length),
+        ]);
+        let along = dot3(dir, basis.forward);
+        if along <= 1.0e-6 {
+            return None;
+        }
+        let range = basis.distance / along;
+        Some([
+            basis.camera_position[0] + dir[0] * range,
+            basis.camera_position[1] + dir[1] * range,
+            basis.camera_position[2] + dir[2] * range,
+        ])
+    }
+
     fn project_point(
         position: [f64; 3],
         width: f64,
@@ -653,13 +783,13 @@ mod wasm {
                 ],
                 forward,
             ),
-            particle: particle.clone(),
+            component: particle.component,
+            mass_msun: particle.mass_msun,
         })
     }
 
-    fn stellar_base_color(particle: &PreviewParticle) -> Option<[f64; 3]> {
-        let component = particle.component;
-        let mass_msun = f64::from(particle.mass_msun).max(1.0);
+    fn stellar_base_color(component: u32, mass_msun: f32) -> Option<[f64; 3]> {
+        let mass_msun = f64::from(mass_msun).max(1.0);
         let mass_bias = clamp((mass_msun.log10() - 4.2) / 1.6, 0.0, 1.0);
         match component {
             0 | 3 => None,
@@ -695,8 +825,8 @@ mod wasm {
     }
 
     fn render_style(projected: ProjectedParticle) -> Option<RenderParticle> {
-        let base_color = stellar_base_color(&projected.particle)?;
-        let mass_msun = f64::from(projected.particle.mass_msun).max(1.0);
+        let base_color = stellar_base_color(projected.component, projected.mass_msun)?;
+        let mass_msun = f64::from(projected.mass_msun).max(1.0);
         let luminosity = clamp((mass_msun.log10() - 3.7) / 2.2, 0.25, 1.8);
         let render_luminosity = luminosity.powf(0.58);
         let color = apply_doppler_shift(base_color, projected.radial_velocity_kms);
@@ -752,240 +882,18 @@ mod wasm {
             depth,
             perspective,
             radial_velocity_kms: dot3(velocity, forward),
-            particle: current.clone(),
+            component: current.component,
+            mass_msun: current.mass_msun,
         })
     }
 
-    fn build_halo_field(points: &[ProjectedParticle], width: f64, height: f64) -> HaloField {
-        let grid_w = ((width / 10.0).floor() as usize).max(48);
-        let grid_h = ((height / 10.0).floor() as usize).max(27);
-        let mut density = vec![0.0; grid_w * grid_h];
-        let mut max_density: f64 = 0.0;
-
-        let mut accumulate = |ix: isize, iy: isize, weight: f64| {
-            if ix < 0 || iy < 0 || weight <= 0.0 {
-                return;
-            }
-            let ix = ix as usize;
-            let iy = iy as usize;
-            if ix >= grid_w || iy >= grid_h {
-                return;
-            }
-            let slot = iy * grid_w + ix;
-            density[slot] += weight;
-            max_density = max_density.max(density[slot]);
-        };
-
-        for point in points {
-            let gx = clamp(point.x / width * grid_w as f64, 0.0, grid_w as f64 - 1.0001);
-            let gy = clamp(point.y / height * grid_h as f64, 0.0, grid_h as f64 - 1.0001);
-            let ix = gx.floor() as isize;
-            let iy = gy.floor() as isize;
-            let tx = gx - ix as f64;
-            let ty = gy - iy as f64;
-            let mass_weight = clamp(
-                f64::from(point.particle.mass_msun).max(1.0).log10() / 6.5,
-                0.18,
-                1.0,
-            );
-            let perspective_weight = point.perspective.max(0.08).powf(0.85);
-            let weight = mass_weight * perspective_weight;
-            accumulate(ix, iy, weight * (1.0 - tx) * (1.0 - ty));
-            accumulate(ix + 1, iy, weight * tx * (1.0 - ty));
-            accumulate(ix, iy + 1, weight * (1.0 - tx) * ty);
-            accumulate(ix + 1, iy + 1, weight * tx * ty);
-        }
-
-        HaloField {
-            density,
-            grid_w,
-            grid_h,
-            cell_w: width / grid_w as f64,
-            cell_h: height / grid_h as f64,
-            max_density,
-        }
-    }
-
-    fn edge_point(
-        x0: f64,
-        y0: f64,
-        v0: f64,
-        x1: f64,
-        y1: f64,
-        v1: f64,
-        threshold: f64,
-    ) -> Option<(f64, f64)> {
-        let dv = v1 - v0;
-        if dv.abs() <= 1.0e-8 {
-            return None;
-        }
-        let t = (threshold - v0) / dv;
-        if !(0.0..=1.0).contains(&t) {
-            return None;
-        }
-        Some((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
-    }
-
-    fn draw_halo_fog_and_contours(
-        context: &CanvasRenderingContext2d,
-        width: f64,
-        height: f64,
-        halo_points: &[ProjectedParticle],
-    ) {
-        if halo_points.is_empty() {
-            return;
-        }
-        let field = build_halo_field(halo_points, width, height);
-        if !(field.max_density > 0.0) {
-            return;
-        }
-
-        context.save();
-        for y in 0..field.grid_h {
-            for x in 0..field.grid_w {
-                let density = field.density[y * field.grid_w + x] / field.max_density;
-                if density < 0.03 {
-                    continue;
-                }
-                let fog = density.powf(0.62);
-                let alpha = clamp(0.015 + 0.11 * fog, 0.0, 0.12);
-                let red = (36.0 + 28.0 * fog) as u32;
-                let green = (88.0 + 72.0 * fog) as u32;
-                let blue = (132.0 + 108.0 * fog) as u32;
-                context.set_fill_style_str(&format!(
-                    "rgba({}, {}, {}, {})",
-                    red, green, blue, alpha
-                ));
-                context.fill_rect(
-                    x as f64 * field.cell_w,
-                    y as f64 * field.cell_h,
-                    field.cell_w + 0.7,
-                    field.cell_h + 0.7,
-                );
-            }
-        }
-        context.restore();
-
-        let thresholds = [
-            (0.16, "rgba(110, 170, 255, 0.12)", 0.8),
-            (0.32, "rgba(130, 205, 255, 0.18)", 0.95),
-            (0.54, "rgba(185, 235, 255, 0.26)", 1.05),
-        ];
-        for (level, color, line_width) in thresholds {
-            context.save();
-            context.set_stroke_style_str(color);
-            context.set_line_width(line_width);
-            for y in 0..field.grid_h.saturating_sub(1) {
-                for x in 0..field.grid_w.saturating_sub(1) {
-                    let v00 = field.density[y * field.grid_w + x] / field.max_density;
-                    let v10 = field.density[y * field.grid_w + x + 1] / field.max_density;
-                    let v01 = field.density[(y + 1) * field.grid_w + x] / field.max_density;
-                    let v11 = field.density[(y + 1) * field.grid_w + x + 1] / field.max_density;
-                    let min_value = v00.min(v10).min(v01).min(v11);
-                    let max_value = v00.max(v10).max(v01).max(v11);
-                    if min_value > level || max_value < level {
-                        continue;
-                    }
-
-                    let x0 = x as f64 * field.cell_w;
-                    let x1 = (x + 1) as f64 * field.cell_w;
-                    let y0 = y as f64 * field.cell_h;
-                    let y1 = (y + 1) as f64 * field.cell_h;
-                    let mut points = Vec::with_capacity(4);
-                    if let Some(point) = edge_point(x0, y0, v00, x1, y0, v10, level) {
-                        points.push(point);
-                    }
-                    if let Some(point) = edge_point(x1, y0, v10, x1, y1, v11, level) {
-                        points.push(point);
-                    }
-                    if let Some(point) = edge_point(x1, y1, v11, x0, y1, v01, level) {
-                        points.push(point);
-                    }
-                    if let Some(point) = edge_point(x0, y1, v01, x0, y0, v00, level) {
-                        points.push(point);
-                    }
-                    if points.len() < 2 {
-                        continue;
-                    }
-                    context.begin_path();
-                    context.move_to(points[0].0, points[0].1);
-                    context.line_to(points[1].0, points[1].1);
-                    context.stroke();
-                    if points.len() == 4 {
-                        context.begin_path();
-                        context.move_to(points[2].0, points[2].1);
-                        context.line_to(points[3].0, points[3].1);
-                        context.stroke();
-                    }
-                }
-            }
-            context.restore();
-        }
-    }
-
-    fn draw_frame(
+    /// Renders the current frame (optionally interpolated against a previous
+    /// frame) — the single draw path for both the animation loop and
+    /// interaction redraws.
+    fn draw_scene(
         context: &CanvasRenderingContext2d,
         canvas: &HtmlCanvasElement,
-        frame: &PreviewFrame,
-        camera: &CameraState,
-    ) {
-        let width = canvas.width() as f64;
-        let height = canvas.height() as f64;
-        context.clear_rect(0.0, 0.0, width, height);
-
-        context.set_fill_style_str("#020810");
-        context.fill_rect(0.0, 0.0, width, height);
-
-        let mut projected = Vec::new();
-        for particle in &frame.particles {
-            let Some(projected_particle) = project_particle(particle, width, height, camera) else {
-                continue;
-            };
-            if particle.component == 0 {
-                continue;
-            }
-            if let Some(rendered) = render_style(projected_particle) {
-                projected.push(rendered);
-            }
-        }
-        projected.sort_by(|left, right| right.depth.total_cmp(&left.depth));
-
-        let _ = context.set_global_composite_operation("lighter");
-        for point in projected {
-            let [r, g, b] = point.color;
-            context.begin_path();
-            context.set_fill_style_str(&format!(
-                "rgba({}, {}, {}, {})",
-                (r * 255.0) as u32,
-                (g * 255.0) as u32,
-                (b * 255.0) as u32,
-                point.glow_alpha
-            ));
-            let _ = context.arc(point.x, point.y, point.glow_radius, 0.0, std::f64::consts::TAU);
-            context.fill();
-
-            context.begin_path();
-            context.set_fill_style_str(&format!(
-                "rgba({}, {}, {}, {})",
-                (r * 255.0) as u32,
-                (g * 255.0) as u32,
-                (b * 255.0) as u32,
-                point.core_alpha
-            ));
-            let _ = context.arc(point.x, point.y, point.core_radius, 0.0, std::f64::consts::TAU);
-            context.fill();
-        }
-        let _ = context.set_global_composite_operation("source-over");
-        if camera.dragging {
-            draw_xy_plane_grid(context, width, height, camera);
-        }
-        draw_origin_axes(context, width, height, camera);
-    }
-
-    fn draw_frame_blended(
-        context: &CanvasRenderingContext2d,
-        canvas: &HtmlCanvasElement,
-        previous: &PreviewFrame,
+        previous: Option<&PreviewFrame>,
         current: &PreviewFrame,
         alpha: f64,
         camera: &CameraState,
@@ -997,26 +905,44 @@ mod wasm {
         context.set_fill_style_str("#020810");
         context.fill_rect(0.0, 0.0, width, height);
 
-        let mut projected = Vec::new();
-        let count = previous.particles.len().min(current.particles.len());
-        for index in 0..count {
-            let previous_particle = &previous.particles[index];
-            let current_particle = &current.particles[index];
-            let Some(projected_particle) = project_interpolated_particle(
-                previous_particle,
-                current_particle,
-                alpha,
-                width,
-                height,
-                camera,
-            ) else {
-                continue;
-            };
-            if current_particle.component == 0 {
-                continue;
+        let mut projected: Vec<RenderParticle> = Vec::with_capacity(current.particles.len());
+        match previous {
+            Some(previous) if alpha < 1.0 => {
+                let count = previous.particles.len().min(current.particles.len());
+                for index in 0..count {
+                    let current_particle = &current.particles[index];
+                    if !is_luminous(current_particle.component) {
+                        continue;
+                    }
+                    let Some(projected_particle) = project_interpolated_particle(
+                        &previous.particles[index],
+                        current_particle,
+                        alpha,
+                        width,
+                        height,
+                        camera,
+                    ) else {
+                        continue;
+                    };
+                    if let Some(rendered) = render_style(projected_particle) {
+                        projected.push(rendered);
+                    }
+                }
             }
-            if let Some(rendered) = render_style(projected_particle) {
-                projected.push(rendered);
+            _ => {
+                for particle in &current.particles {
+                    if !is_luminous(particle.component) {
+                        continue;
+                    }
+                    let Some(projected_particle) =
+                        project_particle(particle, width, height, camera)
+                    else {
+                        continue;
+                    };
+                    if let Some(rendered) = render_style(projected_particle) {
+                        projected.push(rendered);
+                    }
+                }
             }
         }
         projected.sort_by(|left, right| right.depth.total_cmp(&left.depth));
@@ -1024,12 +950,12 @@ mod wasm {
         let _ = context.set_global_composite_operation("lighter");
         for point in projected {
             let [r, g, b] = point.color;
+            let red = (r * 255.0) as u32;
+            let green = (g * 255.0) as u32;
+            let blue = (b * 255.0) as u32;
             context.begin_path();
             context.set_fill_style_str(&format!(
-                "rgba({}, {}, {}, {})",
-                (r * 255.0) as u32,
-                (g * 255.0) as u32,
-                (b * 255.0) as u32,
+                "rgba({red}, {green}, {blue}, {})",
                 point.glow_alpha
             ));
             let _ = context.arc(point.x, point.y, point.glow_radius, 0.0, std::f64::consts::TAU);
@@ -1037,10 +963,7 @@ mod wasm {
 
             context.begin_path();
             context.set_fill_style_str(&format!(
-                "rgba({}, {}, {}, {})",
-                (r * 255.0) as u32,
-                (g * 255.0) as u32,
-                (b * 255.0) as u32,
+                "rgba({red}, {green}, {blue}, {})",
                 point.core_alpha
             ));
             let _ = context.arc(point.x, point.y, point.core_radius, 0.0, std::f64::consts::TAU);

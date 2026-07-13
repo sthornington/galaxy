@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
-bincode.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 parking_lot.workspace = true
@@ -15,6 +14,7 @@ serde.workspace = true
 serde_json.workspace = true
 sim-core = { path = "../sim-core" }
 sim-cuda = { path = "../sim-cuda" }
+thiserror.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true

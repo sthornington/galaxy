@@ -21,10 +21,7 @@ pub struct PreviewParticle {
     pub position_kpc: [f32; 3],
     pub velocity_kms: [f32; 3],
     pub mass_msun: f32,
-    pub galaxy_index: u32,
     pub component: u32,
-    pub color_rgba: [f32; 4],
-    pub intensity: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -112,8 +109,10 @@ pub fn decode_preview_packet(bytes: &[u8]) -> anyhow::Result<PreviewFrame> {
     }
 
     let particle_bytes = &bytes[header_len..];
-    let expected_len = header.preview_count as usize * size_of::<PreviewPacketParticle>();
-    if particle_bytes.len() != expected_len {
+    // Compare in u64: a hostile preview_count times the stride can overflow usize
+    // on wasm32.
+    let expected_len = header.preview_count as u64 * size_of::<PreviewPacketParticle>() as u64;
+    if particle_bytes.len() as u64 != expected_len {
         return Err(anyhow!(
             "preview packet payload size mismatch: expected {} bytes for {} particles, got {}",
             expected_len,
@@ -130,10 +129,7 @@ pub fn decode_preview_packet(bytes: &[u8]) -> anyhow::Result<PreviewFrame> {
             position_kpc: particle.position_kpc,
             velocity_kms: particle.velocity_kms,
             mass_msun: particle.mass_msun,
-            galaxy_index: 0,
             component: particle.component,
-            color_rgba: [0.0, 0.0, 0.0, 1.0],
-            intensity: 1.0,
         })
         .collect();
 

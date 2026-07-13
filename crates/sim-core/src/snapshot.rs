@@ -1,4 +1,8 @@
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    io::BufWriter,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
@@ -38,11 +42,10 @@ pub fn write_particle_snapshot(
 
     let chunk_name = "particles.bin";
     let chunk_path = directory.join(chunk_name);
-    fs::write(
-        &chunk_path,
-        bincode::serialize(particles).context("failed to encode particle snapshot")?,
-    )
-    .with_context(|| format!("failed to write particle snapshot {}", chunk_path.display()))?;
+    let chunk_file = fs::File::create(&chunk_path)
+        .with_context(|| format!("failed to create particle snapshot {}", chunk_path.display()))?;
+    bincode::serialize_into(BufWriter::new(chunk_file), particles)
+        .with_context(|| format!("failed to write particle snapshot {}", chunk_path.display()))?;
 
     let manifest = SnapshotManifest {
         schema_version: CURRENT_SNAPSHOT_SCHEMA_VERSION,
@@ -75,10 +78,21 @@ pub fn load_particle_snapshot(
     )
     .with_context(|| format!("failed to decode manifest {}", manifest_path.display()))?;
 
+    if manifest.schema_version != CURRENT_SNAPSHOT_SCHEMA_VERSION {
+        bail!(
+            "snapshot {} has schema version {} but this build reads version {}",
+            manifest_path.display(),
+            manifest.schema_version,
+            CURRENT_SNAPSHOT_SCHEMA_VERSION
+        );
+    }
+
     let base_dir = manifest_path
         .parent()
         .context("snapshot manifest path must have a parent directory")?;
-    let mut particles = Vec::with_capacity(manifest.particle_count as usize);
+    // The manifest is untrusted input; cap the preallocation and let append grow.
+    let mut particles =
+        Vec::with_capacity((manifest.particle_count as usize).min(1 << 20));
     let mut expected_offset = 0_u64;
 
     for chunk in &manifest.chunk_files {

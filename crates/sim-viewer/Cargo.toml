@@ -8,7 +8,6 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bincode.workspace = true
 js-sys = "0.3"
 sim-core = { path = "../sim-core" }
 wasm-bindgen.workspace = true
@@ -23,6 +22,7 @@ web-sys = { workspace = true, features = [
     "Location",
     "MessageEvent",
     "MouseEvent",
+    "Performance",
     "WebSocket",
     "WheelEvent",
     "Window",

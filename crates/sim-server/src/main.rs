@@ -25,6 +25,10 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to bind HTTP listener")?;
     info!("sim-server listening on http://{addr}");
     axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("shutdown signal received");
+        })
         .await
         .context("HTTP server failed")
 }

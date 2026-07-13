@@ -22,17 +22,6 @@ struct SimCudaPreviewParticle {
   std::uint32_t component;
 };
 
-struct SimCudaGalaxy {
-  double halo_mass_msun;
-  double halo_scale_radius_kpc;
-  double disk_mass_msun;
-  double disk_scale_radius_kpc;
-  double disk_scale_height_kpc;
-  double bulge_mass_msun;
-  double bulge_scale_radius_kpc;
-  double disk_rotation[9];
-};
-
 struct SimCudaDiagnostics {
   std::uint64_t particle_count;
   std::uint32_t preview_count;
@@ -57,7 +46,6 @@ struct SimCudaCreateParams {
 
 int sim_cuda_create(const SimCudaCreateParams* params,
                     const SimCudaParticle* particles,
-                    const SimCudaGalaxy* galaxies,
                     void** out_handle,
                     char* error_buffer,
                     std::size_t error_buffer_len);

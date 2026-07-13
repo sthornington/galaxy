@@ -16,11 +16,36 @@ NVIDIA GB10 / DGX Spark.
 
 ## Current status
 
-This first implementation pass establishes the full project structure and a
-working control-plane contract. The CUDA backend is intentionally a baseline:
-it allocates GPU-resident particle buffers, advances particles with a simple
-accelerator model, and emits preview samples for the browser. The full TreePM +
-weak-field relativistic solver remains the next major implementation step.
+The CUDA backend is a full TreePM solver:
+
+- **Long range**: FFT particle-mesh with a free-space (isolated) Green's
+  function — no periodic-image artifacts — CIC deposit/deconvolution, and a
+  Gaussian force split.
+- **Short range**: an FMM-style interaction-list walk over a baryon-tight cell
+  grid plus a coarsened mass/COM pyramid, giving exact tiling out to the
+  erfc-matched cutoff. Dense neighborhoods use exact pair sums for the local
+  cell and octant monopoles for neighbors.
+- **Integration**: kick-drift-kick leapfrog with merged interior kicks and
+  CFL-adaptive substepping; SMBHs are direct point sources with optional 1PN
+  corrections.
+- **Diagnostics**: kinetic and mesh-sampled potential energy per step; the
+  isolated `major-merger-debug` galaxy conserves total energy to ~0.1% over
+  tens of Myr and holds its disk structure.
+
+Initial conditions come from Jeans-equilibrium analytic samplers in
+`sim-core` (NFW halo, exponential disk with Toomre-Q dispersion and
+asymmetric drift, Hernquist bulge).
+
+Solver validation tools live in `crates/sim-cuda/src/bin`:
+
+```bash
+# per-particle force accuracy vs a brute-force direct sum
+cargo run --release -p sim-cuda --bin force_check -- --samples 300
+
+# time-domain stability / energy-conservation metrics
+cargo run --release -p sim-cuda --bin solver_diag -- \
+  --preset major-merger-debug --steps 100 --batch 25 --no-relax --analytic-ics
+```
 
 ## Local development
 

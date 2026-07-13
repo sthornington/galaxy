@@ -19,7 +19,8 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::session::{
-    ControlCommand, CreateSessionParams, SessionCommand, SessionRegistry, SessionSummary,
+    ControlCommand, CreateSessionParams, MAX_STEP_SUBSTEPS, SessionCommand, SessionError,
+    SessionRegistry, SessionSummary,
 };
 
 #[derive(Clone)]
@@ -179,10 +180,11 @@ async fn step_session(
     Path(id): Path<Uuid>,
     Json(request): Json<StepRequest>,
 ) -> Result<Json<SessionSummary>, AppError> {
+    let substeps = request.substeps.unwrap_or(1).clamp(1, MAX_STEP_SUBSTEPS);
     Ok(Json(
         state
             .sessions
-            .command_wait(id, SessionCommand::Step(request.substeps.unwrap_or(1)))
+            .command_wait(id, SessionCommand::Step(substeps))
             .await?,
     ))
 }
@@ -230,114 +232,90 @@ async fn ws_control(
     Ok(ws.on_upgrade(move |socket| control_socket(socket, session)))
 }
 
+/// Sends one frame in the negotiated encoding. Returns Ok(false) when the
+/// frame could not be decoded (skippable), Err when the socket is gone.
+async fn send_frame(
+    socket: &mut WebSocket,
+    frame: &bytes::Bytes,
+    as_json: bool,
+) -> Result<bool, axum::Error> {
+    if as_json {
+        match decode_preview_packet(frame) {
+            Ok(decoded) => {
+                socket
+                    .send(Message::Text(
+                        serde_json::to_string(&decoded)
+                            .unwrap_or_else(|_| "{}".to_string())
+                            .into(),
+                    ))
+                    .await?;
+                Ok(true)
+            }
+            Err(error) => {
+                warn!("failed to decode preview frame for JSON websocket: {error}");
+                Ok(false)
+            }
+        }
+    } else {
+        socket.send(Message::Binary(frame.clone())).await?;
+        Ok(true)
+    }
+}
+
 async fn frame_socket(
     mut socket: WebSocket,
     session: crate::session::SessionHandle,
     as_json: bool,
 ) {
+    // Subscribe before sending the cached frame so a frame published in
+    // between is not lost.
+    let mut receiver = session.subscribe_frames();
     if let Some(frame) = session.latest_frame() {
-        let send_result = if as_json {
-            match decode_preview_packet(&frame) {
-                Ok(decoded) => {
-                    socket
-                        .send(Message::Text(
-                            serde_json::to_string(&decoded)
-                                .unwrap_or_else(|_| "{}".to_string())
-                                .into(),
-                        ))
-                        .await
-                }
-                Err(error) => {
-                    warn!("failed to decode cached frame for JSON websocket: {error}");
-                    Ok(())
-                }
-            }
-        } else {
-            socket.send(Message::Binary(frame.into())).await
-        };
-        if let Err(error) = send_result {
-            warn!("failed to send cached frame to websocket client: {error}");
+        if send_frame(&mut socket, &frame, as_json).await.is_err() {
             return;
         }
     }
 
-    let mut receiver = session.subscribe_frames();
     loop {
-        match receiver.recv().await {
-            Ok(frame) => {
-                let result = if as_json {
-                    match decode_preview_packet(&frame) {
-                        Ok(decoded) => {
-                            socket
-                                .send(Message::Text(
-                                    serde_json::to_string(&decoded)
-                                        .unwrap_or_else(|_| "{}".to_string())
-                                        .into(),
-                                ))
-                                .await
-                        }
-                        Err(error) => {
-                            warn!("failed to decode preview frame for JSON websocket: {error}");
-                            continue;
-                        }
+        tokio::select! {
+            // Drive the read side too: without it, client close frames are
+            // never observed and disconnected viewers leak tasks while the
+            // session is paused (no broadcasts to fail on).
+            inbound = socket.recv() => {
+                match inbound {
+                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        warn!("frame websocket receive failed: {error}");
+                        return;
                     }
-                } else {
-                    socket.send(Message::Binary(frame.into())).await
-                };
-                if let Err(error) = result {
-                    warn!("frame websocket send failed: {error}");
-                    return;
                 }
             }
-            Err(RecvError::Lagged(skipped)) => {
-                warn!("frame websocket lagged by {skipped}; resynchronizing to latest frame");
-                let Some(frame) = session.latest_frame() else {
-                    continue;
-                };
-                let result = if as_json {
-                    match decode_preview_packet(&frame) {
-                        Ok(decoded) => {
-                            socket
-                                .send(Message::Text(
-                                    serde_json::to_string(&decoded)
-                                        .unwrap_or_else(|_| "{}".to_string())
-                                        .into(),
-                                ))
-                                .await
-                        }
-                        Err(error) => {
-                            warn!("failed to decode latest frame while resynchronizing: {error}");
-                            continue;
-                        }
-                    }
-                } else {
-                    socket.send(Message::Binary(frame.into())).await
-                };
-                if let Err(error) = result {
-                    warn!("frame websocket resync send failed: {error}");
-                    return;
-                }
-
-                loop {
-                    match receiver.try_recv() {
-                        Ok(_) => continue,
-                        Err(TryRecvError::Lagged(skipped_more)) => {
-                            warn!(
-                                "frame websocket discarded additional stale backlog after lag: {skipped_more}"
-                            );
-                            continue;
-                        }
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Closed) => {
-                            warn!("frame broadcast channel closed while draining lag backlog");
+            frame = receiver.recv() => {
+                match frame {
+                    Ok(frame) => {
+                        if send_frame(&mut socket, &frame, as_json).await.is_err() {
                             return;
                         }
                     }
+                    Err(RecvError::Lagged(skipped)) => {
+                        warn!("frame websocket lagged by {skipped}; resynchronizing to latest frame");
+                        if let Some(frame) = session.latest_frame() {
+                            if send_frame(&mut socket, &frame, as_json).await.is_err() {
+                                return;
+                            }
+                        }
+                        loop {
+                            match receiver.try_recv() {
+                                Ok(_) => continue,
+                                Err(TryRecvError::Lagged(_)) => continue,
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Closed) => return,
+                            }
+                        }
+                    }
+                    Err(RecvError::Closed) => return,
                 }
-            }
-            Err(RecvError::Closed) => {
-                warn!("frame broadcast channel closed");
-                return;
             }
         }
     }
@@ -352,20 +330,19 @@ async fn control_socket(mut socket: WebSocket, session: crate::session::SessionH
         match message {
             Message::Text(text) => match serde_json::from_str::<ControlCommand>(&text) {
                 Ok(command) => {
-                    if let Err(error) = session.send_command(SessionCommand::Control(command)) {
+                    if let Err(error) = session.send_command(SessionCommand::from(command)) {
                         error!("control websocket command failed: {error}");
-                        let _ = socket
-                            .send(Message::Text(format!("{{\"error\":\"{error}\"}}").into()))
-                            .await;
+                        let body =
+                            serde_json::json!({ "error": error.to_string() }).to_string();
+                        let _ = socket.send(Message::Text(body.into())).await;
                         return;
                     }
                 }
                 Err(error) => {
-                    let _ = socket
-                        .send(Message::Text(
-                            format!("{{\"error\":\"invalid control command: {error}\"}}").into(),
-                        ))
-                        .await;
+                    let body =
+                        serde_json::json!({ "error": format!("invalid control command: {error}") })
+                            .to_string();
+                    let _ = socket.send(Message::Text(body.into())).await;
                 }
             },
             Message::Close(_) => return,
@@ -384,6 +361,15 @@ enum AppError {
 impl From<anyhow::Error> for AppError {
     fn from(value: anyhow::Error) -> Self {
         Self::Internal(value)
+    }
+}
+
+impl From<SessionError> for AppError {
+    fn from(value: SessionError) -> Self {
+        match value {
+            SessionError::NotFound(id) => Self::NotFound(format!("unknown session `{id}`")),
+            SessionError::Failed(error) => Self::Internal(error),
+        }
     }
 }
 

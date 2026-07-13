@@ -13,7 +13,7 @@ pub use init::{
     InitialConditionError, InitialConditions, Particle, ParticleComponent, generate_analytic_galaxy,
     validate_particle_count,
 };
-pub use math::Vec3;
+pub use math::{GRAV_CONST_KPC_KMS2_PER_MSUN, Vec3};
 pub use preset::{MergerPreset, built_in_presets};
 pub use preview::{
     Diagnostics, PreviewFrame, PreviewPacketHeader, PreviewPacketParticle, PreviewParticle,
@@ -97,16 +97,8 @@ mod tests {
 
                 let relative_position = particle.position_kpc - origin;
                 let relative_velocity = particle.velocity_kms - bulk_velocity;
-                let angular_momentum = Vec3::new(
-                    relative_position.y * relative_velocity.z
-                        - relative_position.z * relative_velocity.y,
-                    relative_position.z * relative_velocity.x
-                        - relative_position.x * relative_velocity.z,
-                    relative_position.x * relative_velocity.y
-                        - relative_position.y * relative_velocity.x,
-                ) * particle.mass_msun;
-
-                total_angular_momentum += angular_momentum;
+                total_angular_momentum +=
+                    relative_position.cross(relative_velocity) * particle.mass_msun;
                 disk_particles += 1;
             }
 
@@ -154,15 +146,8 @@ mod tests {
             for particle in &disk_particles {
                 let relative_position = particle.position_kpc - origin;
                 let relative_velocity = particle.velocity_kms - bulk_velocity;
-                let angular_momentum = Vec3::new(
-                    relative_position.y * relative_velocity.z
-                        - relative_position.z * relative_velocity.y,
-                    relative_position.z * relative_velocity.x
-                        - relative_position.x * relative_velocity.z,
-                    relative_position.x * relative_velocity.y
-                        - relative_position.y * relative_velocity.x,
-                ) * particle.mass_msun;
-                total_angular_momentum += angular_momentum;
+                total_angular_momentum +=
+                    relative_position.cross(relative_velocity) * particle.mass_msun;
             }
 
             let disk_normal = total_angular_momentum.normalized();
@@ -219,14 +204,8 @@ mod tests {
             for particle in &disk_particles {
                 let relative_position = particle.position_kpc - origin;
                 let relative_velocity = particle.velocity_kms - bulk_velocity;
-                total_angular_momentum += Vec3::new(
-                    relative_position.y * relative_velocity.z
-                        - relative_position.z * relative_velocity.y,
-                    relative_position.z * relative_velocity.x
-                        - relative_position.x * relative_velocity.z,
-                    relative_position.x * relative_velocity.y
-                        - relative_position.y * relative_velocity.x,
-                ) * particle.mass_msun;
+                total_angular_momentum +=
+                    relative_position.cross(relative_velocity) * particle.mass_msun;
             }
             let disk_normal = total_angular_momentum.normalized();
 

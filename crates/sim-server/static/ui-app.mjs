@@ -56,6 +56,17 @@ export function createUiApp({
     return Math.min(max, Math.max(min, value));
   }
 
+  // Frames from the binary decoder always carry `component`; synthetic frames
+  // (tests, tools) may omit it. Default to disk so such particles render.
+  function componentOf(particle) {
+    return particle.component ?? 1;
+  }
+
+  function isLuminous(particle) {
+    const component = componentOf(particle);
+    return component !== 0 && component !== 3;
+  }
+
   function normalize3([x, y, z]) {
     const length = Math.hypot(x, y, z);
     if (length <= Number.EPSILON) {
@@ -76,9 +87,7 @@ export function createUiApp({
     if (!camera.autoFrame && !force) {
       return;
     }
-    const luminousParticles = frame.particles.filter(
-      (particle) => particle.component !== 0 && particle.component !== 3
-    );
+    const luminousParticles = frame.particles.filter(isLuminous);
     const particles = luminousParticles.length ? luminousParticles : frame.particles;
 
     if (!particles.length) {
@@ -184,7 +193,7 @@ export function createUiApp({
   }
 
   function stellarBaseColor(particle) {
-    const component = particle.component ?? 1;
+    const component = componentOf(particle);
     const massMsun = Math.max(1, particle.mass_msun ?? 1);
     const massBias = clamp((Math.log10(massMsun) - 4.2) / 1.6, 0, 1);
     if (component === 3 || component === 0) {
@@ -242,155 +251,10 @@ export function createUiApp({
     };
   }
 
-  function buildHaloField(width, height, haloPoints) {
-    const gridWidth = Math.max(48, Math.floor(width / 10));
-    const gridHeight = Math.max(27, Math.floor(height / 10));
-    const density = new Float32Array(gridWidth * gridHeight);
-    let maxDensity = 0;
-
-    function accumulate(ix, iy, weight) {
-      if (ix < 0 || iy < 0 || ix >= gridWidth || iy >= gridHeight || weight <= 0) {
-        return;
-      }
-      const slot = iy * gridWidth + ix;
-      density[slot] += weight;
-      maxDensity = Math.max(maxDensity, density[slot]);
-    }
-
-    for (const point of haloPoints) {
-      const gx = clamp((point.x / width) * gridWidth, 0, gridWidth - 1.0001);
-      const gy = clamp((point.y / height) * gridHeight, 0, gridHeight - 1.0001);
-      const ix = Math.floor(gx);
-      const iy = Math.floor(gy);
-      const tx = gx - ix;
-      const ty = gy - iy;
-      const massWeight = clamp(Math.log10(Math.max(1, point.particle.mass_msun)) / 6.5, 0.18, 1.0);
-      const perspectiveWeight = Math.pow(Math.max(0.08, point.perspective), 0.85);
-      const weight = massWeight * perspectiveWeight;
-      accumulate(ix, iy, weight * (1 - tx) * (1 - ty));
-      accumulate(ix + 1, iy, weight * tx * (1 - ty));
-      accumulate(ix, iy + 1, weight * (1 - tx) * ty);
-      accumulate(ix + 1, iy + 1, weight * tx * ty);
-    }
-
-    return {
-      density,
-      gridWidth,
-      gridHeight,
-      cellWidth: width / gridWidth,
-      cellHeight: height / gridHeight,
-      maxDensity,
-    };
-  }
-
-  function drawHaloContours(field) {
-    if (field.maxDensity <= 0) {
-      return;
-    }
-
-    const thresholds = [
-      { level: 0.16, color: "rgba(110, 170, 255, 0.12)", width: 0.8 },
-      { level: 0.32, color: "rgba(130, 205, 255, 0.18)", width: 0.95 },
-      { level: 0.54, color: "rgba(185, 235, 255, 0.26)", width: 1.05 },
-    ];
-
-    function edgePoint(x0, y0, v0, x1, y1, v1, threshold) {
-      const dv = v1 - v0;
-      if (Math.abs(dv) <= 1.0e-8) {
-        return null;
-      }
-      const t = (threshold - v0) / dv;
-      if (t < 0 || t > 1) {
-        return null;
-      }
-      return [x0 + (x1 - x0) * t, y0 + (y1 - y0) * t];
-    }
-
-    for (const threshold of thresholds) {
-      context.save?.();
-      context.strokeStyle = threshold.color;
-      context.lineWidth = threshold.width;
-      for (let y = 0; y < field.gridHeight - 1; y += 1) {
-        for (let x = 0; x < field.gridWidth - 1; x += 1) {
-          const v00 = field.density[y * field.gridWidth + x] / field.maxDensity;
-          const v10 = field.density[y * field.gridWidth + x + 1] / field.maxDensity;
-          const v01 = field.density[(y + 1) * field.gridWidth + x] / field.maxDensity;
-          const v11 = field.density[(y + 1) * field.gridWidth + x + 1] / field.maxDensity;
-          const minValue = Math.min(v00, v10, v01, v11);
-          const maxValue = Math.max(v00, v10, v01, v11);
-          if (minValue > threshold.level || maxValue < threshold.level) {
-            continue;
-          }
-
-          const x0 = x * field.cellWidth;
-          const x1 = (x + 1) * field.cellWidth;
-          const y0 = y * field.cellHeight;
-          const y1 = (y + 1) * field.cellHeight;
-          const points = [];
-          const top = edgePoint(x0, y0, v00, x1, y0, v10, threshold.level);
-          const right = edgePoint(x1, y0, v10, x1, y1, v11, threshold.level);
-          const bottom = edgePoint(x1, y1, v11, x0, y1, v01, threshold.level);
-          const left = edgePoint(x0, y1, v01, x0, y0, v00, threshold.level);
-          if (top) points.push(top);
-          if (right) points.push(right);
-          if (bottom) points.push(bottom);
-          if (left) points.push(left);
-          if (points.length < 2) {
-            continue;
-          }
-          context.beginPath();
-          context.moveTo(points[0][0], points[0][1]);
-          context.lineTo(points[1][0], points[1][1]);
-          context.stroke();
-          if (points.length === 4) {
-            context.beginPath();
-            context.moveTo(points[2][0], points[2][1]);
-            context.lineTo(points[3][0], points[3][1]);
-            context.stroke();
-          }
-        }
-      }
-      context.restore?.();
-    }
-  }
-
-  function drawHaloFogAndContours(width, height, haloPoints) {
-    if (!haloPoints.length) {
-      return;
-    }
-    const field = buildHaloField(width, height, haloPoints);
-    if (!(field.maxDensity > 0)) {
-      return;
-    }
-
-    context.save?.();
-    for (let y = 0; y < field.gridHeight; y += 1) {
-      for (let x = 0; x < field.gridWidth; x += 1) {
-        const density = field.density[y * field.gridWidth + x] / field.maxDensity;
-        if (density < 0.03) {
-          continue;
-        }
-        const fog = Math.pow(density, 0.62);
-        const alpha = clamp(0.015 + 0.11 * fog, 0.0, 0.12);
-        const red = Math.floor(36 + 28 * fog);
-        const green = Math.floor(88 + 72 * fog);
-        const blue = Math.floor(132 + 108 * fog);
-        context.fillStyle = `rgba(${red}, ${green}, ${blue}, ${alpha})`;
-        context.fillRect(
-          x * field.cellWidth,
-          y * field.cellHeight,
-          field.cellWidth + 0.7,
-          field.cellHeight + 0.7
-        );
-      }
-    }
-    context.restore?.();
-    drawHaloContours(field);
-  }
-
   let activeSessionId = null;
   let frameSocket = null;
   let sessionPoll = null;
+  let attachGeneration = 0;
 
   function preferredPreviewBudget() {
     const params = new URLSearchParams(window.location.search);
@@ -450,12 +314,61 @@ export function createUiApp({
 
   function startSessionPolling(sessionId) {
     stopSessionPolling();
+    let consecutiveFailures = 0;
     sessionPoll = setIntervalImpl(() => {
-      refreshSessionSummary(sessionId).catch((error) => {
-        nodes.viewerStatus.textContent = error.message;
-      });
+      refreshSessionSummary(sessionId)
+        .then(() => {
+          consecutiveFailures = 0;
+        })
+        .catch((error) => {
+          consecutiveFailures += 1;
+          nodes.viewerStatus.textContent = error.message;
+          // A vanished session (or persistent failure) should not be polled
+          // forever at 4 requests per second.
+          if (
+            consecutiveFailures >= 20 ||
+            String(error.message).includes("unknown session")
+          ) {
+            stopSessionPolling();
+          }
+        });
     }, 250);
     return sessionPoll;
+  }
+
+  // Pre-rendered radial sprites per quantized color: one drawImage per splat
+  // instead of two path+fill calls, roughly an order of magnitude faster at
+  // full preview budgets.
+  const spriteCache = new Map();
+  const SPRITE_SIZE = 32;
+
+  function particleSprite(r, g, b) {
+    const key = (r << 16) | (g << 8) | b;
+    let sprite = spriteCache.get(key);
+    if (sprite !== undefined) {
+      return sprite;
+    }
+    sprite = null;
+    try {
+      const surface = document.createElement("canvas");
+      surface.width = SPRITE_SIZE;
+      surface.height = SPRITE_SIZE;
+      const surfaceContext = surface.getContext("2d");
+      if (surfaceContext?.createRadialGradient) {
+        const half = SPRITE_SIZE / 2;
+        const gradient = surfaceContext.createRadialGradient(half, half, 0, half, half, half);
+        gradient.addColorStop(0, `rgba(${r}, ${g}, ${b}, 1)`);
+        gradient.addColorStop(0.55, `rgba(${r}, ${g}, ${b}, 0.45)`);
+        gradient.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
+        surfaceContext.fillStyle = gradient;
+        surfaceContext.fillRect(0, 0, SPRITE_SIZE, SPRITE_SIZE);
+        sprite = surface;
+      }
+    } catch {
+      sprite = null;
+    }
+    spriteCache.set(key, sprite);
+    return sprite;
   }
 
   function drawFrameInternal(frameA, frameB = null, alpha = 1) {
@@ -465,10 +378,9 @@ export function createUiApp({
     const height = nodes.canvas.height;
     context.clearRect(0, 0, width, height);
 
-    const gradient = context.createLinearGradient(0, 0, width, height);
-    gradient.addColorStop(0, "rgba(76, 201, 240, 0.06)");
-    gradient.addColorStop(1, "rgba(242, 193, 75, 0.06)");
-    context.fillStyle = gradient;
+    // Match the WASM viewer's deep-space backdrop so switching renderers is
+    // not visually jarring.
+    context.fillStyle = "#020810";
     context.fillRect(0, 0, width, height);
 
     const stellarProjected = [];
@@ -478,13 +390,15 @@ export function createUiApp({
     for (let index = 0; index < count; index += 1) {
       const particle = frameA.particles[index];
       const targetParticle = frameB ? frameB.particles[index] : particle;
+      if (!isLuminous(targetParticle)) {
+        continue;
+      }
       const point = frameB
         ? projectInterpolatedParticle(particle, targetParticle, alpha, width, height)
         : projectParticle(particle, width, height);
       if (!point) {
         continue;
       }
-      if ((point.particle.component ?? 0) === 0) continue;
       const style = stellarRenderStyle(point);
       if (style) {
         stellarProjected.push(style);
@@ -494,22 +408,43 @@ export function createUiApp({
     stellarProjected.sort((left, right) => right.depth - left.depth);
     context.globalCompositeOperation = "lighter";
 
+    const canDrawSprites = typeof context.drawImage === "function";
     for (const point of stellarProjected) {
       const [r, g, b] = point.color;
-      context.fillStyle = `rgba(${Math.floor(
-        r * 255
-      )}, ${Math.floor(g * 255)}, ${Math.floor(b * 255)}, ${point.glowAlpha})`;
+      // Quantize to 16 levels per channel so the sprite cache stays small.
+      const red = Math.floor(r * 15) * 17;
+      const green = Math.floor(g * 15) * 17;
+      const blue = Math.floor(b * 15) * 17;
+      const sprite = canDrawSprites ? particleSprite(red, green, blue) : null;
+      if (sprite) {
+        context.globalAlpha = clamp(point.glowAlpha * 2.2, 0, 1);
+        context.drawImage(
+          sprite,
+          point.x - point.glowRadius,
+          point.y - point.glowRadius,
+          point.glowRadius * 2,
+          point.glowRadius * 2
+        );
+        context.globalAlpha = clamp(point.coreAlpha, 0, 1);
+        context.drawImage(
+          sprite,
+          point.x - point.coreRadius,
+          point.y - point.coreRadius,
+          point.coreRadius * 2,
+          point.coreRadius * 2
+        );
+        continue;
+      }
+      context.fillStyle = `rgba(${red}, ${green}, ${blue}, ${point.glowAlpha})`;
       context.beginPath();
       context.arc(point.x, point.y, point.glowRadius, 0, Math.PI * 2);
       context.fill();
-
-      context.fillStyle = `rgba(${Math.floor(r * 255)}, ${Math.floor(
-        g * 255
-      )}, ${Math.floor(b * 255)}, ${point.coreAlpha})`;
+      context.fillStyle = `rgba(${red}, ${green}, ${blue}, ${point.coreAlpha})`;
       context.beginPath();
       context.arc(point.x, point.y, point.coreRadius, 0, Math.PI * 2);
       context.fill();
     }
+    context.globalAlpha = 1;
     context.globalCompositeOperation = "source-over";
     if (camera.dragging) {
       drawXyPlaneGrid(width, height);
@@ -523,7 +458,7 @@ export function createUiApp({
   }
 
   function projectInterpolatedParticle(particleA, particleB, alpha, width, height) {
-    if ((particleA.component ?? 0) !== (particleB.component ?? 0)) {
+    if (componentOf(particleA) !== componentOf(particleB)) {
       return projectParticle(particleB, width, height);
     }
     const position = [
@@ -578,7 +513,12 @@ export function createUiApp({
     }
     updateSceneBounds(frame);
     camera.lastFrame = frame;
-    if (renderState.targetFrame) {
+    // Interpolation pairs particles by index, which only holds while the
+    // preview budget is unchanged between frames.
+    if (
+      renderState.targetFrame &&
+      renderState.targetFrame.particles.length === frame.particles.length
+    ) {
       renderState.previousFrame = renderState.targetFrame;
     } else {
       renderState.previousFrame = frame;
@@ -700,9 +640,47 @@ export function createUiApp({
     }
   }
 
-  function zoomAt(_clientX, _clientY, nextDistanceScale) {
+  function cssToBufferScale() {
+    const rect = nodes.canvas.getBoundingClientRect?.();
+    if (rect && rect.width > 0) {
+      return nodes.canvas.width / rect.width;
+    }
+    return 1;
+  }
+
+  function zoomAt(clientX, clientY, nextDistanceScale) {
     camera.autoFrame = false;
+    const previousScale = camera.distanceScale;
     camera.distanceScale = clamp(nextDistanceScale, 0.003, 20);
+
+    // Slide the focus toward the world point under the cursor so it stays
+    // roughly fixed on screen while zooming.
+    const rect = nodes.canvas.getBoundingClientRect?.();
+    if (rect && rect.width > 0 && rect.height > 0 && previousScale > 0) {
+      const bufferScale = cssToBufferScale();
+      const cursorX = (clientX - rect.left) * bufferScale;
+      const cursorY = (clientY - rect.top) * bufferScale;
+      const width = nodes.canvas.width;
+      const height = nodes.canvas.height;
+      const fov = Math.PI / 4;
+      const { distance, cameraPosition, forward, right, up } = getCameraBasis();
+      const focalLength = (Math.min(width, height) * 0.5) / Math.tan(fov * 0.5);
+      const rightAmount = (cursorX - width * 0.5) / focalLength;
+      const upAmount = -(cursorY - height * 0.5) / focalLength;
+      const direction = normalize3([
+        forward[0] + right[0] * rightAmount + up[0] * upAmount,
+        forward[1] + right[1] * rightAmount + up[1] * upAmount,
+        forward[2] + right[2] * rightAmount + up[2] * upAmount,
+      ]);
+      const along = dot3(direction, forward);
+      if (along > 1e-6) {
+        const range = distance / along;
+        const pull = 1 - camera.distanceScale / previousScale;
+        camera.focusX += (cameraPosition[0] + direction[0] * range - camera.focusX) * pull;
+        camera.focusY += (cameraPosition[1] + direction[1] * range - camera.focusY) * pull;
+        camera.focusZ += (cameraPosition[2] + direction[2] * range - camera.focusZ) * pull;
+      }
+    }
     redrawFrame();
   }
 
@@ -724,8 +702,9 @@ export function createUiApp({
       if (!camera.dragging) {
         return;
       }
-      const dx = event.clientX - camera.lastX;
-      const dy = event.clientY - camera.lastY;
+      const bufferScale = cssToBufferScale();
+      const dx = (event.clientX - camera.lastX) * bufferScale;
+      const dy = (event.clientY - camera.lastY) * bufferScale;
       if (camera.dragMode === "pan") {
         const { distance, right, up } = getCameraBasis();
         const fov = Math.PI / 4;
@@ -768,34 +747,56 @@ export function createUiApp({
     });
   }
 
-  function openFrameSocket(sessionId) {
-    stopSessionPolling();
+  function openFrameSocket(sessionId, attempt = 0) {
     closeFrameSocket();
+    // The JSON stream carries preview data only; keep polling the session
+    // summary so State/Particles stay live in this mode too.
+    startSessionPolling(sessionId);
 
     const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-    frameSocket = new WebSocketImpl(
+    const socket = new WebSocketImpl(
       `${scheme}://${window.location.host}/ws/frames/${sessionId}?format=json`
     );
-    frameSocket.onopen = () => {
+    frameSocket = socket;
+    socket.onopen = () => {
+      attempt = 0;
       nodes.viewerStatus.textContent = "Streaming JSON preview frames.";
     };
-    frameSocket.onclose = () => {
-      nodes.viewerStatus.textContent = "Preview stream closed.";
+    socket.onclose = () => {
+      if (frameSocket !== socket || activeSessionId !== sessionId) {
+        return;
+      }
+      // Transient drops should not permanently kill the preview: reconnect
+      // with capped exponential backoff while the session is still active.
+      const delayMs = Math.min(8000, 500 * 2 ** Math.min(attempt, 4));
+      nodes.viewerStatus.textContent = `Preview stream closed; reconnecting in ${(delayMs / 1000).toFixed(1)}s...`;
+      globalThis.setTimeout(() => {
+        if (frameSocket === socket && activeSessionId === sessionId) {
+          openFrameSocket(sessionId, attempt + 1);
+        }
+      }, delayMs);
     };
-    frameSocket.onmessage = (event) => {
+    socket.onerror = () => {};
+    socket.onmessage = (event) => {
       const frame = JSON.parse(event.data);
       queueFrame(frame);
       nodes.previewCount.textContent =
         frame.diagnostics.preview_count.toLocaleString();
       nodes.simTime.textContent = `${frame.sim_time_myr.toFixed(2)} Myr`;
     };
-    return frameSocket;
+    return socket;
   }
 
   async function attachToSession(session) {
+    // A second Launch while the WASM boot below is still awaiting must win;
+    // the stale attach would otherwise clobber the new session's socket.
+    const generation = ++attachGeneration;
     updateSessionStats(session);
     closeFrameSocket();
     const usingRustViewer = await tryBootRustViewer(session.id);
+    if (generation !== attachGeneration) {
+      return session;
+    }
     if (usingRustViewer) {
       startSessionPolling(session.id);
       nodes.viewerStatus.textContent =
@@ -911,15 +912,39 @@ export function createUiApp({
         nodes.viewerStatus.textContent = error.message;
       });
     });
-    nodes.pause.addEventListener("click", () => control("pause"));
-    nodes.resume.addEventListener("click", () => control("resume"));
-    nodes.stop.addEventListener("click", () => control("stop"));
-    nodes.snapshot.addEventListener("click", () => control("snapshot"));
-    nodes.step.addEventListener("click", () => control("step", { substeps: 1 }));
+    const reportControlError = (error) => {
+      nodes.viewerStatus.textContent = error.message;
+    };
+    nodes.pause.addEventListener("click", () => control("pause").catch(reportControlError));
+    nodes.resume.addEventListener("click", () => control("resume").catch(reportControlError));
+    nodes.stop.addEventListener("click", () => control("stop").catch(reportControlError));
+    nodes.snapshot.addEventListener("click", () =>
+      control("snapshot").catch(reportControlError)
+    );
+    nodes.step.addEventListener("click", () =>
+      control("step", { substeps: 1 }).catch(reportControlError)
+    );
+  }
+
+  function resizeCanvasToDisplay() {
+    const rect = nodes.canvas.getBoundingClientRect?.();
+    if (!rect || rect.width <= 0 || rect.height <= 0) {
+      return;
+    }
+    const pixelRatio = Math.min(2, window.devicePixelRatio ?? 1);
+    const width = Math.round(rect.width * pixelRatio);
+    const height = Math.round(rect.height * pixelRatio);
+    if (nodes.canvas.width !== width || nodes.canvas.height !== height) {
+      nodes.canvas.width = width;
+      nodes.canvas.height = height;
+      redrawFrame();
+    }
   }
 
   async function boot() {
     bindControls();
+    resizeCanvasToDisplay();
+    window.addEventListener?.("resize", resizeCanvasToDisplay);
     try {
       await loadPresets();
       await restoreLatestSession();

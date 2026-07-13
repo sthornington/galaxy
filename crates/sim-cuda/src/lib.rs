@@ -1,4 +1,7 @@
-use std::{ffi::c_void, mem::MaybeUninit};
+use std::{
+    ffi::{CStr, c_char, c_void},
+    mem::MaybeUninit,
+};
 
 use anyhow::{Context, anyhow};
 use sim_core::{
@@ -20,18 +23,15 @@ struct FfiParticle {
 
 type FfiPreviewParticle = PreviewPacketParticle;
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct FfiGalaxy {
-    halo_mass_msun: f64,
-    halo_scale_radius_kpc: f64,
-    disk_mass_msun: f64,
-    disk_scale_radius_kpc: f64,
-    disk_scale_height_kpc: f64,
-    bulge_mass_msun: f64,
-    bulge_scale_radius_kpc: f64,
-    disk_rotation: [f64; 9],
-}
+// The FFI structs mirror native/include/sim_cuda.h by hand; keep their layout
+// pinned so a drifting field ordering fails the build instead of corrupting
+// device memory.
+const _: () = {
+    assert!(std::mem::size_of::<FfiParticle>() == 88);
+    assert!(std::mem::size_of::<FfiPreviewParticle>() == 32);
+    assert!(std::mem::size_of::<FfiDiagnostics>() == 72);
+    assert!(std::mem::size_of::<FfiCreateParams>() == 72);
+};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -62,9 +62,8 @@ unsafe extern "C" {
     fn sim_cuda_create(
         params: *const FfiCreateParams,
         particles: *const FfiParticle,
-        galaxies: *const FfiGalaxy,
         out_handle: *mut *mut c_void,
-        error_buffer: *mut i8,
+        error_buffer: *mut c_char,
         error_buffer_len: usize,
     ) -> i32;
     fn sim_cuda_destroy(handle: *mut c_void) -> i32;
@@ -72,14 +71,14 @@ unsafe extern "C" {
         handle: *mut c_void,
         requested_substeps: u32,
         diagnostics: *mut FfiDiagnostics,
-        error_buffer: *mut i8,
+        error_buffer: *mut c_char,
         error_buffer_len: usize,
     ) -> i32;
     fn sim_cuda_advance(
         handle: *mut c_void,
         steps: u32,
         diagnostics: *mut FfiDiagnostics,
-        error_buffer: *mut i8,
+        error_buffer: *mut c_char,
         error_buffer_len: usize,
     ) -> i32;
     fn sim_cuda_fill_preview(
@@ -87,14 +86,14 @@ unsafe extern "C" {
         max_particles: u32,
         out_particles: *mut FfiPreviewParticle,
         out_count: *mut u32,
-        error_buffer: *mut i8,
+        error_buffer: *mut c_char,
         error_buffer_len: usize,
     ) -> i32;
     fn sim_cuda_request_preview(
         handle: *mut c_void,
         max_particles: u32,
         out_count: *mut u32,
-        error_buffer: *mut i8,
+        error_buffer: *mut c_char,
         error_buffer_len: usize,
     ) -> i32;
     fn sim_cuda_collect_preview(
@@ -103,14 +102,14 @@ unsafe extern "C" {
         particle_capacity: u32,
         out_count: *mut u32,
         out_ready: *mut i32,
-        error_buffer: *mut i8,
+        error_buffer: *mut c_char,
         error_buffer_len: usize,
     ) -> i32;
     fn sim_cuda_copy_particles(
         handle: *mut c_void,
         out_particles: *mut FfiParticle,
         particle_capacity: u64,
-        error_buffer: *mut i8,
+        error_buffer: *mut c_char,
         error_buffer_len: usize,
     ) -> i32;
 }
@@ -124,6 +123,9 @@ pub struct GpuBackend {
     pending_preview_diagnostics: Option<Diagnostics>,
 }
 
+// SAFETY: the CUDA runtime API is thread-safe and all device state behind
+// `handle` is only touched through `&mut self` methods, so moving the backend
+// to another thread cannot race.
 unsafe impl Send for GpuBackend {}
 
 impl GpuBackend {
@@ -149,19 +151,12 @@ impl GpuBackend {
             .iter()
             .map(ffi_particle_from_particle)
             .collect();
-        let ffi_galaxies: Vec<FfiGalaxy> = config
-            .galaxies
-            .iter()
-            .map(ffi_galaxy_from_config)
-            .collect();
-
         let mut handle = std::ptr::null_mut();
-        let mut error_buffer = [0_i8; 512];
+        let mut error_buffer = [0 as c_char; 512];
         let code = unsafe {
             sim_cuda_create(
                 &params,
                 ffi_particles.as_ptr(),
-                ffi_galaxies.as_ptr(),
                 &mut handle,
                 error_buffer.as_mut_ptr(),
                 error_buffer.len(),
@@ -187,7 +182,7 @@ impl GpuBackend {
 
     pub fn step(&mut self, requested_substeps: u32) -> anyhow::Result<Diagnostics> {
         let mut ffi = MaybeUninit::<FfiDiagnostics>::uninit();
-        let mut error_buffer = [0_i8; 512];
+        let mut error_buffer = [0 as c_char; 512];
         let code = unsafe {
             sim_cuda_step(
                 self.handle,
@@ -208,7 +203,7 @@ impl GpuBackend {
 
     pub fn advance(&mut self, steps: u32) -> anyhow::Result<Diagnostics> {
         let mut ffi = MaybeUninit::<FfiDiagnostics>::uninit();
-        let mut error_buffer = [0_i8; 512];
+        let mut error_buffer = [0 as c_char; 512];
         let code = unsafe {
             sim_cuda_advance(
                 self.handle,
@@ -240,7 +235,7 @@ impl GpuBackend {
             },
         );
         let mut out_count = 0_u32;
-        let mut error_buffer = [0_i8; 512];
+        let mut error_buffer = [0 as c_char; 512];
         let code = unsafe {
             sim_cuda_fill_preview(
                 self.handle,
@@ -271,7 +266,7 @@ impl GpuBackend {
         );
 
         let mut out_count = 0_u32;
-        let mut error_buffer = [0_i8; 512];
+        let mut error_buffer = [0 as c_char; 512];
         let code = unsafe {
             sim_cuda_request_preview(
                 self.handle,
@@ -290,7 +285,14 @@ impl GpuBackend {
             preview_count: out_count,
             ..self.last_diagnostics.clone()
         };
-        self.pending_preview_diagnostics = Some(diagnostics.clone());
+        // When the native side schedules nothing (empty budget or no visible
+        // particles) there is no in-flight capture to collect; leaving a
+        // pending marker would make try_collect return Ok(None) forever.
+        self.pending_preview_diagnostics = if out_count > 0 {
+            Some(diagnostics.clone())
+        } else {
+            None
+        };
         Ok(diagnostics)
     }
 
@@ -304,7 +306,7 @@ impl GpuBackend {
         let capacity = self.preview_scratch.len() as u32;
         let mut out_count = 0_u32;
         let mut ready = 0_i32;
-        let mut error_buffer = [0_i8; 512];
+        let mut error_buffer = [0 as c_char; 512];
         let code = unsafe {
             sim_cuda_collect_preview(
                 self.handle,
@@ -334,7 +336,9 @@ impl GpuBackend {
             &self.preview_scratch[..out_count as usize],
         );
         self.pending_preview_diagnostics = None;
-        Ok(Some((self.preview_packet_scratch.clone(), diagnostics)))
+        // Hand the encoded packet to the caller instead of cloning it; the
+        // scratch buffer re-reserves on the next encode either way.
+        Ok(Some((std::mem::take(&mut self.preview_packet_scratch), diagnostics)))
     }
 
     pub fn preview_packet_bytes(&mut self, budget: u32) -> anyhow::Result<(Vec<u8>, Diagnostics)> {
@@ -348,7 +352,7 @@ impl GpuBackend {
             &diagnostics,
             &self.preview_scratch[..out_count as usize],
         );
-        Ok((self.preview_packet_scratch.clone(), diagnostics))
+        Ok((std::mem::take(&mut self.preview_packet_scratch), diagnostics))
     }
 
     pub fn preview_frame(&mut self, budget: u32) -> anyhow::Result<PreviewFrame> {
@@ -365,10 +369,7 @@ impl GpuBackend {
                     position_kpc: particle.position_kpc,
                     velocity_kms: particle.velocity_kms,
                     mass_msun: particle.mass_msun,
-                    galaxy_index: 0,
                     component: particle.component,
-                    color_rgba: [0.0, 0.0, 0.0, 1.0],
-                    intensity: 1.0,
                 })
                 .collect(),
         })
@@ -387,7 +388,7 @@ impl GpuBackend {
             };
             self.particle_count as usize
         ];
-        let mut error_buffer = [0_i8; 512];
+        let mut error_buffer = [0 as c_char; 512];
         let code = unsafe {
             sim_cuda_copy_particles(
                 self.handle,
@@ -439,43 +440,6 @@ fn ffi_particle_from_particle(particle: &Particle) -> FfiParticle {
     }
 }
 
-fn ffi_galaxy_from_config(galaxy: &sim_core::GalaxyConfig) -> FfiGalaxy {
-    let rotation = rotation_from_euler_deg(galaxy.disk_tilt_deg);
-    FfiGalaxy {
-        halo_mass_msun: galaxy.halo_mass_msun,
-        halo_scale_radius_kpc: galaxy.halo_scale_radius_kpc,
-        disk_mass_msun: galaxy.disk_mass_msun,
-        disk_scale_radius_kpc: galaxy.disk_scale_radius_kpc,
-        disk_scale_height_kpc: galaxy.disk_scale_height_kpc,
-        bulge_mass_msun: galaxy.bulge_mass_msun,
-        bulge_scale_radius_kpc: galaxy.bulge_scale_radius_kpc,
-        disk_rotation: [
-            rotation[0][0],
-            rotation[0][1],
-            rotation[0][2],
-            rotation[1][0],
-            rotation[1][1],
-            rotation[1][2],
-            rotation[2][0],
-            rotation[2][1],
-            rotation[2][2],
-        ],
-    }
-}
-
-fn rotation_from_euler_deg(angles_deg: [f64; 3]) -> [[f64; 3]; 3] {
-    let [ax, ay, az] = angles_deg.map(f64::to_radians);
-    let (sx, cx) = ax.sin_cos();
-    let (sy, cy) = ay.sin_cos();
-    let (sz, cz) = az.sin_cos();
-
-    [
-        [cy * cz, cz * sx * sy - cx * sz, sx * sz + cx * cz * sy],
-        [cy * sz, cx * cz + sx * sy * sz, cx * sy * sz - cz * sx],
-        [-sy, cy * sx, cx * cy],
-    ]
-}
-
 fn diagnostics_from_ffi(ffi: FfiDiagnostics) -> Diagnostics {
     Diagnostics {
         particle_count: ffi.particle_count,
@@ -518,14 +482,13 @@ fn particle_from_ffi(particle: FfiParticle) -> Particle {
     }
 }
 
-fn decode_error(bytes: &[i8]) -> String {
-    let bytes: Vec<u8> = bytes
-        .iter()
-        .copied()
-        .take_while(|byte| *byte != 0)
-        .map(|byte| byte as u8)
-        .collect();
-    String::from_utf8_lossy(&bytes).trim().to_string()
+fn decode_error(bytes: &[c_char]) -> String {
+    // The native side always NUL-terminates via snprintf; fall back to the
+    // whole buffer if it somehow did not.
+    let bytes: Vec<u8> = bytes.iter().map(|byte| *byte as u8).collect();
+    CStr::from_bytes_until_nul(&bytes)
+        .map(|message| message.to_string_lossy().trim().to_string())
+        .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).trim().to_string())
 }
 
 #[cfg(test)]
@@ -976,13 +939,11 @@ mod tests {
             },
             preview: PreviewConfig {
                 particle_budget: 16,
-                density_grid: [64, 64],
                 target_fps: 60,
             },
             snapshots: SnapshotConfig {
                 directory: format!("/tmp/galaxy-self-gravity-{}", Uuid::new_v4()),
                 cadence_steps: 120,
-                compress: false,
             },
             integration: TimeIntegrationConfig {
                 base_timestep_myr: 0.05,

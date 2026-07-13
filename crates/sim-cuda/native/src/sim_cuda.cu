@@ -16,6 +16,7 @@
 #include <thrust/device_ptr.h>
 #include <thrust/system/cuda/execution_policy.h>
 #include <thrust/extrema.h>
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/sort.h>
 #include <thrust/transform_reduce.h>
@@ -24,57 +25,27 @@ namespace {
 
 constexpr double kKpcPerKmPerMyr = 0.001022712165045695;
 constexpr double kSpeedOfLightKms = 299792.458;
-constexpr double kFourPi = 12.566370614359172;
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kSqrtPi = 1.77245385090551602729;
-constexpr double kGlobalDomainPadding = 4.0;
+// The global PM mesh solves with a free-space (isolated) Green's function, so
+// the box only needs to comfortably exceed twice the particle extent per axis
+// for the circular convolution to be exact for every in-extent pair.
+constexpr double kGlobalDomainPadding = 2.15;
 constexpr double kShortRangeDomainPadding = 1.15;
 constexpr double kMinGlobalBoxLengthKpc = 64.0;
 constexpr double kMinShortRangeBoxLengthKpc = 8.0;
 constexpr double kMinShortRangeCellSizeKpc = 0.35;
 constexpr double kMaxShortRangeCellSizeKpc = 3.0;
-constexpr double kShortRangeTargetOccupancy = 8.0;
 constexpr std::uint32_t kShortRangeForceFactorLutSize = 4096;
 constexpr std::size_t kMaxShortRangeCells = 4u * 1024u * 1024u;
 constexpr int kMaxShortRangeAxisCells = 1024;
-constexpr int kShortRangeDirectCellThreshold = 192;
 constexpr int kShortRangeDirectNeighborhoodThresholdLowN = 768;
 constexpr int kShortRangeDirectNeighborhoodThresholdDefault = 256;
-// Shipped presets should all exercise the same solver path.
-// The host-built particle tree remains available as an opt-in diagnostic path via
-// SIM_CUDA_PARTICLE_TREE_THRESHOLD, but the default runtime stays on the large-run cell tree.
-constexpr std::uint32_t kDefaultParticleTreeThreshold = 0;
-constexpr int kLocalFineNx = 128;
-constexpr int kLocalFineNy = 128;
-constexpr int kLocalFineNz = 64;
-constexpr int kLocalCoarseNx = 32;
-constexpr int kLocalCoarseNy = 32;
-constexpr int kLocalCoarseNz = 16;
-constexpr double kLocalCorrectionBlendExtent = 0.78;
-constexpr int kMaxRefinementPatches = 8;
-constexpr int kMaxDensityTreeDepth = 5;
-constexpr int kMinRefineCellsXY = 8;
-constexpr int kMinRefineCellsZ = 4;
-constexpr double kRefineSplitDensityRatio = 0.12;
-constexpr double kRefineLeafDensityRatio = 0.045;
-constexpr double kRefineMinMassFraction = 2.0e-4;
-
-std::uint32_t particle_tree_threshold() {
-  static const std::uint32_t threshold = []() {
-    const char* raw_value = std::getenv("SIM_CUDA_PARTICLE_TREE_THRESHOLD");
-    if (raw_value == nullptr || raw_value[0] == '\0') {
-      return kDefaultParticleTreeThreshold;
-    }
-    char* end = nullptr;
-    const unsigned long long parsed = std::strtoull(raw_value, &end, 10);
-    if (end == raw_value || (end != nullptr && *end != '\0')) {
-      return kDefaultParticleTreeThreshold;
-    }
-    return static_cast<std::uint32_t>(
-        std::min<unsigned long long>(parsed, std::numeric_limits<std::uint32_t>::max()));
-  }();
-  return threshold;
-}
+// Coarsened mass/COM pyramid over the short-range grid. Level 0 is the fine
+// grid itself; each level halves the resolution until the top level is at most
+// 3 cells per axis so the per-particle interaction-list walk covers the whole
+// grid without any radius truncation.
+constexpr int kMaxPyramidLevels = 12;
 
 bool short_range_baryons_only() {
   static const bool enabled = []() {
@@ -114,20 +85,16 @@ double short_range_target_occupancy(const std::uint64_t particle_count) {
   if (override > 0.0) {
     return override;
   }
-  // Dense low-particle collapses are especially sensitive to close-force
-  // quantization. Keep the low-N grid noticeably finer so more local
-  // interactions stay in the direct path instead of collapsing into coarse
-  // octant COM approximations.
+  // The short grid only spans the dense baryonic region now, so aim for a few
+  // particles per cell: most neighborhoods stay on the exact direct-sum path
+  // and the octant fallback only fires in cluster cores.
   if (particle_count <= 300'000u) {
-    return 16.0;
+    return 4.0;
   }
   if (particle_count <= 1'000'000u) {
-    return 24.0;
+    return 6.0;
   }
-  if (particle_count >= 2'000'000u) {
-    return 32.0;
-  }
-  return 24.0;
+  return 8.0;
 }
 
 bool profile_force_stages() {
@@ -153,81 +120,17 @@ void flush_profile_stage(const char* label,
                std::chrono::duration<double, std::milli>(end - start).count());
 }
 
-struct MeshBuffers {
-  int nx = 0;
-  int ny = 0;
-  int nz = 0;
-  int nz_complex = 0;
-  std::size_t real_count = 0;
-  std::size_t complex_count = 0;
-
-  cufftReal* density_grid = nullptr;
-  cufftComplex* density_k = nullptr;
-  cufftComplex* force_k = nullptr;
-  cufftReal* force_x = nullptr;
-  cufftReal* force_y = nullptr;
-  cufftReal* force_z = nullptr;
-
-  cufftHandle forward_plan = 0;
-  cufftHandle inverse_plan = 0;
-};
-
-struct ShortRangeTreeNode {
-  double mass = 0.0;
-  double com[3] = {0.0, 0.0, 0.0};
-  double center[3] = {0.0, 0.0, 0.0};
-  double half_size = 0.0;
-  double softening_kpc = 0.0;
-  int child[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
-  std::uint8_t child_mask = 0;
-  int cell_id = -1;
-  int particle_index = -1;
-};
-
-struct ShortRangeSourceCell {
-  int cell_id = -1;
-  double mass = 0.0;
-  double com[3] = {0.0, 0.0, 0.0};
-  double softening_kpc = 0.0;
-};
-
-struct ShortRangeParticleSource {
-  int particle_index = -1;
-  double mass = 0.0;
-  double position[3] = {0.0, 0.0, 0.0};
-  double softening_kpc = 0.0;
-};
-
-struct ShortRangeInteractionSource {
-  double mass = 0.0;
-  double com[3] = {0.0, 0.0, 0.0};
-  double softening_kpc = 0.0;
-};
-
-struct RefinementPatchState {
-  bool active = false;
-  int grid_min[3] = {0, 0, 0};
-  int grid_max[3] = {0, 0, 0};
-  double box_length[3] = {1.0, 1.0, 1.0};
-  double domain_origin[3] = {0.0, 0.0, 0.0};
-  double cell_size_fine[3] = {1.0, 1.0, 1.0};
-  double cell_size_coarse[3] = {1.0, 1.0, 1.0};
-  MeshBuffers fine;
-  MeshBuffers coarse;
-};
-
-struct DensityRegionSummary {
-  double mass_msun = 0.0;
-  double max_density = 0.0;
-};
-
-struct DensityTreeCandidate {
-  int grid_min[3] = {0, 0, 0};
-  int grid_max[3] = {0, 0, 0};
-  double mass_msun = 0.0;
-  double max_density = 0.0;
-  int depth = 0;
-  double score = 0.0;
+// Per-level view of the coarsened cell pyramid, passed to the kick kernel by
+// value. Each level stores packed (com - short_origin, mass) float4 moments;
+// single-precision is ample for monopole approximations evaluated at least one
+// cell away, and one vector load per cell keeps the walk bandwidth-bound work
+// low.
+struct PyramidDeviceView {
+  int level_count = 0;
+  int nx[kMaxPyramidLevels] = {};
+  int ny[kMaxPyramidLevels] = {};
+  int nz[kMaxPyramidLevels] = {};
+  const float4* moments[kMaxPyramidLevels] = {};
 };
 
 struct DeviceState {
@@ -241,7 +144,6 @@ struct DeviceState {
   double cfl_safety_factor = 0.35;
   double max_softening_kpc = 0.05;
   double opening_angle = 0.55;
-  bool short_tree_particle_mode = false;
   bool short_range_target_baryons_only = false;
   bool force_state_valid = false;
   double last_max_accel_sq = 0.0;
@@ -265,14 +167,49 @@ struct DeviceState {
   int short_nz = 0;
   std::size_t short_cell_count = 0;
   std::size_t short_cell_capacity = 0;
-  std::size_t short_cell_interaction_cell_capacity = 0;
-  std::size_t short_cell_interaction_capacity = 0;
   double short_domain_origin[3] = {0.0, 0.0, 0.0};
   double short_box_length[3] = {1.0, 1.0, 1.0};
   double short_cell_size[3] = {1.0, 1.0, 1.0};
   double short_cutoff_kpc = 0.0;
   double short_pm_softening_kpc = 0.0;
   double short_force_factor_lut_scale = 0.0;
+  double lut_cached_cutoff_kpc = -1.0;
+  double lut_cached_split_kpc = -1.0;
+
+  // Coarsened pyramid over the fine short-range cells (levels 1..level_count-1;
+  // level 0 aliases short_cell_mass/short_cell_com_*).
+  int pyramid_level_count = 0;
+  int pyramid_nx[kMaxPyramidLevels] = {};
+  int pyramid_ny[kMaxPyramidLevels] = {};
+  int pyramid_nz[kMaxPyramidLevels] = {};
+  std::size_t pyramid_offset[kMaxPyramidLevels] = {};
+  std::size_t pyramid_total_cells = 0;
+  std::size_t pyramid_capacity = 0;
+  double* pyramid_mass = nullptr;
+  double* pyramid_com_x = nullptr;
+  double* pyramid_com_y = nullptr;
+  double* pyramid_com_z = nullptr;
+
+  // Packed single-precision interaction tables rebuilt each force update:
+  // per-cell moments for level 0 followed by the pyramid levels, plus the
+  // per-octant moments of the fine cells, all relative to short_domain_origin.
+  std::size_t moments_f4_capacity = 0;
+  float4* cell_moments_f4 = nullptr;
+  float4* octant_moments_f4 = nullptr;
+
+  // Short-range sources gathered into sorted SoA order so the direct-sum inner
+  // loops stream coalesced memory instead of chasing an index indirection into
+  // the 88-byte particle records.
+  double* sorted_source_x = nullptr;
+  double* sorted_source_y = nullptr;
+  double* sorted_source_z = nullptr;
+  double* sorted_source_mass = nullptr;
+  double* sorted_source_softening = nullptr;
+
+  // Particles that are not short-range sources (SMBHs, massless, filtered),
+  // processed after the cell-sorted targets so every particle gets kicked.
+  int* non_source_indices = nullptr;
+  std::uint32_t non_source_count = 0;
 
   SimCudaParticle* particles = nullptr;
   int* galaxy_smbh_indices = nullptr;
@@ -282,7 +219,6 @@ struct DeviceState {
   int* short_sorted_particle_indices = nullptr;
   int* short_cell_start = nullptr;
   int* short_cell_end = nullptr;
-  int* short_cell_interaction_start = nullptr;
   double* short_cell_mass = nullptr;
   double* short_cell_com_x = nullptr;
   double* short_cell_com_y = nullptr;
@@ -293,25 +229,10 @@ struct DeviceState {
   double* short_cell_octant_com_z = nullptr;
   float* short_force_factor_lut = nullptr;
   double* max_accel_sq = nullptr;
-  ShortRangeInteractionSource* short_cell_interactions = nullptr;
-  ShortRangeTreeNode* short_tree_nodes = nullptr;
   std::uint32_t short_source_particle_count = 0;
   std::uint32_t preview_visible_particle_count = 0;
-  std::uint32_t short_tree_node_count = 0;
-  std::size_t short_tree_node_capacity = 0;
-  int short_tree_root = -1;
   std::vector<int> galaxy_smbh_indices_host;
-  std::vector<cufftReal> density_host;
-  std::vector<RefinementPatchState> refinement_patches;
-  std::vector<double> short_cell_mass_host;
-  std::vector<double> short_cell_com_x_host;
-  std::vector<double> short_cell_com_y_host;
-  std::vector<double> short_cell_com_z_host;
-  std::vector<int> short_cell_interaction_start_host;
-  std::vector<ShortRangeInteractionSource> short_cell_interactions_host;
   std::vector<float> short_force_factor_lut_host;
-  std::vector<ShortRangeTreeNode> short_tree_host;
-  std::vector<SimCudaParticle> particles_host;
 
   cufftReal* density_grid = nullptr;
   cufftComplex* density_k = nullptr;
@@ -319,6 +240,9 @@ struct DeviceState {
   cufftReal* force_x = nullptr;
   cufftReal* force_y = nullptr;
   cufftReal* force_z = nullptr;
+  cufftReal* potential_grid = nullptr;
+  cufftComplex* greens_k = nullptr;
+  double greens_box[3] = {0.0, 0.0, 0.0};
 
   cufftHandle forward_plan = 0;
   cufftHandle inverse_plan = 0;
@@ -428,107 +352,11 @@ __device__ inline void atomic_max_positive_double(double* address, const double 
   }
 }
 
-void destroy_mesh_buffers(MeshBuffers& mesh) {
-  if (mesh.forward_plan != 0) {
-    cufftDestroy(mesh.forward_plan);
-    mesh.forward_plan = 0;
-  }
-  if (mesh.inverse_plan != 0) {
-    cufftDestroy(mesh.inverse_plan);
-    mesh.inverse_plan = 0;
-  }
-  cudaFree(mesh.force_z);
-  cudaFree(mesh.force_y);
-  cudaFree(mesh.force_x);
-  cudaFree(mesh.force_k);
-  cudaFree(mesh.density_k);
-  cudaFree(mesh.density_grid);
-  mesh.force_z = nullptr;
-  mesh.force_y = nullptr;
-  mesh.force_x = nullptr;
-  mesh.force_k = nullptr;
-  mesh.density_k = nullptr;
-  mesh.density_grid = nullptr;
-}
-
-int create_mesh_buffers(MeshBuffers& mesh,
-                        const int nx,
-                        const int ny,
-                        const int nz,
-                        char* error_buffer,
-                        const std::size_t error_buffer_len) {
-  mesh.nx = nx;
-  mesh.ny = ny;
-  mesh.nz = nz;
-  mesh.nz_complex = nz / 2 + 1;
-  mesh.real_count = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) *
-                    static_cast<std::size_t>(nz);
-  mesh.complex_count = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) *
-                       static_cast<std::size_t>(mesh.nz_complex);
-
-  cudaError_t cuda_status =
-      cudaMalloc(reinterpret_cast<void**>(&mesh.density_grid), sizeof(cufftReal) * mesh.real_count);
-  if (cuda_status != cudaSuccess) {
-    fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for local density grid failed", cuda_status);
-    return 1;
-  }
-
-  cuda_status =
-      cudaMalloc(reinterpret_cast<void**>(&mesh.density_k), sizeof(cufftComplex) * mesh.complex_count);
-  if (cuda_status != cudaSuccess) {
-    fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for local density spectrum failed", cuda_status);
-    return 1;
-  }
-
-  cuda_status =
-      cudaMalloc(reinterpret_cast<void**>(&mesh.force_k), sizeof(cufftComplex) * mesh.complex_count);
-  if (cuda_status != cudaSuccess) {
-    fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for local force spectrum failed", cuda_status);
-    return 1;
-  }
-
-  cuda_status = cudaMalloc(reinterpret_cast<void**>(&mesh.force_x), sizeof(cufftReal) * mesh.real_count);
-  if (cuda_status != cudaSuccess) {
-    fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for local force_x failed", cuda_status);
-    return 1;
-  }
-
-  cuda_status = cudaMalloc(reinterpret_cast<void**>(&mesh.force_y), sizeof(cufftReal) * mesh.real_count);
-  if (cuda_status != cudaSuccess) {
-    fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for local force_y failed", cuda_status);
-    return 1;
-  }
-
-  cuda_status = cudaMalloc(reinterpret_cast<void**>(&mesh.force_z), sizeof(cufftReal) * mesh.real_count);
-  if (cuda_status != cudaSuccess) {
-    fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for local force_z failed", cuda_status);
-    return 1;
-  }
-
-  cufftResult fft_status = cufftPlan3d(&mesh.forward_plan, nx, ny, nz, CUFFT_R2C);
-  if (fft_status != CUFFT_SUCCESS) {
-    fill_cufft_error(error_buffer, error_buffer_len, "local forward FFT plan creation failed", fft_status);
-    return 1;
-  }
-
-  fft_status = cufftPlan3d(&mesh.inverse_plan, nx, ny, nz, CUFFT_C2R);
-  if (fft_status != CUFFT_SUCCESS) {
-    fill_cufft_error(error_buffer, error_buffer_len, "local inverse FFT plan creation failed", fft_status);
-    return 1;
-  }
-
-  return 0;
-}
-
 void destroy_state(DeviceState* state) {
   if (state == nullptr) {
     return;
   }
 
-  for (auto& patch : state->refinement_patches) {
-    destroy_mesh_buffers(patch.fine);
-    destroy_mesh_buffers(patch.coarse);
-  }
   if (state->preview_copy_done_event != nullptr) {
     cudaEventDestroy(state->preview_copy_done_event);
   }
@@ -551,15 +379,24 @@ void destroy_state(DeviceState* state) {
   cudaFree(state->short_cell_com_y);
   cudaFree(state->short_cell_com_x);
   cudaFree(state->short_cell_mass);
-  cudaFree(state->short_cell_interactions);
-  cudaFree(state->short_cell_interaction_start);
   cudaFree(state->short_cell_octant_com_z);
   cudaFree(state->short_cell_octant_com_y);
   cudaFree(state->short_cell_octant_com_x);
   cudaFree(state->short_cell_octant_mass);
+  cudaFree(state->pyramid_com_z);
+  cudaFree(state->pyramid_com_y);
+  cudaFree(state->pyramid_com_x);
+  cudaFree(state->pyramid_mass);
+  cudaFree(state->cell_moments_f4);
+  cudaFree(state->octant_moments_f4);
+  cudaFree(state->sorted_source_x);
+  cudaFree(state->sorted_source_y);
+  cudaFree(state->sorted_source_z);
+  cudaFree(state->sorted_source_mass);
+  cudaFree(state->sorted_source_softening);
+  cudaFree(state->non_source_indices);
   cudaFree(state->short_force_factor_lut);
   cudaFree(state->max_accel_sq);
-  cudaFree(state->short_tree_nodes);
   cudaFree(state->short_cell_end);
   cudaFree(state->short_cell_start);
   cudaFree(state->short_sorted_particle_indices);
@@ -568,6 +405,8 @@ void destroy_state(DeviceState* state) {
   cudaFree(state->preview_visible_particle_indices);
   cudaFreeHost(state->preview_host_particles);
   cudaFree(state->preview_particles);
+  cudaFree(state->greens_k);
+  cudaFree(state->potential_grid);
   cudaFree(state->force_z);
   cudaFree(state->force_y);
   cudaFree(state->force_x);
@@ -817,6 +656,10 @@ void compute_simulation_domain(DeviceState* state, const SimCudaParticle* partic
     for (int axis = 0; axis < 3; ++axis) {
       min_pos[axis] = std::min(min_pos[axis], particles[i].position_kpc[axis]);
       max_pos[axis] = std::max(max_pos[axis], particles[i].position_kpc[axis]);
+      // The short-range grid tracks the dense baryonic region (disk, bulge,
+      // SMBH) so its cells stay small where close forces matter. Halo
+      // particles inside the box still participate; the diffuse outer halo is
+      // handled by the PM mesh alone.
       if (particles[i].component != 0u) {
         min_short_pos[axis] = std::min(min_short_pos[axis], particles[i].position_kpc[axis]);
         max_short_pos[axis] = std::max(max_short_pos[axis], particles[i].position_kpc[axis]);
@@ -875,129 +718,6 @@ __host__ __device__ __forceinline__ std::size_t complex_grid_index(
          static_cast<std::size_t>(z);
 }
 
-__device__ __forceinline__ double wrap_position(
-    const double value, const double origin, const double length) {
-  double shifted = value - origin;
-  shifted -= floor(shifted / length) * length;
-  return shifted;
-}
-
-bool region_has_refinement_extent(const int grid_min[3], const int grid_max[3]) {
-  return (grid_max[0] - grid_min[0] > kMinRefineCellsXY) &&
-         (grid_max[1] - grid_min[1] > kMinRefineCellsXY) &&
-         (grid_max[2] - grid_min[2] > kMinRefineCellsZ);
-}
-
-DensityRegionSummary summarize_density_region(const DeviceState& state,
-                                              const int grid_min[3],
-                                              const int grid_max[3]) {
-  DensityRegionSummary summary;
-  for (int ix = grid_min[0]; ix < grid_max[0]; ++ix) {
-    for (int iy = grid_min[1]; iy < grid_max[1]; ++iy) {
-      for (int iz = grid_min[2]; iz < grid_max[2]; ++iz) {
-        const double density = state.density_host[real_grid_index(ix, iy, iz, state.ny, state.nz)];
-        if (density <= 0.0) {
-          continue;
-        }
-        summary.mass_msun += density * state.cell_volume;
-        summary.max_density = std::max(summary.max_density, density);
-      }
-    }
-  }
-  return summary;
-}
-
-void collect_density_tree_candidates(const DeviceState& state,
-                                     const int grid_min[3],
-                                     const int grid_max[3],
-                                     const DensityRegionSummary& summary,
-                                     const double root_mass_msun,
-                                     const double root_max_density,
-                                     const int depth,
-                                     std::vector<DensityTreeCandidate>& out_candidates) {
-  if (summary.mass_msun <= root_mass_msun * kRefineMinMassFraction ||
-      summary.max_density <= root_max_density * kRefineLeafDensityRatio) {
-    return;
-  }
-
-  const bool can_split = depth < kMaxDensityTreeDepth && region_has_refinement_extent(grid_min, grid_max) &&
-                         summary.max_density > root_max_density * kRefineSplitDensityRatio;
-  if (!can_split) {
-    if (depth == 0) {
-      return;
-    }
-    DensityTreeCandidate candidate;
-    for (int axis = 0; axis < 3; ++axis) {
-      candidate.grid_min[axis] = grid_min[axis];
-      candidate.grid_max[axis] = grid_max[axis];
-    }
-    candidate.mass_msun = summary.mass_msun;
-    candidate.max_density = summary.max_density;
-    candidate.depth = depth;
-    candidate.score = candidate.max_density * std::sqrt(std::max(candidate.mass_msun, 1.0));
-    out_candidates.push_back(candidate);
-    return;
-  }
-
-  const int mid[3] = {
-      (grid_min[0] + grid_max[0]) / 2,
-      (grid_min[1] + grid_max[1]) / 2,
-      (grid_min[2] + grid_max[2]) / 2,
-  };
-  bool emitted_child = false;
-  for (int octant = 0; octant < 8; ++octant) {
-    const int child_min[3] = {
-        (octant & 1) == 0 ? grid_min[0] : mid[0],
-        (octant & 2) == 0 ? grid_min[1] : mid[1],
-        (octant & 4) == 0 ? grid_min[2] : mid[2],
-    };
-    const int child_max[3] = {
-        (octant & 1) == 0 ? mid[0] : grid_max[0],
-        (octant & 2) == 0 ? mid[1] : grid_max[1],
-        (octant & 4) == 0 ? mid[2] : grid_max[2],
-    };
-    if (child_min[0] >= child_max[0] || child_min[1] >= child_max[1] || child_min[2] >= child_max[2]) {
-      continue;
-    }
-    const DensityRegionSummary child_summary = summarize_density_region(state, child_min, child_max);
-    if (child_summary.mass_msun <= 0.0) {
-      continue;
-    }
-    emitted_child = true;
-    collect_density_tree_candidates(
-        state,
-        child_min,
-        child_max,
-        child_summary,
-        root_mass_msun,
-        root_max_density,
-        depth + 1,
-        out_candidates);
-  }
-
-  if (!emitted_child && depth > 0) {
-    DensityTreeCandidate candidate;
-    for (int axis = 0; axis < 3; ++axis) {
-      candidate.grid_min[axis] = grid_min[axis];
-      candidate.grid_max[axis] = grid_max[axis];
-    }
-    candidate.mass_msun = summary.mass_msun;
-    candidate.max_density = summary.max_density;
-    candidate.depth = depth;
-    candidate.score = candidate.max_density * std::sqrt(std::max(candidate.mass_msun, 1.0));
-    out_candidates.push_back(candidate);
-  }
-}
-
-bool grid_regions_overlap(const int a_min[3], const int a_max[3], const int b_min[3], const int b_max[3]) {
-  for (int axis = 0; axis < 3; ++axis) {
-    if (a_max[axis] <= b_min[axis] || b_max[axis] <= a_min[axis]) {
-      return false;
-    }
-  }
-  return true;
-}
-
 struct DomainBounds {
   double min_pos[3];
   double max_pos[3];
@@ -1023,7 +743,8 @@ struct DomainBoundsAccessor {
       const double position = particle.position_kpc[axis];
       bounds.min_pos[axis] = position;
       bounds.max_pos[axis] = position;
-      if (particle.component != 3u) {
+      // Baryons + SMBHs only: see compute_simulation_domain.
+      if (particle.component != 0u) {
         bounds.short_min_pos[axis] = position;
         bounds.short_max_pos[axis] = position;
       }
@@ -1132,6 +853,8 @@ int ensure_short_range_cell_storage(DeviceState* state,
   cudaFree(state->short_cell_octant_com_x);
   cudaFree(state->short_cell_octant_com_y);
   cudaFree(state->short_cell_octant_com_z);
+  cudaFree(state->octant_moments_f4);
+  state->octant_moments_f4 = nullptr;
   state->short_cell_start = nullptr;
   state->short_cell_end = nullptr;
   state->short_cell_mass = nullptr;
@@ -1244,520 +967,18 @@ int ensure_short_range_cell_storage(DeviceState* state,
                     cuda_status);
     return 1;
   }
+  cuda_status = cudaMalloc(reinterpret_cast<void**>(&state->octant_moments_f4),
+                           sizeof(float4) * octant_count);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer,
+                    error_buffer_len,
+                    "cudaMalloc for packed octant moments failed",
+                    cuda_status);
+    return 1;
+  }
 
   state->short_cell_capacity = required_cell_count;
   return 0;
-}
-
-int ensure_short_range_tree_storage(DeviceState* state,
-                                    const std::size_t required_node_count,
-                                    char* error_buffer,
-                                    const std::size_t error_buffer_len) {
-  if (required_node_count == 0) {
-    return 0;
-  }
-  if (required_node_count <= state->short_tree_node_capacity &&
-      state->short_tree_nodes != nullptr) {
-    return 0;
-  }
-
-  cudaFree(state->short_tree_nodes);
-  state->short_tree_nodes = nullptr;
-  state->short_tree_node_capacity = 0;
-
-  const cudaError_t cuda_status =
-      cudaMalloc(reinterpret_cast<void**>(&state->short_tree_nodes),
-                 sizeof(ShortRangeTreeNode) * required_node_count);
-  if (cuda_status != cudaSuccess) {
-    fill_cuda_error(error_buffer,
-                    error_buffer_len,
-                    "cudaMalloc for short-range tree nodes failed",
-                    cuda_status);
-    return 1;
-  }
-  state->short_tree_node_capacity = required_node_count;
-  return 0;
-}
-
-int ensure_short_range_interaction_storage(DeviceState* state,
-                                           const std::size_t required_cell_count,
-                                           const std::size_t required_interaction_count,
-                                           char* error_buffer,
-                                           const std::size_t error_buffer_len) {
-  if (required_cell_count > state->short_cell_interaction_cell_capacity ||
-      state->short_cell_interaction_start == nullptr) {
-    cudaFree(state->short_cell_interaction_start);
-    state->short_cell_interaction_start = nullptr;
-    state->short_cell_interaction_cell_capacity = 0;
-
-    const cudaError_t cuda_status =
-        cudaMalloc(reinterpret_cast<void**>(&state->short_cell_interaction_start),
-                   sizeof(int) * (required_cell_count + 1));
-    if (cuda_status != cudaSuccess) {
-      fill_cuda_error(error_buffer,
-                      error_buffer_len,
-                      "cudaMalloc for short-range interaction starts failed",
-                      cuda_status);
-      return 1;
-    }
-    state->short_cell_interaction_cell_capacity = required_cell_count;
-  }
-
-  if (required_interaction_count == 0) {
-    cudaFree(state->short_cell_interactions);
-    state->short_cell_interactions = nullptr;
-    state->short_cell_interaction_capacity = 0;
-    return 0;
-  }
-
-  if (required_interaction_count <= state->short_cell_interaction_capacity &&
-      state->short_cell_interactions != nullptr) {
-    return 0;
-  }
-
-  cudaFree(state->short_cell_interactions);
-  state->short_cell_interactions = nullptr;
-  state->short_cell_interaction_capacity = 0;
-
-  const cudaError_t cuda_status =
-      cudaMalloc(reinterpret_cast<void**>(&state->short_cell_interactions),
-                 sizeof(ShortRangeInteractionSource) * required_interaction_count);
-  if (cuda_status != cudaSuccess) {
-    fill_cuda_error(error_buffer,
-                    error_buffer_len,
-                    "cudaMalloc for short-range interaction sources failed",
-                    cuda_status);
-    return 1;
-  }
-  state->short_cell_interaction_capacity = required_interaction_count;
-  return 0;
-}
-
-void accumulate_tree_node_properties(const std::vector<ShortRangeSourceCell>& sources,
-                                     const std::vector<int>& indices,
-                                     ShortRangeTreeNode& node) {
-  double mass = 0.0;
-  double com_x = 0.0;
-  double com_y = 0.0;
-  double com_z = 0.0;
-  double softening = 0.0;
-  for (const int index : indices) {
-    const ShortRangeSourceCell& source = sources[index];
-    mass += source.mass;
-    com_x += source.mass * source.com[0];
-    com_y += source.mass * source.com[1];
-    com_z += source.mass * source.com[2];
-    softening = std::max(softening, source.softening_kpc);
-  }
-  if (mass > 0.0) {
-    com_x /= mass;
-    com_y /= mass;
-    com_z /= mass;
-  }
-  node.mass = mass;
-  node.com[0] = com_x;
-  node.com[1] = com_y;
-  node.com[2] = com_z;
-  node.softening_kpc = softening;
-}
-
-int build_short_range_tree_recursive(const std::vector<ShortRangeSourceCell>& sources,
-                                     const std::vector<int>& indices,
-                                     const double center[3],
-                                     const double half_size,
-                                     const int depth,
-                                     std::vector<ShortRangeTreeNode>& nodes) {
-  const int node_index = static_cast<int>(nodes.size());
-  nodes.emplace_back();
-  ShortRangeTreeNode& node = nodes[node_index];
-  node.center[0] = center[0];
-  node.center[1] = center[1];
-  node.center[2] = center[2];
-  node.half_size = half_size;
-  accumulate_tree_node_properties(sources, indices, node);
-
-  if (indices.size() == 1 || depth >= 24 || half_size <= 1.0e-3) {
-    if (indices.size() == 1) {
-      const ShortRangeSourceCell& source = sources[indices.front()];
-      node.cell_id = source.cell_id;
-      node.softening_kpc = source.softening_kpc;
-    }
-    return node_index;
-  }
-
-  std::vector<int> buckets[8];
-  for (const int index : indices) {
-    const ShortRangeSourceCell& source = sources[index];
-    int octant = 0;
-    if (source.com[0] >= center[0]) {
-      octant |= 1;
-    }
-    if (source.com[1] >= center[1]) {
-      octant |= 2;
-    }
-    if (source.com[2] >= center[2]) {
-      octant |= 4;
-    }
-    buckets[octant].push_back(index);
-  }
-
-  const double child_half = half_size * 0.5;
-  for (int octant = 0; octant < 8; ++octant) {
-    if (buckets[octant].empty()) {
-      continue;
-    }
-    double child_center[3] = {
-        center[0] + ((octant & 1) ? child_half : -child_half),
-        center[1] + ((octant & 2) ? child_half : -child_half),
-        center[2] + ((octant & 4) ? child_half : -child_half),
-    };
-    const int child_index = build_short_range_tree_recursive(
-        sources, buckets[octant], child_center, child_half, depth + 1, nodes);
-    nodes[node_index].child[octant] = child_index;
-    nodes[node_index].child_mask |= static_cast<std::uint8_t>(1u << octant);
-  }
-  nodes[node_index].softening_kpc = std::max(nodes[node_index].softening_kpc, half_size * 0.5);
-  return node_index;
-}
-
-void accumulate_tree_node_properties(const std::vector<ShortRangeParticleSource>& sources,
-                                     const std::vector<int>& indices,
-                                     ShortRangeTreeNode& node) {
-  double mass = 0.0;
-  double com_x = 0.0;
-  double com_y = 0.0;
-  double com_z = 0.0;
-  double softening = 0.0;
-  for (const int index : indices) {
-    const ShortRangeParticleSource& source = sources[index];
-    mass += source.mass;
-    com_x += source.mass * source.position[0];
-    com_y += source.mass * source.position[1];
-    com_z += source.mass * source.position[2];
-    softening = std::max(softening, source.softening_kpc);
-  }
-  if (mass > 0.0) {
-    com_x /= mass;
-    com_y /= mass;
-    com_z /= mass;
-  }
-  node.mass = mass;
-  node.com[0] = com_x;
-  node.com[1] = com_y;
-  node.com[2] = com_z;
-  node.softening_kpc = softening;
-}
-
-int build_short_range_particle_tree_recursive(const std::vector<ShortRangeParticleSource>& sources,
-                                              const std::vector<int>& indices,
-                                              const double center[3],
-                                              const double half_size,
-                                              const int depth,
-                                              std::vector<ShortRangeTreeNode>& nodes) {
-  const int node_index = static_cast<int>(nodes.size());
-  nodes.emplace_back();
-  ShortRangeTreeNode& node = nodes[node_index];
-  node.center[0] = center[0];
-  node.center[1] = center[1];
-  node.center[2] = center[2];
-  node.half_size = half_size;
-  accumulate_tree_node_properties(sources, indices, node);
-
-  if (indices.size() == 1 || depth >= 32 || half_size <= 1.0e-4) {
-    if (indices.size() == 1) {
-      const ShortRangeParticleSource& source = sources[indices.front()];
-      node.particle_index = source.particle_index;
-      node.softening_kpc = source.softening_kpc;
-    }
-    return node_index;
-  }
-
-  std::vector<int> buckets[8];
-  for (const int index : indices) {
-    const ShortRangeParticleSource& source = sources[index];
-    int octant = 0;
-    if (source.position[0] >= center[0]) {
-      octant |= 1;
-    }
-    if (source.position[1] >= center[1]) {
-      octant |= 2;
-    }
-    if (source.position[2] >= center[2]) {
-      octant |= 4;
-    }
-    buckets[octant].push_back(index);
-  }
-
-  const double child_half = half_size * 0.5;
-  for (int octant = 0; octant < 8; ++octant) {
-    if (buckets[octant].empty()) {
-      continue;
-    }
-    double child_center[3] = {
-        center[0] + ((octant & 1) ? child_half : -child_half),
-        center[1] + ((octant & 2) ? child_half : -child_half),
-        center[2] + ((octant & 4) ? child_half : -child_half),
-    };
-    const int child_index = build_short_range_particle_tree_recursive(
-        sources, buckets[octant], child_center, child_half, depth + 1, nodes);
-    nodes[node_index].child[octant] = child_index;
-    nodes[node_index].child_mask |= static_cast<std::uint8_t>(1u << octant);
-  }
-  nodes[node_index].softening_kpc = std::max(nodes[node_index].softening_kpc, half_size * 0.25);
-  return node_index;
-}
-
-void append_short_range_cell_interactions(const DeviceState* state,
-                                          const int cell_id,
-                                          std::vector<ShortRangeInteractionSource>& out) {
-  if (state->short_tree_root < 0 || state->short_tree_host.empty()) {
-    return;
-  }
-
-  const int cell_plane = state->short_ny * state->short_nz;
-  const int ix = cell_id / cell_plane;
-  const int rem = cell_id - ix * cell_plane;
-  const int iy = rem / state->short_nz;
-  const int iz = rem - iy * state->short_nz;
-  const double half_x = 0.5 * state->short_cell_size[0];
-  const double half_y = 0.5 * state->short_cell_size[1];
-  const double half_z = 0.5 * state->short_cell_size[2];
-  const double center_x =
-      state->short_domain_origin[0] + (static_cast<double>(ix) + 0.5) * state->short_cell_size[0];
-  const double center_y =
-      state->short_domain_origin[1] + (static_cast<double>(iy) + 0.5) * state->short_cell_size[1];
-  const double center_z =
-      state->short_domain_origin[2] + (static_cast<double>(iz) + 0.5) * state->short_cell_size[2];
-  const double target_half_diag = std::sqrt(half_x * half_x + half_y * half_y + half_z * half_z);
-  const double short_cutoff_sq = state->short_cutoff_kpc * state->short_cutoff_kpc;
-  const double theta_sq = state->opening_angle * state->opening_angle;
-
-  std::vector<int> stack;
-  stack.reserve(128);
-  stack.push_back(state->short_tree_root);
-
-  while (!stack.empty()) {
-    const int node_index = stack.back();
-    stack.pop_back();
-    if (node_index < 0 || static_cast<std::size_t>(node_index) >= state->short_tree_host.size()) {
-      continue;
-    }
-
-    const ShortRangeTreeNode& node = state->short_tree_host[static_cast<std::size_t>(node_index)];
-    if (!(node.mass > 0.0)) {
-      continue;
-    }
-
-    const bool is_leaf = node.child_mask == 0;
-    if (is_leaf && node.cell_id == cell_id) {
-      continue;
-    }
-
-    const double dx_aabb = std::max(std::fabs(center_x - node.center[0]) - (node.half_size + half_x), 0.0);
-    const double dy_aabb = std::max(std::fabs(center_y - node.center[1]) - (node.half_size + half_y), 0.0);
-    const double dz_aabb = std::max(std::fabs(center_z - node.center[2]) - (node.half_size + half_z), 0.0);
-    if (dx_aabb * dx_aabb + dy_aabb * dy_aabb + dz_aabb * dz_aabb > short_cutoff_sq) {
-      continue;
-    }
-
-    const double dx = node.com[0] - center_x;
-    const double dy = node.com[1] - center_y;
-    const double dz = node.com[2] - center_z;
-    const double r2 = dx * dx + dy * dy + dz * dz;
-    const double combined_half = node.half_size + target_half_diag;
-    const double size_over_r_sq =
-        r2 > 1.0e-12 ? (4.0 * combined_half * combined_half) / r2
-                     : std::numeric_limits<double>::infinity();
-    if (!is_leaf && size_over_r_sq > theta_sq) {
-      for (int child = 0; child < 8; ++child) {
-        if ((node.child_mask & static_cast<std::uint8_t>(1u << child)) != 0) {
-          stack.push_back(node.child[child]);
-        }
-      }
-      continue;
-    }
-
-    if (r2 <= 1.0e-12 || r2 > short_cutoff_sq) {
-      continue;
-    }
-
-    ShortRangeInteractionSource interaction{};
-    interaction.mass = node.mass;
-    interaction.com[0] = node.com[0];
-    interaction.com[1] = node.com[1];
-    interaction.com[2] = node.com[2];
-    interaction.softening_kpc = node.softening_kpc;
-    out.push_back(interaction);
-  }
-}
-
-int build_short_range_cell_interactions(DeviceState* state,
-                                        char* error_buffer,
-                                        const std::size_t error_buffer_len) {
-  state->short_cell_interaction_start_host.assign(state->short_cell_count + 1, 0);
-  state->short_cell_interactions_host.clear();
-  if (state->short_cell_count == 0 || state->short_tree_root < 0 || state->short_tree_host.empty()) {
-    return ensure_short_range_interaction_storage(
-        state, state->short_cell_count, 0, error_buffer, error_buffer_len);
-  }
-
-  state->short_cell_interactions_host.reserve(state->short_tree_host.size() * 8u);
-  int interaction_cursor = 0;
-  for (std::size_t cell_id = 0; cell_id < state->short_cell_count; ++cell_id) {
-    state->short_cell_interaction_start_host[cell_id] = interaction_cursor;
-    if (!(state->short_cell_mass_host[cell_id] > 0.0)) {
-      continue;
-    }
-    append_short_range_cell_interactions(
-        state, static_cast<int>(cell_id), state->short_cell_interactions_host);
-    interaction_cursor = static_cast<int>(state->short_cell_interactions_host.size());
-  }
-  state->short_cell_interaction_start_host[state->short_cell_count] = interaction_cursor;
-
-  if (ensure_short_range_interaction_storage(state,
-                                             state->short_cell_count,
-                                             state->short_cell_interactions_host.size(),
-                                             error_buffer,
-                                             error_buffer_len) != 0) {
-    return 1;
-  }
-
-  cudaError_t cuda_status =
-      cudaMemcpyAsync(state->short_cell_interaction_start,
-                      state->short_cell_interaction_start_host.data(),
-                      sizeof(int) * (state->short_cell_count + 1),
-                      cudaMemcpyHostToDevice,
-                      state->compute_stream);
-  if (cuda_status != cudaSuccess) {
-    fill_cuda_error(
-        error_buffer, error_buffer_len, "short-range interaction starts upload failed", cuda_status);
-    return 1;
-  }
-
-  if (!state->short_cell_interactions_host.empty()) {
-    cuda_status = cudaMemcpyAsync(state->short_cell_interactions,
-                                  state->short_cell_interactions_host.data(),
-                                  sizeof(ShortRangeInteractionSource) *
-                                      state->short_cell_interactions_host.size(),
-                                  cudaMemcpyHostToDevice,
-                                  state->compute_stream);
-    if (cuda_status != cudaSuccess) {
-      fill_cuda_error(error_buffer,
-                      error_buffer_len,
-                      "short-range interaction sources upload failed",
-                      cuda_status);
-      return 1;
-    }
-  }
-  return 0;
-}
-
-int build_short_range_tree(DeviceState* state,
-                           char* error_buffer,
-                           const std::size_t error_buffer_len) {
-  state->short_tree_root = -1;
-  state->short_tree_node_count = 0;
-  state->short_tree_particle_mode = false;
-  state->short_tree_host.clear();
-  if (state->short_cell_count == 0) {
-    return 0;
-  }
-
-  if (state->short_source_particle_count <= particle_tree_threshold()) {
-    state->particles_host.resize(state->particle_count);
-    cudaError_t particle_status =
-        cudaMemcpyAsync(state->particles_host.data(),
-                        state->particles,
-                        sizeof(SimCudaParticle) * state->particle_count,
-                        cudaMemcpyDeviceToHost,
-                        state->compute_stream);
-    if (particle_status == cudaSuccess) {
-      particle_status = cudaStreamSynchronize(state->compute_stream);
-    }
-    if (particle_status != cudaSuccess) {
-      fill_cuda_error(error_buffer,
-                      error_buffer_len,
-                      "particle download for short-range tree failed",
-                      particle_status);
-      return 1;
-    }
-
-    std::vector<ShortRangeParticleSource> sources;
-    sources.reserve(state->short_source_particle_count);
-    double min_pos[3] = {
-        std::numeric_limits<double>::infinity(),
-        std::numeric_limits<double>::infinity(),
-        std::numeric_limits<double>::infinity(),
-    };
-    double max_pos[3] = {
-        -std::numeric_limits<double>::infinity(),
-        -std::numeric_limits<double>::infinity(),
-        -std::numeric_limits<double>::infinity(),
-    };
-    for (std::uint64_t particle_index = 0; particle_index < state->particle_count; ++particle_index) {
-      const SimCudaParticle& particle = state->particles_host[particle_index];
-      if (particle.component == 3u || !(particle.mass_msun > 0.0)) {
-        continue;
-      }
-      ShortRangeParticleSource source;
-      source.particle_index = static_cast<int>(particle_index);
-      source.mass = particle.mass_msun;
-      source.position[0] = particle.position_kpc[0];
-      source.position[1] = particle.position_kpc[1];
-      source.position[2] = particle.position_kpc[2];
-      source.softening_kpc = particle.softening_kpc;
-      sources.push_back(source);
-      for (int axis = 0; axis < 3; ++axis) {
-        min_pos[axis] = std::min(min_pos[axis], source.position[axis]);
-        max_pos[axis] = std::max(max_pos[axis], source.position[axis]);
-      }
-    }
-
-    if (!sources.empty()) {
-      double center[3] = {0.0, 0.0, 0.0};
-      double span = 0.0;
-      for (int axis = 0; axis < 3; ++axis) {
-        center[axis] = 0.5 * (min_pos[axis] + max_pos[axis]);
-        span = std::max(span, max_pos[axis] - min_pos[axis]);
-      }
-      const double half_size = std::max(
-          0.5 * span + std::max(state->short_cell_size[0],
-                                std::max(state->short_cell_size[1], state->short_cell_size[2])),
-          2.0 * state->max_softening_kpc);
-
-      std::vector<int> indices(sources.size());
-      for (std::size_t i = 0; i < sources.size(); ++i) {
-        indices[i] = static_cast<int>(i);
-      }
-      state->short_tree_host.reserve(sources.size() * 2);
-      state->short_tree_root = build_short_range_particle_tree_recursive(
-          sources, indices, center, half_size, 0, state->short_tree_host);
-      state->short_tree_node_count = static_cast<std::uint32_t>(state->short_tree_host.size());
-      state->short_tree_particle_mode = true;
-    }
-  }
-
-  if (state->short_tree_particle_mode) {
-    if (ensure_short_range_tree_storage(state,
-                                        state->short_tree_node_count,
-                                        error_buffer,
-                                        error_buffer_len) != 0) {
-      return 1;
-    }
-    const cudaError_t cuda_status =
-        cudaMemcpyAsync(state->short_tree_nodes,
-                        state->short_tree_host.data(),
-                        sizeof(ShortRangeTreeNode) * state->short_tree_node_count,
-                        cudaMemcpyHostToDevice,
-                        state->compute_stream);
-    if (cuda_status != cudaSuccess) {
-      fill_cuda_error(error_buffer, error_buffer_len, "short-range particle tree upload failed", cuda_status);
-      return 1;
-    }
-    return 0;
-  }
-  return ensure_short_range_interaction_storage(
-      state, state->short_cell_count, 0, error_buffer, error_buffer_len);
 }
 
 int update_short_range_grid(DeviceState* state,
@@ -1859,6 +1080,70 @@ int update_short_range_grid(DeviceState* state,
   state->short_cutoff_kpc =
       std::max(4.5 * state->short_pm_softening_kpc, 1.5 * max_short_cell);
 
+  // Size the coarsened pyramid: halve the grid per level until the top level
+  // is at most 3 cells per axis, so the per-particle V-list walk covers the
+  // whole grid without truncation.
+  state->pyramid_level_count = 1;
+  state->pyramid_nx[0] = short_nx;
+  state->pyramid_ny[0] = short_ny;
+  state->pyramid_nz[0] = short_nz;
+  state->pyramid_offset[0] = 0;
+  std::size_t pyramid_cells = 0;
+  while (state->pyramid_level_count < kMaxPyramidLevels) {
+    const int level = state->pyramid_level_count;
+    const int prev_nx = state->pyramid_nx[level - 1];
+    const int prev_ny = state->pyramid_ny[level - 1];
+    const int prev_nz = state->pyramid_nz[level - 1];
+    if (prev_nx <= 3 && prev_ny <= 3 && prev_nz <= 3) {
+      break;
+    }
+    state->pyramid_nx[level] = (prev_nx + 1) / 2;
+    state->pyramid_ny[level] = (prev_ny + 1) / 2;
+    state->pyramid_nz[level] = (prev_nz + 1) / 2;
+    state->pyramid_offset[level] = pyramid_cells;
+    pyramid_cells += static_cast<std::size_t>(state->pyramid_nx[level]) *
+                     static_cast<std::size_t>(state->pyramid_ny[level]) *
+                     static_cast<std::size_t>(state->pyramid_nz[level]);
+    ++state->pyramid_level_count;
+  }
+  state->pyramid_total_cells = pyramid_cells;
+
+  if (pyramid_cells > state->pyramid_capacity) {
+    cudaFree(state->pyramid_mass);
+    cudaFree(state->pyramid_com_x);
+    cudaFree(state->pyramid_com_y);
+    cudaFree(state->pyramid_com_z);
+    state->pyramid_mass = nullptr;
+    state->pyramid_com_x = nullptr;
+    state->pyramid_com_y = nullptr;
+    state->pyramid_com_z = nullptr;
+    state->pyramid_capacity = 0;
+
+    const std::size_t bytes = sizeof(double) * pyramid_cells;
+    if (cudaMalloc(reinterpret_cast<void**>(&state->pyramid_mass), bytes) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->pyramid_com_x), bytes) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->pyramid_com_y), bytes) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->pyramid_com_z), bytes) != cudaSuccess) {
+      fill_error(error_buffer, error_buffer_len, "cudaMalloc for cell pyramid failed");
+      return 1;
+    }
+    state->pyramid_capacity = pyramid_cells;
+  }
+
+  const std::size_t moments_needed = short_cell_count + pyramid_cells;
+  if (moments_needed > state->moments_f4_capacity) {
+    cudaFree(state->cell_moments_f4);
+    state->cell_moments_f4 = nullptr;
+    state->moments_f4_capacity = 0;
+
+    if (cudaMalloc(reinterpret_cast<void**>(&state->cell_moments_f4),
+                   sizeof(float4) * moments_needed) != cudaSuccess) {
+      fill_error(error_buffer, error_buffer_len, "cudaMalloc for packed moments failed");
+      return 1;
+    }
+    state->moments_f4_capacity = moments_needed;
+  }
+
   if (state->short_force_factor_lut == nullptr) {
     const cudaError_t cuda_status =
         cudaMalloc(reinterpret_cast<void**>(&state->short_force_factor_lut),
@@ -1869,10 +1154,7 @@ int update_short_range_grid(DeviceState* state,
       return 1;
     }
     state->short_force_factor_lut_host.resize(kShortRangeForceFactorLutSize);
-  }
-
-  if (state->short_force_factor_lut_host.size() != kShortRangeForceFactorLutSize) {
-    state->short_force_factor_lut_host.resize(kShortRangeForceFactorLutSize);
+    state->lut_cached_cutoff_kpc = -1.0;
   }
 
   const double short_cutoff_sq = state->short_cutoff_kpc * state->short_cutoff_kpc;
@@ -1880,24 +1162,32 @@ int update_short_range_grid(DeviceState* state,
       short_cutoff_sq > 0.0
           ? static_cast<double>(kShortRangeForceFactorLutSize - 1) / short_cutoff_sq
           : 0.0;
-  for (std::uint32_t i = 0; i < kShortRangeForceFactorLutSize; ++i) {
-    const double t = static_cast<double>(i) /
-                     static_cast<double>(std::max<std::uint32_t>(1, kShortRangeForceFactorLutSize - 1));
-    const double r = sqrt(t * short_cutoff_sq);
-    state->short_force_factor_lut_host[i] = static_cast<float>(
-        treepm_short_range_force_factor(r, state->short_pm_softening_kpc));
-  }
 
-  const cudaError_t lut_copy_status =
-      cudaMemcpyAsync(state->short_force_factor_lut,
-                      state->short_force_factor_lut_host.data(),
-                      sizeof(float) * kShortRangeForceFactorLutSize,
-                      cudaMemcpyHostToDevice,
-                      state->compute_stream);
-  if (lut_copy_status != cudaSuccess) {
-    fill_cuda_error(
-        error_buffer, error_buffer_len, "short-range factor LUT upload failed", lut_copy_status);
-    return 1;
+  // The LUT depends only on the cutoff and split radius; the domain ratchet
+  // makes those change rarely, so skip the rebuild+upload when unchanged.
+  if (state->lut_cached_cutoff_kpc != state->short_cutoff_kpc ||
+      state->lut_cached_split_kpc != state->short_pm_softening_kpc) {
+    for (std::uint32_t i = 0; i < kShortRangeForceFactorLutSize; ++i) {
+      const double t = static_cast<double>(i) /
+                       static_cast<double>(std::max<std::uint32_t>(1, kShortRangeForceFactorLutSize - 1));
+      const double r = sqrt(t * short_cutoff_sq);
+      state->short_force_factor_lut_host[i] = static_cast<float>(
+          treepm_short_range_force_factor(r, state->short_pm_softening_kpc));
+    }
+
+    const cudaError_t lut_copy_status =
+        cudaMemcpyAsync(state->short_force_factor_lut,
+                        state->short_force_factor_lut_host.data(),
+                        sizeof(float) * kShortRangeForceFactorLutSize,
+                        cudaMemcpyHostToDevice,
+                        state->compute_stream);
+    if (lut_copy_status != cudaSuccess) {
+      fill_cuda_error(
+          error_buffer, error_buffer_len, "short-range factor LUT upload failed", lut_copy_status);
+      return 1;
+    }
+    state->lut_cached_cutoff_kpc = state->short_cutoff_kpc;
+    state->lut_cached_split_kpc = state->short_pm_softening_kpc;
   }
   return 0;
 }
@@ -1932,9 +1222,12 @@ std::uint32_t estimate_substeps_for_step(DeviceState* state,
                    std::min(state->short_cell_size[0],
                             std::min(state->short_cell_size[1], state->short_cell_size[2])));
       // The near-field correction varies on a much smaller scale than the global PM mesh.
-      // Keep substeps small enough that particles traverse at most about a quarter of a
-      // short-range cell per kick, otherwise dense regions heat numerically.
-      integration_scale = std::min(integration_scale, 0.25 * min_short_cell);
+      // Keep substeps small enough that the fastest particles traverse at most about
+      // half a short-range cell per kick, otherwise dense regions heat numerically. The
+      // floor stops sub-kpc cells from exploding the substep count; below that scale the
+      // per-particle softening dominates anyway.
+      integration_scale =
+          std::min(integration_scale, std::max(0.5 * min_short_cell, 0.25));
     }
     const double allowed_displacement =
         state->cfl_safety_factor * std::max(1.0e-4, integration_scale);
@@ -1951,116 +1244,6 @@ std::uint32_t estimate_substeps_for_step(DeviceState* state,
     fill_error(error_buffer, error_buffer_len, error.what());
     return std::max(1u, state->max_substeps);
   }
-}
-
-void initialize_refinement_patch_geometry(const DeviceState& state,
-                                          RefinementPatchState& patch,
-                                          const DensityTreeCandidate& candidate) {
-  patch.active = true;
-  for (int axis = 0; axis < 3; ++axis) {
-    const int width = candidate.grid_max[axis] - candidate.grid_min[axis];
-    const int pad = std::max(2, width / 2);
-    patch.grid_min[axis] = std::max(0, candidate.grid_min[axis] - pad);
-    const int limit = axis == 0 ? state.nx : (axis == 1 ? state.ny : state.nz);
-    patch.grid_max[axis] = std::min(limit, candidate.grid_max[axis] + pad);
-    patch.domain_origin[axis] =
-        state.domain_origin[axis] + static_cast<double>(patch.grid_min[axis]) * state.cell_size[axis];
-    patch.box_length[axis] =
-        static_cast<double>(patch.grid_max[axis] - patch.grid_min[axis]) * state.cell_size[axis];
-  }
-  patch.cell_size_fine[0] = patch.box_length[0] / static_cast<double>(patch.fine.nx);
-  patch.cell_size_fine[1] = patch.box_length[1] / static_cast<double>(patch.fine.ny);
-  patch.cell_size_fine[2] = patch.box_length[2] / static_cast<double>(patch.fine.nz);
-  patch.cell_size_coarse[0] = patch.box_length[0] / static_cast<double>(patch.coarse.nx);
-  patch.cell_size_coarse[1] = patch.box_length[1] / static_cast<double>(patch.coarse.ny);
-  patch.cell_size_coarse[2] = patch.box_length[2] / static_cast<double>(patch.coarse.nz);
-}
-
-int update_refinement_patches(DeviceState* state,
-                              char* error_buffer,
-                              const std::size_t error_buffer_len) {
-  if (state->density_host.size() != state->real_count) {
-    state->density_host.resize(state->real_count);
-  }
-  const cudaError_t cuda_status = cudaMemcpy(state->density_host.data(),
-                                             state->density_grid,
-                                             sizeof(cufftReal) * state->real_count,
-                                             cudaMemcpyDeviceToHost);
-  if (cuda_status != cudaSuccess) {
-    fill_cuda_error(error_buffer, error_buffer_len, "density download for refinement failed", cuda_status);
-    return 1;
-  }
-
-  const int root_min[3] = {0, 0, 0};
-  const int root_max[3] = {state->nx, state->ny, state->nz};
-  const DensityRegionSummary root_summary = summarize_density_region(*state, root_min, root_max);
-
-  for (auto& patch : state->refinement_patches) {
-    patch.active = false;
-  }
-  if (root_summary.mass_msun <= 0.0 || root_summary.max_density <= 0.0) {
-    return 0;
-  }
-
-  std::vector<DensityTreeCandidate> candidates;
-  candidates.reserve(64);
-  collect_density_tree_candidates(
-      *state,
-      root_min,
-      root_max,
-      root_summary,
-      root_summary.mass_msun,
-      root_summary.max_density,
-      0,
-      candidates);
-  std::sort(candidates.begin(), candidates.end(), [](const DensityTreeCandidate& lhs, const DensityTreeCandidate& rhs) {
-    if (lhs.depth != rhs.depth) {
-      return lhs.depth > rhs.depth;
-    }
-    return lhs.score > rhs.score;
-  });
-
-  std::vector<DensityTreeCandidate> selected;
-  selected.reserve(state->refinement_patches.size());
-  for (const auto& candidate : candidates) {
-    int padded_min[3];
-    int padded_max[3];
-    for (int axis = 0; axis < 3; ++axis) {
-      const int width = candidate.grid_max[axis] - candidate.grid_min[axis];
-      const int pad = std::max(2, width / 2);
-      const int limit = axis == 0 ? state->nx : (axis == 1 ? state->ny : state->nz);
-      padded_min[axis] = std::max(0, candidate.grid_min[axis] - pad);
-      padded_max[axis] = std::min(limit, candidate.grid_max[axis] + pad);
-    }
-    bool overlaps = false;
-    for (const auto& prior : selected) {
-      int prior_min[3];
-      int prior_max[3];
-      for (int axis = 0; axis < 3; ++axis) {
-        const int width = prior.grid_max[axis] - prior.grid_min[axis];
-        const int pad = std::max(2, width / 2);
-        const int limit = axis == 0 ? state->nx : (axis == 1 ? state->ny : state->nz);
-        prior_min[axis] = std::max(0, prior.grid_min[axis] - pad);
-        prior_max[axis] = std::min(limit, prior.grid_max[axis] + pad);
-      }
-      if (grid_regions_overlap(padded_min, padded_max, prior_min, prior_max)) {
-        overlaps = true;
-        break;
-      }
-    }
-    if (overlaps) {
-      continue;
-    }
-    selected.push_back(candidate);
-    if (selected.size() >= state->refinement_patches.size()) {
-      break;
-    }
-  }
-
-  for (std::size_t i = 0; i < selected.size(); ++i) {
-    initialize_refinement_patch_geometry(*state, state->refinement_patches[i], selected[i]);
-  }
-  return 0;
 }
 
 __device__ __forceinline__ float sinc_pi(const float x) {
@@ -2105,6 +1288,19 @@ __device__ __forceinline__ double treepm_short_range_force_factor_lookup(
   const double value0 = static_cast<double>(lut[index0]);
   const double value1 = static_cast<double>(lut[index1]);
   return value0 + (value1 - value0) * frac;
+}
+
+// Single-precision variant for the packed monopole paths.
+__device__ __forceinline__ float treepm_short_range_force_factor_lookup_f(
+    const float* lut,
+    const std::uint32_t lut_size,
+    const float lut_scale,
+    const float r2) {
+  const float scaled = fminf(r2 * lut_scale, static_cast<float>(lut_size - 1));
+  const std::uint32_t index0 = static_cast<std::uint32_t>(scaled);
+  const std::uint32_t index1 = min(index0 + 1u, lut_size - 1);
+  const float frac = scaled - static_cast<float>(index0);
+  return lut[index0] + (lut[index1] - lut[index0]) * frac;
 }
 
 __device__ __forceinline__ void add_point_mass_acceleration(double& ax,
@@ -2228,84 +1424,6 @@ __device__ __forceinline__ void sample_grid_trilinear_vector(const cufftReal* gr
           grid_z[idx110] * w110 + grid_z[idx111] * w111;
 }
 
-__device__ __forceinline__ bool sample_grid_trilinear_vector_local(const cufftReal* grid_x,
-                                                                   const cufftReal* grid_y,
-                                                                   const cufftReal* grid_z,
-                                                                   const int nx,
-                                                                   const int ny,
-                                                                   const int nz,
-                                                                   const double origin_x,
-                                                                   const double origin_y,
-                                                                   const double origin_z,
-                                                                   const double cell_x,
-                                                                   const double cell_y,
-                                                                   const double cell_z,
-                                                                   const double px,
-                                                                   const double py,
-                                                                   const double pz,
-                                                                   double& out_x,
-                                                                   double& out_y,
-                                                                   double& out_z) {
-  const double gx = (px - origin_x) / cell_x;
-  const double gy = (py - origin_y) / cell_y;
-  const double gz = (pz - origin_z) / cell_z;
-  if (gx < 0.0 || gy < 0.0 || gz < 0.0 ||
-      gx >= static_cast<double>(nx - 1) ||
-      gy >= static_cast<double>(ny - 1) ||
-      gz >= static_cast<double>(nz - 1)) {
-    out_x = 0.0;
-    out_y = 0.0;
-    out_z = 0.0;
-    return false;
-  }
-
-  const int i0 = static_cast<int>(floor(gx));
-  const int j0 = static_cast<int>(floor(gy));
-  const int k0 = static_cast<int>(floor(gz));
-  const int i1 = i0 + 1;
-  const int j1 = j0 + 1;
-  const int k1 = k0 + 1;
-
-  const double tx = gx - floor(gx);
-  const double ty = gy - floor(gy);
-  const double tz = gz - floor(gz);
-  const double wx0 = 1.0 - tx;
-  const double wy0 = 1.0 - ty;
-  const double wz0 = 1.0 - tz;
-  const double wx1 = tx;
-  const double wy1 = ty;
-  const double wz1 = tz;
-
-  const std::size_t idx000 = real_grid_index(i0, j0, k0, ny, nz);
-  const std::size_t idx001 = real_grid_index(i0, j0, k1, ny, nz);
-  const std::size_t idx010 = real_grid_index(i0, j1, k0, ny, nz);
-  const std::size_t idx011 = real_grid_index(i0, j1, k1, ny, nz);
-  const std::size_t idx100 = real_grid_index(i1, j0, k0, ny, nz);
-  const std::size_t idx101 = real_grid_index(i1, j0, k1, ny, nz);
-  const std::size_t idx110 = real_grid_index(i1, j1, k0, ny, nz);
-  const std::size_t idx111 = real_grid_index(i1, j1, k1, ny, nz);
-
-  const double w000 = wx0 * wy0 * wz0;
-  const double w001 = wx0 * wy0 * wz1;
-  const double w010 = wx0 * wy1 * wz0;
-  const double w011 = wx0 * wy1 * wz1;
-  const double w100 = wx1 * wy0 * wz0;
-  const double w101 = wx1 * wy0 * wz1;
-  const double w110 = wx1 * wy1 * wz0;
-  const double w111 = wx1 * wy1 * wz1;
-
-  out_x = grid_x[idx000] * w000 + grid_x[idx001] * w001 + grid_x[idx010] * w010 +
-          grid_x[idx011] * w011 + grid_x[idx100] * w100 + grid_x[idx101] * w101 +
-          grid_x[idx110] * w110 + grid_x[idx111] * w111;
-  out_y = grid_y[idx000] * w000 + grid_y[idx001] * w001 + grid_y[idx010] * w010 +
-          grid_y[idx011] * w011 + grid_y[idx100] * w100 + grid_y[idx101] * w101 +
-          grid_y[idx110] * w110 + grid_y[idx111] * w111;
-  out_z = grid_z[idx000] * w000 + grid_z[idx001] * w001 + grid_z[idx010] * w010 +
-          grid_z[idx011] * w011 + grid_z[idx100] * w100 + grid_z[idx101] * w101 +
-          grid_z[idx110] * w110 + grid_z[idx111] * w111;
-  return true;
-}
-
 __global__ void deposit_mass_cic(const SimCudaParticle* particles,
                                  const std::uint64_t particle_count,
                                  cufftReal* density_grid,
@@ -2387,84 +1505,6 @@ __global__ void deposit_mass_cic(const SimCudaParticle* particles,
       mass_density * wx1 * wy1 * wz1);
 }
 
-__global__ void deposit_mass_cic_local(const SimCudaParticle* particles,
-                                       const std::uint64_t particle_count,
-                                       cufftReal* density_grid,
-                                       const int nx,
-                                       const int ny,
-                                       const int nz,
-                                       const double origin_x,
-                                       const double origin_y,
-                                       const double origin_z,
-                                       const double cell_x,
-                                       const double cell_y,
-                                       const double cell_z,
-                                       const float inv_cell_volume) {
-  const std::uint64_t index =
-      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index >= particle_count) {
-    return;
-  }
-
-  const SimCudaParticle& particle = particles[index];
-  if (particle.component == 3u || particle.mass_msun <= 0.0) {
-    return;
-  }
-
-  const double gx = (particle.position_kpc[0] - origin_x) / cell_x;
-  const double gy = (particle.position_kpc[1] - origin_y) / cell_y;
-  const double gz = (particle.position_kpc[2] - origin_z) / cell_z;
-  if (gx < 0.0 || gy < 0.0 || gz < 0.0 ||
-      gx >= static_cast<double>(nx - 1) ||
-      gy >= static_cast<double>(ny - 1) ||
-      gz >= static_cast<double>(nz - 1)) {
-    return;
-  }
-
-  const int i0 = static_cast<int>(floor(gx));
-  const int j0 = static_cast<int>(floor(gy));
-  const int k0 = static_cast<int>(floor(gz));
-  const int i1 = i0 + 1;
-  const int j1 = j0 + 1;
-  const int k1 = k0 + 1;
-
-  const float tx = static_cast<float>(gx - floor(gx));
-  const float ty = static_cast<float>(gy - floor(gy));
-  const float tz = static_cast<float>(gz - floor(gz));
-  const float wx0 = 1.0f - tx;
-  const float wy0 = 1.0f - ty;
-  const float wz0 = 1.0f - tz;
-  const float wx1 = tx;
-  const float wy1 = ty;
-  const float wz1 = tz;
-  const float mass_density = static_cast<float>(particle.mass_msun) * inv_cell_volume;
-
-  atomicAdd(
-      &density_grid[real_grid_index(i0, j0, k0, ny, nz)],
-      mass_density * wx0 * wy0 * wz0);
-  atomicAdd(
-      &density_grid[real_grid_index(i0, j0, k1, ny, nz)],
-      mass_density * wx0 * wy0 * wz1);
-  atomicAdd(
-      &density_grid[real_grid_index(i0, j1, k0, ny, nz)],
-      mass_density * wx0 * wy1 * wz0);
-  atomicAdd(
-      &density_grid[real_grid_index(i0, j1, k1, ny, nz)],
-      mass_density * wx0 * wy1 * wz1);
-  atomicAdd(
-      &density_grid[real_grid_index(i1, j0, k0, ny, nz)],
-      mass_density * wx1 * wy0 * wz0);
-  atomicAdd(
-      &density_grid[real_grid_index(i1, j0, k1, ny, nz)],
-      mass_density * wx1 * wy0 * wz1);
-  atomicAdd(
-      &density_grid[real_grid_index(i1, j1, k0, ny, nz)],
-      mass_density * wx1 * wy1 * wz0);
-  atomicAdd(
-      &density_grid[real_grid_index(i1, j1, k1, ny, nz)],
-      mass_density * wx1 * wy1 * wz1);
-}
-
 __host__ __device__ __forceinline__ int short_cell_linear_index(const int ix,
                                                                 const int iy,
                                                                 const int iz,
@@ -2503,18 +1543,23 @@ __global__ void compute_short_range_cells(const SimCudaParticle* particles,
 
   const int particle_index = source_particle_indices[index];
   const SimCudaParticle& particle = particles[particle_index];
-  const double gx = fmin(
-      fmax((particle.position_kpc[0] - origin_x) / cell_x, 0.0),
-      static_cast<double>(nx) - 1.000001);
-  const double gy = fmin(
-      fmax((particle.position_kpc[1] - origin_y) / cell_y, 0.0),
-      static_cast<double>(ny) - 1.000001);
-  const double gz = fmin(
-      fmax((particle.position_kpc[2] - origin_z) / cell_z, 0.0),
-      static_cast<double>(nz) - 1.000001);
-  const int ix = static_cast<int>(floor(gx));
-  const int iy = static_cast<int>(floor(gy));
-  const int iz = static_cast<int>(floor(gz));
+  const double gx = (particle.position_kpc[0] - origin_x) / cell_x;
+  const double gy = (particle.position_kpc[1] - origin_y) / cell_y;
+  const double gz = (particle.position_kpc[2] - origin_z) / cell_z;
+  // Sources outside the (baryon-tight) short-range box are long-range only:
+  // park them in the overflow slot past the last real cell so the sort keeps
+  // them out of every geometric neighborhood.
+  if (gx < 0.0 || gy < 0.0 || gz < 0.0 ||
+      gx >= static_cast<double>(nx) ||
+      gy >= static_cast<double>(ny) ||
+      gz >= static_cast<double>(nz)) {
+    sorted_cell_ids[index] = nx * ny * nz;
+    sorted_particle_indices[index] = particle_index;
+    return;
+  }
+  const int ix = min(static_cast<int>(floor(gx)), nx - 1);
+  const int iy = min(static_cast<int>(floor(gy)), ny - 1);
+  const int iz = min(static_cast<int>(floor(gz)), nz - 1);
 
   const int cell_id = short_cell_linear_index(ix, iy, iz, ny, nz);
   sorted_cell_ids[index] = cell_id;
@@ -2581,7 +1626,189 @@ __global__ void normalize_short_range_cell_moments(const std::size_t cell_count,
   }
 }
 
+// Builds one pyramid level from the next-finer level: each coarse cell is the
+// mass-weighted merge of its (up to) 8 children. Inputs and outputs are
+// normalized (mass, com) pairs.
+__global__ void coarsen_cell_moments(const double* __restrict__ fine_mass,
+                                     const double* __restrict__ fine_com_x,
+                                     const double* __restrict__ fine_com_y,
+                                     const double* __restrict__ fine_com_z,
+                                     const int fine_nx,
+                                     const int fine_ny,
+                                     const int fine_nz,
+                                     double* __restrict__ coarse_mass,
+                                     double* __restrict__ coarse_com_x,
+                                     double* __restrict__ coarse_com_y,
+                                     double* __restrict__ coarse_com_z,
+                                     const int coarse_nx,
+                                     const int coarse_ny,
+                                     const int coarse_nz) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t coarse_count = static_cast<std::size_t>(coarse_nx) *
+                                   static_cast<std::size_t>(coarse_ny) *
+                                   static_cast<std::size_t>(coarse_nz);
+  if (index >= coarse_count) {
+    return;
+  }
+
+  const int cz = static_cast<int>(index % static_cast<std::size_t>(coarse_nz));
+  const std::size_t xy = index / static_cast<std::size_t>(coarse_nz);
+  const int cy = static_cast<int>(xy % static_cast<std::size_t>(coarse_ny));
+  const int cx = static_cast<int>(xy / static_cast<std::size_t>(coarse_ny));
+
+  double mass = 0.0;
+  double sum_x = 0.0;
+  double sum_y = 0.0;
+  double sum_z = 0.0;
+  const int fx1 = min(2 * cx + 1, fine_nx - 1);
+  const int fy1 = min(2 * cy + 1, fine_ny - 1);
+  const int fz1 = min(2 * cz + 1, fine_nz - 1);
+  for (int fx = 2 * cx; fx <= fx1; ++fx) {
+    for (int fy = 2 * cy; fy <= fy1; ++fy) {
+      for (int fz = 2 * cz; fz <= fz1; ++fz) {
+        const int fine_index = short_cell_linear_index(fx, fy, fz, fine_ny, fine_nz);
+        const double child_mass = fine_mass[fine_index];
+        if (!(child_mass > 0.0)) {
+          continue;
+        }
+        mass += child_mass;
+        sum_x += child_mass * fine_com_x[fine_index];
+        sum_y += child_mass * fine_com_y[fine_index];
+        sum_z += child_mass * fine_com_z[fine_index];
+      }
+    }
+  }
+
+  coarse_mass[index] = mass;
+  if (mass > 0.0) {
+    coarse_com_x[index] = sum_x / mass;
+    coarse_com_y[index] = sum_y / mass;
+    coarse_com_z[index] = sum_z / mass;
+  } else {
+    coarse_com_x[index] = 0.0;
+    coarse_com_y[index] = 0.0;
+    coarse_com_z[index] = 0.0;
+  }
+}
+
+// Packs normalized (mass, com) moments into origin-relative float4 records.
+__global__ void pack_cell_moments_f4(const double* __restrict__ mass,
+                                     const double* __restrict__ com_x,
+                                     const double* __restrict__ com_y,
+                                     const double* __restrict__ com_z,
+                                     const std::size_t count,
+                                     const double origin_x,
+                                     const double origin_y,
+                                     const double origin_z,
+                                     float4* __restrict__ out) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  const double cell_mass = mass[index];
+  if (cell_mass > 0.0) {
+    out[index] = make_float4(static_cast<float>(com_x[index] - origin_x),
+                             static_cast<float>(com_y[index] - origin_y),
+                             static_cast<float>(com_z[index] - origin_z),
+                             static_cast<float>(cell_mass));
+  } else {
+    out[index] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  }
+}
+
+// Same packing for the octant tables, whose inputs are raw mass-weighted sums.
+__global__ void pack_octant_moments_f4(const double* __restrict__ octant_mass,
+                                       const double* __restrict__ octant_sum_x,
+                                       const double* __restrict__ octant_sum_y,
+                                       const double* __restrict__ octant_sum_z,
+                                       const std::size_t count,
+                                       const double origin_x,
+                                       const double origin_y,
+                                       const double origin_z,
+                                       float4* __restrict__ out) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  const double mass = octant_mass[index];
+  if (mass > 0.0) {
+    out[index] = make_float4(static_cast<float>(octant_sum_x[index] / mass - origin_x),
+                             static_cast<float>(octant_sum_y[index] / mass - origin_y),
+                             static_cast<float>(octant_sum_z[index] / mass - origin_z),
+                             static_cast<float>(mass));
+  } else {
+    out[index] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  }
+}
+
+// Gathers the cell-sorted sources into SoA arrays so direct-sum loops stream
+// contiguous memory.
+__global__ void gather_sorted_sources(const SimCudaParticle* __restrict__ particles,
+                                      const int* __restrict__ sorted_particle_indices,
+                                      const std::uint32_t source_count,
+                                      double* __restrict__ out_x,
+                                      double* __restrict__ out_y,
+                                      double* __restrict__ out_z,
+                                      double* __restrict__ out_mass,
+                                      double* __restrict__ out_softening) {
+  const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+  if (slot >= source_count) {
+    return;
+  }
+  const int particle_index = sorted_particle_indices[slot];
+  const SimCudaParticle particle = particles[particle_index];
+  out_x[slot] = particle.position_kpc[0];
+  out_y[slot] = particle.position_kpc[1];
+  out_z[slot] = particle.position_kpc[2];
+  out_mass[slot] = particle.mass_msun;
+  out_softening[slot] = particle.softening_kpc;
+}
+
+// Real-space free-space (isolated) Green's function on the mesh, using the
+// minimum-image displacement. As long as every source-target pair is within
+// half a box length per axis (guaranteed by kGlobalDomainPadding > 2), the
+// circular convolution with this kernel reproduces the exact open-boundary
+// potential — no periodic images, unlike the naive -4*pi*G/k^2 spectrum.
+// Values are pre-multiplied by cell_volume so K (x) rho sums mass, not density.
+__global__ void fill_freespace_greens(cufftReal* greens,
+                                      const int nx,
+                                      const int ny,
+                                      const int nz,
+                                      const double cell_x,
+                                      const double cell_y,
+                                      const double cell_z,
+                                      const double grav_const) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t real_count =
+      static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
+  if (index >= real_count) {
+    return;
+  }
+
+  const int iz = static_cast<int>(index % static_cast<std::size_t>(nz));
+  const std::size_t xy = index / static_cast<std::size_t>(nz);
+  const int iy = static_cast<int>(xy % static_cast<std::size_t>(ny));
+  const int ix = static_cast<int>(xy / static_cast<std::size_t>(ny));
+
+  const double dx = static_cast<double>((ix <= nx / 2) ? ix : ix - nx) * cell_x;
+  const double dy = static_cast<double>((iy <= ny / 2) ? iy : iy - ny) * cell_y;
+  const double dz = static_cast<double>((iz <= nz / 2) ? iz : iz - nz) * cell_z;
+  const double r = sqrt(dx * dx + dy * dy + dz * dz);
+  const double cell_volume = cell_x * cell_y * cell_z;
+  const double mean_cell = cbrt(cell_volume);
+  // The r=0 self-cell value approximates the potential at the center of a
+  // uniform cube of the same volume; its exact value barely matters because
+  // the k-space split filter suppresses sub-cell scales anyway.
+  const double inv_r = (r > 0.25 * mean_cell) ? 1.0 / r : 2.5 / mean_cell;
+  greens[index] = static_cast<cufftReal>(-grav_const * cell_volume * inv_r);
+}
+
 __global__ void apply_potential_spectrum(const cufftComplex* density_k,
+                                         const cufftComplex* greens_k,
                                          cufftComplex* potential_k,
                                          const int nx,
                                          const int ny,
@@ -2594,7 +1821,7 @@ __global__ void apply_potential_spectrum(const cufftComplex* density_k,
                                          const double cell_y,
                                          const double cell_z,
                                          const double split_radius_kpc,
-                                         const float grav_const) {
+                                         const double inv_fft_cells) {
   const std::size_t index =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const std::size_t complex_count =
@@ -2618,12 +1845,6 @@ __global__ void apply_potential_spectrum(const cufftComplex* density_k,
   const float kz = static_cast<float>(2.0 * kPi * static_cast<double>(kz_index) / length_z);
   const float k_squared = kx * kx + ky * ky + kz * kz;
 
-  if (k_squared <= 1.0e-12f) {
-    potential_k[index].x = 0.0f;
-    potential_k[index].y = 0.0f;
-    return;
-  }
-
   const float wx = sinc_pi(0.5f * kx * static_cast<float>(cell_x));
   const float wy = sinc_pi(0.5f * ky * static_cast<float>(cell_y));
   const float wz = sinc_pi(0.5f * kz * static_cast<float>(cell_z));
@@ -2632,12 +1853,16 @@ __global__ void apply_potential_spectrum(const cufftComplex* density_k,
   const float deconvolution = 1.0f / fmaxf(window_sq * window_sq, 1.0e-4f);
   const float split = static_cast<float>(split_radius_kpc);
   const float long_range_filter = expf(-(k_squared * split * split));
+  // The extra inv_fft_cells normalizes the forward FFT of the Green's function
+  // (cuFFT is unnormalized; the density FFT's factor is applied at force
+  // sampling time as before).
   const float scale =
-      -static_cast<float>(kFourPi) * grav_const * deconvolution * long_range_filter / k_squared;
+      deconvolution * long_range_filter * static_cast<float>(inv_fft_cells);
 
   const cufftComplex rho = density_k[index];
-  potential_k[index].x = scale * rho.x;
-  potential_k[index].y = scale * rho.y;
+  const cufftComplex greens = greens_k[index];
+  potential_k[index].x = scale * (rho.x * greens.x - rho.y * greens.y);
+  potential_k[index].y = scale * (rho.x * greens.y + rho.y * greens.x);
 }
 
 __global__ void compute_force_from_potential(const cufftReal* potential_grid,
@@ -2701,51 +1926,6 @@ __global__ void compute_force_from_potential(const cufftReal* potential_grid,
       static_cast<float>(cell_z);
 }
 
-__global__ void compute_force_from_potential_clamped(const cufftReal* potential_grid,
-                                                     cufftReal* force_x,
-                                                     cufftReal* force_y,
-                                                     cufftReal* force_z,
-                                                     const int nx,
-                                                     const int ny,
-                                                     const int nz,
-                                                     const double cell_x,
-                                                     const double cell_y,
-                                                     const double cell_z) {
-  const std::size_t index =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const std::size_t real_count =
-      static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
-  if (index >= real_count) {
-    return;
-  }
-
-  const int iz = static_cast<int>(index % static_cast<std::size_t>(nz));
-  const std::size_t xy = index / static_cast<std::size_t>(nz);
-  const int iy = static_cast<int>(xy % static_cast<std::size_t>(ny));
-  const int ix = static_cast<int>(xy / static_cast<std::size_t>(ny));
-
-  const int ixm = clamp_index(ix - 1, nx);
-  const int ixp = clamp_index(ix + 1, nx);
-  const int iym = clamp_index(iy - 1, ny);
-  const int iyp = clamp_index(iy + 1, ny);
-  const int izm = clamp_index(iz - 1, nz);
-  const int izp = clamp_index(iz + 1, nz);
-
-  const float phi_xm = potential_grid[real_grid_index(ixm, iy, iz, ny, nz)];
-  const float phi_xp = potential_grid[real_grid_index(ixp, iy, iz, ny, nz)];
-  const float phi_ym = potential_grid[real_grid_index(ix, iym, iz, ny, nz)];
-  const float phi_yp = potential_grid[real_grid_index(ix, iyp, iz, ny, nz)];
-  const float phi_zm = potential_grid[real_grid_index(ix, iy, izm, ny, nz)];
-  const float phi_zp = potential_grid[real_grid_index(ix, iy, izp, ny, nz)];
-
-  const float dx = static_cast<float>((ixp == ixm) ? cell_x : (ixp - ixm) * cell_x);
-  const float dy = static_cast<float>((iyp == iym) ? cell_y : (iyp - iym) * cell_y);
-  const float dz = static_cast<float>((izp == izm) ? cell_z : (izp - izm) * cell_z);
-  force_x[index] = -(phi_xp - phi_xm) / fmaxf(dx, 1.0e-6f);
-  force_y[index] = -(phi_yp - phi_ym) / fmaxf(dy, 1.0e-6f);
-  force_z[index] = -(phi_zp - phi_zm) / fmaxf(dz, 1.0e-6f);
-}
-
 __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
                                       const std::uint64_t particle_count,
                                       const cufftReal* __restrict__ force_x,
@@ -2757,33 +1937,24 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
                                       const double origin_x,
                                       const double origin_y,
                                       const double origin_z,
-                                      const double length_x,
-                                      const double length_y,
-                                      const double length_z,
                                       const double cell_x,
                                       const double cell_y,
                                       const double cell_z,
-                                      const double inv_fft_cells,
-                                      const int* __restrict__ short_sorted_particle_indices,
+                                      const int* __restrict__ sorted_particle_indices,
+                                      const int* __restrict__ non_source_indices,
+                                      const std::uint32_t source_count,
                                       const int* __restrict__ short_cell_start,
                                       const int* __restrict__ short_cell_end,
-                                      const int* __restrict__ short_cell_interaction_start,
-                                      const double* __restrict__ short_cell_mass,
-                                      const double* __restrict__ short_cell_com_x,
-                                      const double* __restrict__ short_cell_com_y,
-                                      const double* __restrict__ short_cell_com_z,
-                                      const double* __restrict__ short_cell_octant_mass,
-                                      const double* __restrict__ short_cell_octant_com_x,
-                                      const double* __restrict__ short_cell_octant_com_y,
-                                      const double* __restrict__ short_cell_octant_com_z,
-                                      const ShortRangeInteractionSource* __restrict__ short_cell_interactions,
+                                      const double* __restrict__ sorted_source_x,
+                                      const double* __restrict__ sorted_source_y,
+                                      const double* __restrict__ sorted_source_z,
+                                      const double* __restrict__ sorted_source_mass,
+                                      const double* __restrict__ sorted_source_softening,
+                                      const float4* __restrict__ octant_moments,
                                       const float* __restrict__ short_force_factor_lut,
                                       const std::uint32_t short_force_factor_lut_size,
                                       const double short_force_factor_lut_scale,
-                                      const ShortRangeTreeNode* __restrict__ short_tree_nodes,
-                                      const int short_tree_root,
-                                      const std::uint32_t short_tree_node_count,
-                                      const int short_tree_particle_mode,
+                                      const PyramidDeviceView pyramid,
                                       const int short_nx,
                                       const int short_ny,
                                       const int short_nz,
@@ -2795,7 +1966,8 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
                                       const double short_cell_z,
                                       const double short_cutoff_kpc,
                                       const double short_pm_softening_kpc,
-                                      const double opening_angle,
+                                      const double max_softening_kpc,
+                                      const int direct_neighborhood_threshold,
                                       const int short_range_target_baryons_only,
                                       const int* __restrict__ galaxy_smbh_indices,
                                       const std::uint32_t galaxy_count,
@@ -2803,15 +1975,26 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
                                       const int enable_smbh_post_newtonian,
                                       double* __restrict__ max_accel_sq,
                                       const double dt_myr) {
-  const std::uint64_t index =
+  const std::uint64_t thread_slot =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index >= particle_count) {
+  if (thread_slot >= particle_count) {
     return;
   }
 
-  (void)length_x;
-  (void)length_y;
-  (void)length_z;
+  // Threads walk targets in cell-sorted order so a warp shares its
+  // interaction-list cells (and therefore its moment loads); the leftover
+  // non-source particles (SMBHs, filtered components) ride at the tail.
+  std::uint64_t index = thread_slot;
+  int self_slot = -1;
+  if (source_count > 0) {
+    if (thread_slot < source_count) {
+      index = static_cast<std::uint64_t>(sorted_particle_indices[thread_slot]);
+      self_slot = static_cast<int>(thread_slot);
+    } else {
+      index = static_cast<std::uint64_t>(
+          non_source_indices[thread_slot - source_count]);
+    }
+  }
 
   SimCudaParticle& particle = particles[index];
   const double particle_pos_x = particle.position_kpc[0];
@@ -2820,7 +2003,6 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
   const double particle_vel_x = particle.velocity_kms[0];
   const double particle_vel_y = particle.velocity_kms[1];
   const double particle_vel_z = particle.velocity_kms[2];
-  const double particle_mass = particle.mass_msun;
   const double particle_softening = particle.softening_kpc;
   const std::uint32_t particle_component = particle.component;
   const double short_cutoff_sq = short_cutoff_kpc * short_cutoff_kpc;
@@ -2846,409 +2028,249 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
                                ax,
                                ay,
                                az);
-  ax *= inv_fft_cells;
-  ay *= inv_fft_cells;
-  az *= inv_fft_cells;
+  // The force grid is already fully normalized: the density FFT and the
+  // Green's-function FFT normalizations are both applied in the spectrum pass.
 
-  if (particle_component != 3u &&
-      !(short_range_target_baryons_only != 0 && particle_component == 0u)) {
-    int particle_cell = -1;
-    int particle_cell_x = -1;
-    int particle_cell_y = -1;
-    int particle_cell_z = -1;
-    int neighbor_radius_x = 0;
-    int neighbor_radius_y = 0;
-    int neighbor_radius_z = 0;
-    bool use_direct_neighborhood = false;
-    if (short_tree_particle_mode == 0) {
-      const double gx = fmin(
-          fmax((particle_pos_x - short_origin_x) / short_cell_x, 0.0),
-          static_cast<double>(short_nx) - 1.000001);
-      const double gy = fmin(
-          fmax((particle_pos_y - short_origin_y) / short_cell_y, 0.0),
-          static_cast<double>(short_ny) - 1.000001);
-      const double gz = fmin(
-          fmax((particle_pos_z - short_origin_z) / short_cell_z, 0.0),
-          static_cast<double>(short_nz) - 1.000001);
-      particle_cell_x = static_cast<int>(floor(gx));
-      particle_cell_y = static_cast<int>(floor(gy));
-      particle_cell_z = static_cast<int>(floor(gz));
-      particle_cell = short_cell_linear_index(particle_cell_x,
-                                              particle_cell_y,
-                                              particle_cell_z,
-                                              short_ny,
-                                              short_nz);
-      neighbor_radius_x =
-          min(1, max(1, static_cast<int>(ceil(short_cutoff_kpc / fmax(short_cell_x, 1.0e-6)))));
-      neighbor_radius_y =
-          min(1, max(1, static_cast<int>(ceil(short_cutoff_kpc / fmax(short_cell_y, 1.0e-6)))));
-      neighbor_radius_z =
-          min(1, max(1, static_cast<int>(ceil(short_cutoff_kpc / fmax(short_cell_z, 1.0e-6)))));
-      const int start = short_cell_start[particle_cell];
-      if (start >= 0) {
-        const int direct_neighborhood_threshold =
-            particle_count <= 300'000u ? kShortRangeDirectNeighborhoodThresholdLowN
-                                       : kShortRangeDirectNeighborhoodThresholdDefault;
-        const double cell_half_x = 0.5 * short_cell_x;
-        const double cell_half_y = 0.5 * short_cell_y;
-        const double cell_half_z = 0.5 * short_cell_z;
-        int local_occupancy = 0;
-        bool neighborhood_too_dense = false;
-        for (int neighbor_x = max(0, particle_cell_x - neighbor_radius_x);
-             neighbor_x <= min(short_nx - 1, particle_cell_x + neighbor_radius_x) &&
-             !neighborhood_too_dense;
-             ++neighbor_x) {
-          for (int neighbor_y = max(0, particle_cell_y - neighbor_radius_y);
-               neighbor_y <= min(short_ny - 1, particle_cell_y + neighbor_radius_y) &&
-               !neighborhood_too_dense;
-               ++neighbor_y) {
-            for (int neighbor_z = max(0, particle_cell_z - neighbor_radius_z);
-                 neighbor_z <= min(short_nz - 1, particle_cell_z + neighbor_radius_z);
-                 ++neighbor_z) {
-              const double center_x =
-                  short_origin_x + (static_cast<double>(neighbor_x) + 0.5) * short_cell_x;
-              const double center_y =
-                  short_origin_y + (static_cast<double>(neighbor_y) + 0.5) * short_cell_y;
-              const double center_z =
-                  short_origin_z + (static_cast<double>(neighbor_z) + 0.5) * short_cell_z;
-              const double dx_aabb =
-                  fmax(fabs(particle_pos_x - center_x) - cell_half_x, 0.0);
-              const double dy_aabb =
-                  fmax(fabs(particle_pos_y - center_y) - cell_half_y, 0.0);
-              const double dz_aabb =
-                  fmax(fabs(particle_pos_z - center_z) - cell_half_z, 0.0);
-              if (dx_aabb * dx_aabb + dy_aabb * dy_aabb + dz_aabb * dz_aabb > short_cutoff_sq) {
-                continue;
-              }
-              const int neighbor_cell =
-                  short_cell_linear_index(neighbor_x, neighbor_y, neighbor_z, short_ny, short_nz);
-              const int neighbor_start = short_cell_start[neighbor_cell];
-              if (neighbor_start < 0) {
-                continue;
-              }
-              local_occupancy += short_cell_end[neighbor_cell] - neighbor_start;
-              if (local_occupancy > direct_neighborhood_threshold) {
-                neighborhood_too_dense = true;
-                break;
-              }
-            }
+  // Short-range TreePM correction, only inside the (baryon-tight) short box;
+  // outside it the PM force is the whole story.
+  const double target_gx = (particle_pos_x - short_origin_x) / short_cell_x;
+  const double target_gy = (particle_pos_y - short_origin_y) / short_cell_y;
+  const double target_gz = (particle_pos_z - short_origin_z) / short_cell_z;
+  const bool inside_short_box =
+      target_gx >= 0.0 && target_gy >= 0.0 && target_gz >= 0.0 &&
+      target_gx < static_cast<double>(short_nx) &&
+      target_gy < static_cast<double>(short_ny) &&
+      target_gz < static_cast<double>(short_nz);
+  const bool wants_short_range = pyramid.level_count > 0 && inside_short_box &&
+      !(short_range_target_baryons_only != 0 && particle_component == 0u);
+  if (wants_short_range) {
+    const int fine_ix = min(static_cast<int>(floor(target_gx)), short_nx - 1);
+    const int fine_iy = min(static_cast<int>(floor(target_gy)), short_ny - 1);
+    const int fine_iz = min(static_cast<int>(floor(target_gz)), short_nz - 1);
+
+    const int nbr_x0 = max(0, fine_ix - 1);
+    const int nbr_x1 = min(short_nx - 1, fine_ix + 1);
+    const int nbr_y0 = max(0, fine_iy - 1);
+    const int nbr_y1 = min(short_ny - 1, fine_iy + 1);
+    const int nbr_z0 = max(0, fine_iz - 1);
+    const int nbr_z1 = min(short_nz - 1, fine_iz + 1);
+
+    // Region(0): the 3x3x3 fine-cell neighborhood. Use direct particle sums if
+    // it is sparse enough, otherwise exact pairs for the particle's own cell
+    // plus octant moments for the 26 neighbors.
+    int neighborhood_occupancy = 0;
+    for (int cx = nbr_x0; cx <= nbr_x1 && neighborhood_occupancy <= direct_neighborhood_threshold; ++cx) {
+      for (int cy = nbr_y0; cy <= nbr_y1 && neighborhood_occupancy <= direct_neighborhood_threshold; ++cy) {
+        for (int cz = nbr_z0; cz <= nbr_z1; ++cz) {
+          const int cell = short_cell_linear_index(cx, cy, cz, short_ny, short_nz);
+          const int start = short_cell_start[cell];
+          if (start < 0) {
+            continue;
           }
-        }
-        use_direct_neighborhood = !neighborhood_too_dense;
-        if (use_direct_neighborhood) {
-          for (int neighbor_x = max(0, particle_cell_x - neighbor_radius_x);
-               neighbor_x <= min(short_nx - 1, particle_cell_x + neighbor_radius_x);
-               ++neighbor_x) {
-            for (int neighbor_y = max(0, particle_cell_y - neighbor_radius_y);
-                 neighbor_y <= min(short_ny - 1, particle_cell_y + neighbor_radius_y);
-                 ++neighbor_y) {
-              for (int neighbor_z = max(0, particle_cell_z - neighbor_radius_z);
-                   neighbor_z <= min(short_nz - 1, particle_cell_z + neighbor_radius_z);
-                   ++neighbor_z) {
-                const double center_x =
-                    short_origin_x + (static_cast<double>(neighbor_x) + 0.5) * short_cell_x;
-                const double center_y =
-                    short_origin_y + (static_cast<double>(neighbor_y) + 0.5) * short_cell_y;
-                const double center_z =
-                    short_origin_z + (static_cast<double>(neighbor_z) + 0.5) * short_cell_z;
-                const double dx_aabb =
-                    fmax(fabs(particle_pos_x - center_x) - cell_half_x, 0.0);
-                const double dy_aabb =
-                    fmax(fabs(particle_pos_y - center_y) - cell_half_y, 0.0);
-                const double dz_aabb =
-                    fmax(fabs(particle_pos_z - center_z) - cell_half_z, 0.0);
-                if (dx_aabb * dx_aabb + dy_aabb * dy_aabb + dz_aabb * dz_aabb >
-                    short_cutoff_sq) {
-                  continue;
-                }
-
-                const int neighbor_cell = short_cell_linear_index(
-                    neighbor_x, neighbor_y, neighbor_z, short_ny, short_nz);
-                const int neighbor_start = short_cell_start[neighbor_cell];
-                if (neighbor_start < 0) {
-                  continue;
-                }
-                const int neighbor_end = short_cell_end[neighbor_cell];
-                for (int sorted_index = neighbor_start; sorted_index < neighbor_end; ++sorted_index) {
-                  const int source_index = short_sorted_particle_indices[sorted_index];
-                  if (source_index < 0 ||
-                      static_cast<std::uint64_t>(source_index) >= particle_count ||
-                      source_index == static_cast<int>(index)) {
-                    continue;
-                  }
-
-                  const SimCudaParticle source = particles[source_index];
-                  const double dx = source.position_kpc[0] - particle_pos_x;
-                  const double dy = source.position_kpc[1] - particle_pos_y;
-                  const double dz = source.position_kpc[2] - particle_pos_z;
-                  const double r2 = dx * dx + dy * dy + dz * dz;
-                  if (r2 <= 1.0e-12 || r2 > short_cutoff_sq) {
-                    continue;
-                  }
-
-                  const double short_softening = fmax(particle_softening, source.softening_kpc);
-                  const double direct_scale =
-                      grav_const * source.mass_msun * softened_inv_r3(dx, dy, dz, short_softening);
-                  const double correction_scale =
-                      direct_scale * treepm_short_range_force_factor_lookup(short_force_factor_lut,
-                                                                            short_force_factor_lut_size,
-                                                                            short_force_factor_lut_scale,
-                                                                            r2,
-                                                                            short_pm_softening_kpc);
-                  ax += correction_scale * dx;
-                  ay += correction_scale * dy;
-                  az += correction_scale * dz;
-                }
-              }
-            }
+          neighborhood_occupancy += short_cell_end[cell] - start;
+          if (neighborhood_occupancy > direct_neighborhood_threshold) {
+            break;
           }
-        } else {
-        const int end = short_cell_end[particle_cell];
-        const int occupancy = end - start;
-        if (occupancy <= kShortRangeDirectCellThreshold) {
-          for (int sorted_index = start; sorted_index < end; ++sorted_index) {
-            const int source_index = short_sorted_particle_indices[sorted_index];
-            if (source_index < 0 ||
-                static_cast<std::uint64_t>(source_index) >= particle_count ||
-                source_index == static_cast<int>(index)) {
-              continue;
-            }
-
-            const SimCudaParticle source = particles[source_index];
-            const double dx = source.position_kpc[0] - particle_pos_x;
-            const double dy = source.position_kpc[1] - particle_pos_y;
-            const double dz = source.position_kpc[2] - particle_pos_z;
-            const double r2 = dx * dx + dy * dy + dz * dz;
-            if (r2 <= 1.0e-12 || r2 > short_cutoff_sq) {
-              continue;
-            }
-
-            const double short_softening = fmax(particle_softening, source.softening_kpc);
-            const double direct_scale =
-                grav_const * source.mass_msun * softened_inv_r3(dx, dy, dz, short_softening);
-            const double correction_scale =
-                direct_scale * treepm_short_range_force_factor_lookup(short_force_factor_lut,
-                                                                      short_force_factor_lut_size,
-                                                                      short_force_factor_lut_scale,
-                                                                      r2,
-                                                                      short_pm_softening_kpc);
-            ax += correction_scale * dx;
-            ay += correction_scale * dy;
-            az += correction_scale * dz;
-          }
-        } else {
-          const int cell_plane = short_ny * short_nz;
-          const int cell_x_index = particle_cell / cell_plane;
-          const int rem = particle_cell - cell_x_index * cell_plane;
-          const int cell_y_index = rem / short_nz;
-          const int cell_z_index = rem - cell_y_index * short_nz;
-          const double center_x =
-              short_origin_x + (static_cast<double>(cell_x_index) + 0.5) * short_cell_x;
-          const double center_y =
-              short_origin_y + (static_cast<double>(cell_y_index) + 0.5) * short_cell_y;
-          const double center_z =
-              short_origin_z + (static_cast<double>(cell_z_index) + 0.5) * short_cell_z;
-          const int particle_octant =
-              (particle_pos_x >= center_x ? 1 : 0) |
-              (particle_pos_y >= center_y ? 2 : 0) |
-              (particle_pos_z >= center_z ? 4 : 0);
-          const double cell_softening =
-              fmax(particle_softening, 0.5 * fmax(short_cell_x, fmax(short_cell_y, short_cell_z)));
-          const std::size_t cell_base = static_cast<std::size_t>(particle_cell) * 8u;
-          for (int octant = 0; octant < 8; ++octant) {
-            const std::size_t slot = cell_base + static_cast<std::size_t>(octant);
-            double mass = short_cell_octant_mass[slot];
-            if (!(mass > 0.0)) {
-              continue;
-            }
-            double sum_x = short_cell_octant_com_x[slot];
-            double sum_y = short_cell_octant_com_y[slot];
-            double sum_z = short_cell_octant_com_z[slot];
-            if (octant == particle_octant) {
-              mass -= particle_mass;
-              if (!(mass > 0.0)) {
-                continue;
-              }
-              sum_x -= particle_mass * particle_pos_x;
-              sum_y -= particle_mass * particle_pos_y;
-              sum_z -= particle_mass * particle_pos_z;
-            }
-            const double com_x = sum_x / mass;
-            const double com_y = sum_y / mass;
-            const double com_z = sum_z / mass;
-            const double dx = com_x - particle_pos_x;
-            const double dy = com_y - particle_pos_y;
-            const double dz = com_z - particle_pos_z;
-            const double r2 = dx * dx + dy * dy + dz * dz;
-            if (r2 <= 1.0e-12 || r2 > short_cutoff_sq) {
-              continue;
-            }
-
-            const double direct_scale =
-                grav_const * mass * softened_inv_r3(dx, dy, dz, cell_softening);
-            const double correction_scale =
-                direct_scale * treepm_short_range_force_factor_lookup(short_force_factor_lut,
-                                                                      short_force_factor_lut_size,
-                                                                      short_force_factor_lut_scale,
-                                                                      r2,
-                                                                      short_pm_softening_kpc);
-            ax += correction_scale * dx;
-            ay += correction_scale * dy;
-            az += correction_scale * dz;
-          }
-        }
         }
       }
     }
 
-    if (!use_direct_neighborhood && short_tree_particle_mode == 0 && particle_cell >= 0) {
-      const double cell_half_x = 0.5 * short_cell_x;
-      const double cell_half_y = 0.5 * short_cell_y;
-      const double cell_half_z = 0.5 * short_cell_z;
-      const double cell_softening =
-          fmax(particle_softening, 0.5 * fmax(short_cell_x, fmax(short_cell_y, short_cell_z)));
+    const bool sparse_neighborhood =
+        neighborhood_occupancy <= direct_neighborhood_threshold;
+    const int own_cell = short_cell_linear_index(fine_ix, fine_iy, fine_iz, short_ny, short_nz);
 
-      for (int neighbor_x = max(0, particle_cell_x - neighbor_radius_x);
-           neighbor_x <= min(short_nx - 1, particle_cell_x + neighbor_radius_x);
-           ++neighbor_x) {
-        for (int neighbor_y = max(0, particle_cell_y - neighbor_radius_y);
-             neighbor_y <= min(short_ny - 1, particle_cell_y + neighbor_radius_y);
-             ++neighbor_y) {
-          for (int neighbor_z = max(0, particle_cell_z - neighbor_radius_z);
-               neighbor_z <= min(short_nz - 1, particle_cell_z + neighbor_radius_z);
-               ++neighbor_z) {
-            const int neighbor_cell =
-                short_cell_linear_index(neighbor_x, neighbor_y, neighbor_z, short_ny, short_nz);
-            if (neighbor_cell == particle_cell) {
+    for (int cx = nbr_x0; cx <= nbr_x1; ++cx) {
+      for (int cy = nbr_y0; cy <= nbr_y1; ++cy) {
+        for (int cz = nbr_z0; cz <= nbr_z1; ++cz) {
+          const int cell = short_cell_linear_index(cx, cy, cz, short_ny, short_nz);
+          if (!sparse_neighborhood && cell != own_cell) {
+            continue;
+          }
+          const int start = short_cell_start[cell];
+          if (start < 0) {
+            continue;
+          }
+          const int end = short_cell_end[cell];
+          for (int slot = start; slot < end; ++slot) {
+            if (slot == self_slot) {
               continue;
             }
-
-            const double center_x =
-                short_origin_x + (static_cast<double>(neighbor_x) + 0.5) * short_cell_x;
-            const double center_y =
-                short_origin_y + (static_cast<double>(neighbor_y) + 0.5) * short_cell_y;
-            const double center_z =
-                short_origin_z + (static_cast<double>(neighbor_z) + 0.5) * short_cell_z;
-            const double dx_aabb =
-                fmax(fabs(particle_pos_x - center_x) - cell_half_x, 0.0);
-            const double dy_aabb =
-                fmax(fabs(particle_pos_y - center_y) - cell_half_y, 0.0);
-            const double dz_aabb =
-                fmax(fabs(particle_pos_z - center_z) - cell_half_z, 0.0);
-            if (dx_aabb * dx_aabb + dy_aabb * dy_aabb + dz_aabb * dz_aabb > short_cutoff_sq) {
-              continue;
-            }
-
-            const int start = short_cell_start[neighbor_cell];
-            if (start < 0) {
-              continue;
-            }
-            const double mass = short_cell_mass[neighbor_cell];
-            if (!(mass > 0.0)) {
-              continue;
-            }
-            const double dx = short_cell_com_x[neighbor_cell] - particle_pos_x;
-            const double dy = short_cell_com_y[neighbor_cell] - particle_pos_y;
-            const double dz = short_cell_com_z[neighbor_cell] - particle_pos_z;
+            const double dx = sorted_source_x[slot] - particle_pos_x;
+            const double dy = sorted_source_y[slot] - particle_pos_y;
+            const double dz = sorted_source_z[slot] - particle_pos_z;
             const double r2 = dx * dx + dy * dy + dz * dz;
             if (r2 <= 1.0e-12 || r2 > short_cutoff_sq) {
               continue;
             }
 
-            const double direct_scale =
-                grav_const * mass * softened_inv_r3(dx, dy, dz, cell_softening);
+            const double short_softening =
+                fmax(particle_softening, sorted_source_softening[slot]);
             const double correction_scale =
-                direct_scale * treepm_short_range_force_factor_lookup(short_force_factor_lut,
-                                                                      short_force_factor_lut_size,
-                                                                      short_force_factor_lut_scale,
-                                                                      r2,
-                                                                      short_pm_softening_kpc);
+                grav_const * sorted_source_mass[slot] *
+                softened_inv_r3(dx, dy, dz, short_softening) *
+                treepm_short_range_force_factor_lookup(short_force_factor_lut,
+                                                       short_force_factor_lut_size,
+                                                       short_force_factor_lut_scale,
+                                                       r2,
+                                                       short_pm_softening_kpc);
             ax += correction_scale * dx;
             ay += correction_scale * dy;
             az += correction_scale * dz;
           }
         }
       }
-    } else if (short_tree_nodes != nullptr && short_tree_root >= 0 && short_tree_node_count > 0) {
-      int stack[64];
-      int stack_size = 0;
-      stack[stack_size++] = short_tree_root;
-      const double theta_sq = opening_angle * opening_angle;
-      while (stack_size > 0) {
-        const int node_index = stack[--stack_size];
-        if (node_index < 0 || static_cast<std::uint32_t>(node_index) >= short_tree_node_count) {
-          continue;
-        }
+    }
 
-        const ShortRangeTreeNode node = short_tree_nodes[node_index];
-        if (node.mass <= 0.0) {
-          continue;
-        }
+    // Single-precision monopole paths: coordinates are relative to the short
+    // box origin, so float precision is ~1e-4 kpc against evaluation distances
+    // of at least one cell.
+    const float pxf = static_cast<float>(particle_pos_x - short_origin_x);
+    const float pyf = static_cast<float>(particle_pos_y - short_origin_y);
+    const float pzf = static_cast<float>(particle_pos_z - short_origin_z);
+    const float cutoff_sq_f = static_cast<float>(short_cutoff_sq);
+    const float grav_f = static_cast<float>(grav_const);
+    const float lut_scale_f = static_cast<float>(short_force_factor_lut_scale);
+    float fax = 0.0f;
+    float fay = 0.0f;
+    float faz = 0.0f;
 
-        const bool is_leaf = node.child_mask == 0;
-        if (short_tree_particle_mode == 0 && is_leaf && node.cell_id == particle_cell) {
-          continue;
-        }
-
-        const double dx = node.com[0] - particle_pos_x;
-        const double dy = node.com[1] - particle_pos_y;
-        const double dz = node.com[2] - particle_pos_z;
-        const double dx_aabb =
-            fmax(fabs(particle_pos_x - node.center[0]) - node.half_size, 0.0);
-        const double dy_aabb =
-            fmax(fabs(particle_pos_y - node.center[1]) - node.half_size, 0.0);
-        const double dz_aabb =
-            fmax(fabs(particle_pos_z - node.center[2]) - node.half_size, 0.0);
-        if (dx_aabb * dx_aabb + dy_aabb * dy_aabb + dz_aabb * dz_aabb > short_cutoff_sq) {
-          continue;
-        }
-        const double r2 = dx * dx + dy * dy + dz * dz;
-        if (r2 <= 1.0e-12) {
-          continue;
-        }
-
-        if (short_tree_particle_mode != 0) {
-          const bool contains_particle =
-              fabs(particle_pos_x - node.center[0]) <= node.half_size &&
-              fabs(particle_pos_y - node.center[1]) <= node.half_size &&
-              fabs(particle_pos_z - node.center[2]) <= node.half_size;
-          if (contains_particle && !is_leaf && stack_size <= 56) {
-            for (int child = 0; child < 8; ++child) {
-              if ((node.child_mask & static_cast<std::uint8_t>(1u << child)) != 0) {
-                stack[stack_size++] = node.child[child];
+    if (!sparse_neighborhood) {
+      // Just enough softening to keep a near-coincident neighbor-octant COM
+      // from producing a huge kick; anything larger systematically suppresses
+      // close forces in dense regions.
+      const float octant_eps = static_cast<float>(fmax(
+          particle_softening, 0.125 * fmax(short_cell_x, fmax(short_cell_y, short_cell_z))));
+      const float octant_eps_sq = octant_eps * octant_eps;
+      for (int cx = nbr_x0; cx <= nbr_x1; ++cx) {
+        for (int cy = nbr_y0; cy <= nbr_y1; ++cy) {
+          for (int cz = nbr_z0; cz <= nbr_z1; ++cz) {
+            const int cell = short_cell_linear_index(cx, cy, cz, short_ny, short_nz);
+            if (cell == own_cell) {
+              continue;
+            }
+            const std::size_t cell_base = static_cast<std::size_t>(cell) * 8u;
+            for (int octant = 0; octant < 8; ++octant) {
+              const float4 moment = octant_moments[cell_base + static_cast<std::size_t>(octant)];
+              if (!(moment.w > 0.0f)) {
+                continue;
               }
+              const float dx = moment.x - pxf;
+              const float dy = moment.y - pyf;
+              const float dz = moment.z - pzf;
+              const float r2 = dx * dx + dy * dy + dz * dz;
+              if (r2 <= 1.0e-8f || r2 > cutoff_sq_f) {
+                continue;
+              }
+
+              const float inv_r = rsqrtf(r2 + octant_eps_sq);
+              const float scale = grav_f * moment.w * inv_r * inv_r * inv_r *
+                  treepm_short_range_force_factor_lookup_f(short_force_factor_lut,
+                                                           short_force_factor_lut_size,
+                                                           lut_scale_f,
+                                                           r2);
+              fax += scale * dx;
+              fay += scale * dy;
+              faz += scale * dz;
             }
-            continue;
-          }
-          if (is_leaf && node.particle_index == static_cast<int>(index)) {
-            continue;
           }
         }
-
-        const double size_over_r_sq = (4.0 * node.half_size * node.half_size) / r2;
-        if (!is_leaf && size_over_r_sq > theta_sq && stack_size <= 56) {
-          for (int child = 0; child < 8; ++child) {
-            if ((node.child_mask & static_cast<std::uint8_t>(1u << child)) != 0) {
-              stack[stack_size++] = node.child[child];
-            }
-          }
-          continue;
-        }
-
-        const double node_softening = fmax(particle_softening, node.softening_kpc);
-        const double direct_scale =
-            grav_const * node.mass * softened_inv_r3(dx, dy, dz, node_softening);
-        const double correction_scale =
-            direct_scale * treepm_short_range_force_factor_lookup(short_force_factor_lut,
-                                                                  short_force_factor_lut_size,
-                                                                  short_force_factor_lut_scale,
-                                                                  r2,
-                                                                  short_pm_softening_kpc);
-        ax += correction_scale * dx;
-        ay += correction_scale * dy;
-        az += correction_scale * dz;
       }
     }
+
+    // Interaction lists per pyramid level (FMM-style V-lists): at each level
+    // visit the children of the parent cell's neighborhood that are not
+    // themselves neighbors of the particle's cell at that level. Together with
+    // Region(0) above this tiles the grid exactly once out to the cutoff.
+    const float node_eps = static_cast<float>(fmax(particle_softening, max_softening_kpc));
+    const float node_eps_sq = node_eps * node_eps;
+    for (int level = 0; level + 1 < pyramid.level_count; ++level) {
+      const float level_cell_x = static_cast<float>(short_cell_x) * static_cast<float>(1 << level);
+      const float level_cell_y = static_cast<float>(short_cell_y) * static_cast<float>(1 << level);
+      const float level_cell_z = static_cast<float>(short_cell_z) * static_cast<float>(1 << level);
+      const float half_lx = 0.5f * level_cell_x;
+      const float half_ly = 0.5f * level_cell_y;
+      const float half_lz = 0.5f * level_cell_z;
+      const int own_x = fine_ix >> level;
+      const int own_y = fine_iy >> level;
+      const int own_z = fine_iz >> level;
+      const int parent_x = fine_ix >> (level + 1);
+      const int parent_y = fine_iy >> (level + 1);
+      const int parent_z = fine_iz >> (level + 1);
+      const int level_ny = pyramid.ny[level];
+      const int level_nz = pyramid.nz[level];
+      const float4* __restrict__ level_moments = pyramid.moments[level];
+
+      const int vx0 = max(0, 2 * (parent_x - 1));
+      const int vx1 = min(pyramid.nx[level] - 1, 2 * (parent_x + 1) + 1);
+      const int vy0 = max(0, 2 * (parent_y - 1));
+      const int vy1 = min(level_ny - 1, 2 * (parent_y + 1) + 1);
+      const int vz0 = max(0, 2 * (parent_z - 1));
+      const int vz1 = min(level_nz - 1, 2 * (parent_z + 1) + 1);
+
+      for (int cx = vx0; cx <= vx1; ++cx) {
+        const bool near_x = cx >= own_x - 1 && cx <= own_x + 1;
+        const float center_x = (static_cast<float>(cx) + 0.5f) * level_cell_x;
+        const float dx_aabb = fmaxf(fabsf(pxf - center_x) - half_lx, 0.0f);
+        const float dx_aabb_sq = dx_aabb * dx_aabb;
+        if (dx_aabb_sq > cutoff_sq_f) {
+          continue;
+        }
+        for (int cy = vy0; cy <= vy1; ++cy) {
+          const bool near_xy = near_x && cy >= own_y - 1 && cy <= own_y + 1;
+          const float center_y = (static_cast<float>(cy) + 0.5f) * level_cell_y;
+          const float dy_aabb = fmaxf(fabsf(pyf - center_y) - half_ly, 0.0f);
+          const float dxy_aabb_sq = dx_aabb_sq + dy_aabb * dy_aabb;
+          if (dxy_aabb_sq > cutoff_sq_f) {
+            continue;
+          }
+          for (int cz = vz0; cz <= vz1; ++cz) {
+            if (near_xy && cz >= own_z - 1 && cz <= own_z + 1) {
+              continue;
+            }
+            const float center_z = (static_cast<float>(cz) + 0.5f) * level_cell_z;
+            const float dz_aabb = fmaxf(fabsf(pzf - center_z) - half_lz, 0.0f);
+            if (dxy_aabb_sq + dz_aabb * dz_aabb > cutoff_sq_f) {
+              continue;
+            }
+
+            const float4 moment =
+                level_moments[short_cell_linear_index(cx, cy, cz, level_ny, level_nz)];
+            if (!(moment.w > 0.0f)) {
+              continue;
+            }
+            const float dx = moment.x - pxf;
+            const float dy = moment.y - pyf;
+            const float dz = moment.z - pzf;
+            const float r2 = dx * dx + dy * dy + dz * dz;
+            if (r2 <= 1.0e-8f) {
+              continue;
+            }
+
+            const float inv_r = rsqrtf(r2 + node_eps_sq);
+            const float scale = grav_f * moment.w * inv_r * inv_r * inv_r *
+                treepm_short_range_force_factor_lookup_f(short_force_factor_lut,
+                                                         short_force_factor_lut_size,
+                                                         lut_scale_f,
+                                                         r2);
+            fax += scale * dx;
+            fay += scale * dy;
+            faz += scale * dz;
+          }
+        }
+      }
+
+      // Region(level + 1) already covers the cutoff sphere: deeper levels are
+      // entirely beyond the correction radius.
+      const double coverage = static_cast<double>(1 << (level + 1)) *
+                              fmin(short_cell_x, fmin(short_cell_y, short_cell_z));
+      if (coverage >= short_cutoff_kpc) {
+        break;
+      }
+    }
+
+    ax += static_cast<double>(fax);
+    ay += static_cast<double>(fay);
+    az += static_cast<double>(faz);
   }
 
   for (std::uint32_t galaxy_index = 0; galaxy_index < galaxy_count; ++galaxy_index) {
@@ -3278,121 +2300,6 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
   particle.velocity_kms[0] = particle_vel_x + ax * dt_myr * kKpcPerKmPerMyr;
   particle.velocity_kms[1] = particle_vel_y + ay * dt_myr * kKpcPerKmPerMyr;
   particle.velocity_kms[2] = particle_vel_z + az * dt_myr * kKpcPerKmPerMyr;
-}
-
-__global__ void apply_local_mesh_correction(SimCudaParticle* particles,
-                                            const std::uint64_t particle_count,
-                                            const cufftReal* fine_force_x,
-                                            const cufftReal* fine_force_y,
-                                            const cufftReal* fine_force_z,
-                                            const int fine_nx,
-                                            const int fine_ny,
-                                            const int fine_nz,
-                                            const double fine_origin_x,
-                                            const double fine_origin_y,
-                                            const double fine_origin_z,
-                                            const double fine_cell_x,
-                                            const double fine_cell_y,
-                                            const double fine_cell_z,
-                                            const double fine_inv_fft_cells,
-                                            const cufftReal* coarse_force_x,
-                                            const cufftReal* coarse_force_y,
-                                            const cufftReal* coarse_force_z,
-                                            const int coarse_nx,
-                                            const int coarse_ny,
-                                            const int coarse_nz,
-                                            const double coarse_origin_x,
-                                            const double coarse_origin_y,
-                                            const double coarse_origin_z,
-                                            const double coarse_cell_x,
-                                            const double coarse_cell_y,
-                                            const double coarse_cell_z,
-                                            const double coarse_inv_fft_cells,
-                                            const double center_x,
-                                            const double center_y,
-                                            const double center_z,
-                                            const double half_x,
-                                            const double half_y,
-                                            const double half_z,
-                                            const double dt_myr) {
-  const std::uint64_t index =
-      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index >= particle_count) {
-    return;
-  }
-
-  SimCudaParticle& particle = particles[index];
-  if (particle.component == 3u) {
-    return;
-  }
-
-  const double dx = particle.position_kpc[0] - center_x;
-  const double dy = particle.position_kpc[1] - center_y;
-  const double dz = particle.position_kpc[2] - center_z;
-  const double qx = fabs(dx) / fmax(half_x, 1.0e-6);
-  const double qy = fabs(dy) / fmax(half_y, 1.0e-6);
-  const double qz = fabs(dz) / fmax(half_z, 1.0e-6);
-  const double q = fmax(qx, fmax(qy, qz));
-  if (q >= 1.0) {
-    return;
-  }
-
-  const double t = fmin(1.0, q / kLocalCorrectionBlendExtent);
-  const double weight = 1.0 - t * t * (3.0 - 2.0 * t);
-
-  double ax_fine = 0.0;
-  double ay_fine = 0.0;
-  double az_fine = 0.0;
-  sample_grid_trilinear_vector_local(fine_force_x,
-                                     fine_force_y,
-                                     fine_force_z,
-                                     fine_nx,
-                                     fine_ny,
-                                     fine_nz,
-                                     fine_origin_x,
-                                     fine_origin_y,
-                                     fine_origin_z,
-                                     fine_cell_x,
-                                     fine_cell_y,
-                                     fine_cell_z,
-                                     particle.position_kpc[0],
-                                     particle.position_kpc[1],
-                                     particle.position_kpc[2],
-                                     ax_fine,
-                                     ay_fine,
-                                     az_fine);
-  ax_fine *= fine_inv_fft_cells;
-  ay_fine *= fine_inv_fft_cells;
-  az_fine *= fine_inv_fft_cells;
-
-  double ax_coarse = 0.0;
-  double ay_coarse = 0.0;
-  double az_coarse = 0.0;
-  sample_grid_trilinear_vector_local(coarse_force_x,
-                                     coarse_force_y,
-                                     coarse_force_z,
-                                     coarse_nx,
-                                     coarse_ny,
-                                     coarse_nz,
-                                     coarse_origin_x,
-                                     coarse_origin_y,
-                                     coarse_origin_z,
-                                     coarse_cell_x,
-                                     coarse_cell_y,
-                                     coarse_cell_z,
-                                     particle.position_kpc[0],
-                                     particle.position_kpc[1],
-                                     particle.position_kpc[2],
-                                     ax_coarse,
-                                     ay_coarse,
-                                     az_coarse);
-  ax_coarse *= coarse_inv_fft_cells;
-  ay_coarse *= coarse_inv_fft_cells;
-  az_coarse *= coarse_inv_fft_cells;
-
-  particle.velocity_kms[0] += (ax_fine - ax_coarse) * weight * dt_myr * kKpcPerKmPerMyr;
-  particle.velocity_kms[1] += (ay_fine - ay_coarse) * weight * dt_myr * kKpcPerKmPerMyr;
-  particle.velocity_kms[2] += (az_fine - az_coarse) * weight * dt_myr * kKpcPerKmPerMyr;
 }
 
 __global__ void drift_particles(SimCudaParticle* particles,
@@ -3460,7 +2367,53 @@ SimCudaPreviewParticle preview_particle_from_host_particle(const SimCudaParticle
   return preview;
 }
 
+// (Re)builds the FFT of the free-space Green's function whenever the global
+// box geometry changes; the grow-only domain ratchet makes this rare.
+int ensure_freespace_greens(DeviceState* state,
+                            char* error_buffer,
+                            const std::size_t error_buffer_len) {
+  if (state->greens_box[0] == state->box_length[0] &&
+      state->greens_box[1] == state->box_length[1] &&
+      state->greens_box[2] == state->box_length[2]) {
+    return 0;
+  }
+
+  const int threads_per_block = 256;
+  const int real_blocks =
+      static_cast<int>((state->real_count + threads_per_block - 1) / threads_per_block);
+  fill_freespace_greens<<<real_blocks, threads_per_block, 0, state->compute_stream>>>(
+      state->potential_grid,
+      state->nx,
+      state->ny,
+      state->nz,
+      state->cell_size[0],
+      state->cell_size[1],
+      state->cell_size[2],
+      state->grav_const);
+  const cudaError_t cuda_status = cudaGetLastError();
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "Green's function fill kernel failed", cuda_status);
+    return 1;
+  }
+
+  const cufftResult fft_status =
+      cufftExecR2C(state->forward_plan, state->potential_grid, state->greens_k);
+  if (fft_status != CUFFT_SUCCESS) {
+    fill_cufft_error(error_buffer, error_buffer_len, "Green's function FFT failed", fft_status);
+    return 1;
+  }
+
+  state->greens_box[0] = state->box_length[0];
+  state->greens_box[1] = state->box_length[1];
+  state->greens_box[2] = state->box_length[2];
+  return 0;
+}
+
 int build_force_mesh(DeviceState* state, char* error_buffer, const std::size_t error_buffer_len) {
+  if (ensure_freespace_greens(state, error_buffer, error_buffer_len) != 0) {
+    return 1;
+  }
+
   const cudaError_t clear_status =
       cudaMemsetAsync(state->density_grid,
                       0,
@@ -3508,6 +2461,7 @@ int build_force_mesh(DeviceState* state, char* error_buffer, const std::size_t e
       static_cast<int>((state->complex_count + threads_per_block - 1) / threads_per_block);
   apply_potential_spectrum<<<complex_blocks, threads_per_block, 0, state->compute_stream>>>(
       state->density_k,
+      state->greens_k,
       state->force_k,
       state->nx,
       state->ny,
@@ -3520,7 +2474,7 @@ int build_force_mesh(DeviceState* state, char* error_buffer, const std::size_t e
       state->cell_size[1],
       state->cell_size[2],
       state->short_pm_softening_kpc,
-      static_cast<float>(state->grav_const));
+      1.0 / static_cast<double>(state->real_count));
   cuda_status = cudaGetLastError();
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer, error_buffer_len, "potential spectrum kernel failed", cuda_status);
@@ -3557,6 +2511,134 @@ int build_force_mesh(DeviceState* state, char* error_buffer, const std::size_t e
   return 0;
 }
 
+// Samples the unfiltered mesh potential at each particle and returns
+// PE ~= 0.5 * sum(m_i * phi(x_i)). SMBH point masses are not mesh sources, so
+// their (negligible) pair energies are undercounted; this is a diagnostic.
+struct PotentialEnergyAccessor {
+  const SimCudaParticle* particles;
+  const cufftReal* potential;
+  int nx;
+  int ny;
+  int nz;
+  double origin_x;
+  double origin_y;
+  double origin_z;
+  double cell_x;
+  double cell_y;
+  double cell_z;
+
+  __device__ double operator()(const std::uint64_t index) const {
+    const SimCudaParticle particle = particles[index];
+    if (!(particle.mass_msun > 0.0)) {
+      return 0.0;
+    }
+
+    const double gx = fmin(
+        fmax((particle.position_kpc[0] - origin_x) / cell_x, 0.0),
+        static_cast<double>(nx) - 1.000001);
+    const double gy = fmin(
+        fmax((particle.position_kpc[1] - origin_y) / cell_y, 0.0),
+        static_cast<double>(ny) - 1.000001);
+    const double gz = fmin(
+        fmax((particle.position_kpc[2] - origin_z) / cell_z, 0.0),
+        static_cast<double>(nz) - 1.000001);
+    const int i0 = static_cast<int>(floor(gx));
+    const int j0 = static_cast<int>(floor(gy));
+    const int k0 = static_cast<int>(floor(gz));
+    const int i1 = min(i0 + 1, nx - 1);
+    const int j1 = min(j0 + 1, ny - 1);
+    const int k1 = min(k0 + 1, nz - 1);
+    const double tx = gx - floor(gx);
+    const double ty = gy - floor(gy);
+    const double tz = gz - floor(gz);
+
+    const double phi =
+        potential[real_grid_index(i0, j0, k0, ny, nz)] * (1.0 - tx) * (1.0 - ty) * (1.0 - tz) +
+        potential[real_grid_index(i0, j0, k1, ny, nz)] * (1.0 - tx) * (1.0 - ty) * tz +
+        potential[real_grid_index(i0, j1, k0, ny, nz)] * (1.0 - tx) * ty * (1.0 - tz) +
+        potential[real_grid_index(i0, j1, k1, ny, nz)] * (1.0 - tx) * ty * tz +
+        potential[real_grid_index(i1, j0, k0, ny, nz)] * tx * (1.0 - ty) * (1.0 - tz) +
+        potential[real_grid_index(i1, j0, k1, ny, nz)] * tx * (1.0 - ty) * tz +
+        potential[real_grid_index(i1, j1, k0, ny, nz)] * tx * ty * (1.0 - tz) +
+        potential[real_grid_index(i1, j1, k1, ny, nz)] * tx * ty * tz;
+    return 0.5 * particle.mass_msun * phi;
+  }
+};
+
+int compute_potential_energy(DeviceState* state,
+                             double* out_potential_energy,
+                             char* error_buffer,
+                             const std::size_t error_buffer_len) {
+  *out_potential_energy = 0.0;
+  if (!state->force_state_valid) {
+    // density_k does not correspond to current positions; skip rather than
+    // paying for an extra deposit + FFT.
+    return 0;
+  }
+
+  const int threads_per_block = 256;
+  const int complex_blocks =
+      static_cast<int>((state->complex_count + threads_per_block - 1) / threads_per_block);
+  // Unfiltered potential: same Green's function, split radius zero.
+  apply_potential_spectrum<<<complex_blocks, threads_per_block, 0, state->compute_stream>>>(
+      state->density_k,
+      state->greens_k,
+      state->force_k,
+      state->nx,
+      state->ny,
+      state->nz,
+      state->nz_complex,
+      state->box_length[0],
+      state->box_length[1],
+      state->box_length[2],
+      state->cell_size[0],
+      state->cell_size[1],
+      state->cell_size[2],
+      0.0,
+      1.0 / static_cast<double>(state->real_count));
+  cudaError_t cuda_status = cudaGetLastError();
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "energy spectrum kernel failed", cuda_status);
+    return 1;
+  }
+
+  const cufftResult inverse_status =
+      cufftExecC2R(state->inverse_plan, state->force_k, state->potential_grid);
+  if (inverse_status != CUFFT_SUCCESS) {
+    fill_cufft_error(error_buffer, error_buffer_len, "energy potential FFT failed", inverse_status);
+    return 1;
+  }
+
+  try {
+    PotentialEnergyAccessor accessor{};
+    accessor.particles = state->particles;
+    accessor.potential = state->potential_grid;
+    accessor.nx = state->nx;
+    accessor.ny = state->ny;
+    accessor.nz = state->nz;
+    accessor.origin_x = state->domain_origin[0];
+    accessor.origin_y = state->domain_origin[1];
+    accessor.origin_z = state->domain_origin[2];
+    accessor.cell_x = state->cell_size[0];
+    accessor.cell_y = state->cell_size[1];
+    accessor.cell_z = state->cell_size[2];
+
+    const double raw_sum = thrust::transform_reduce(
+        thrust::cuda::par.on(state->compute_stream),
+        thrust::counting_iterator<std::uint64_t>(0),
+        thrust::counting_iterator<std::uint64_t>(state->particle_count),
+        accessor,
+        0.0,
+        thrust::plus<double>());
+    // The spectrum pass already carries the full convolution normalization.
+    *out_potential_energy = raw_sum;
+  } catch (const std::exception& error) {
+    fill_error(error_buffer, error_buffer_len, error.what());
+    return 1;
+  }
+  return 0;
+}
+
 int build_short_range_structure(DeviceState* state,
                                 char* error_buffer,
                                 const std::size_t error_buffer_len) {
@@ -3577,10 +2659,6 @@ int build_short_range_structure(DeviceState* state,
     flush_profile_stage(label, start, std::chrono::steady_clock::now());
     return 0;
   };
-
-  if (state->short_source_particle_count <= particle_tree_threshold()) {
-    return build_short_range_tree(state, error_buffer, error_buffer_len);
-  }
 
   const int threads_per_block = 256;
   const int particle_blocks =
@@ -3778,118 +2856,114 @@ int build_short_range_structure(DeviceState* state,
   }
 
   stage_start = std::chrono::steady_clock::now();
-  if (build_short_range_tree(state, error_buffer, error_buffer_len) != 0) {
-    return 1;
-  }
-  if (finish_stage("short_range.build_tree", stage_start) != 0) {
-    return 1;
-  }
-
-  return 0;
-}
-
-int build_local_force_mesh(DeviceState* state,
-                           RefinementPatchState& patch,
-                           char* error_buffer,
-                           const std::size_t error_buffer_len) {
-  if (!patch.active) {
-    return 0;
-  }
-  const int threads_per_block = 256;
-  const int particle_blocks =
-      static_cast<int>((state->particle_count + threads_per_block - 1) / threads_per_block);
-
-  auto build_mesh = [&](MeshBuffers& mesh, const double cell_size[3]) -> int {
-    cudaError_t cuda_status = cudaMemsetAsync(
-        mesh.density_grid, 0, sizeof(cufftReal) * mesh.real_count, state->compute_stream);
+  for (int level = 1; level < state->pyramid_level_count; ++level) {
+    const double* fine_mass;
+    const double* fine_com_x;
+    const double* fine_com_y;
+    const double* fine_com_z;
+    if (level == 1) {
+      fine_mass = state->short_cell_mass;
+      fine_com_x = state->short_cell_com_x;
+      fine_com_y = state->short_cell_com_y;
+      fine_com_z = state->short_cell_com_z;
+    } else {
+      const std::size_t prev_offset = state->pyramid_offset[level - 1];
+      fine_mass = state->pyramid_mass + prev_offset;
+      fine_com_x = state->pyramid_com_x + prev_offset;
+      fine_com_y = state->pyramid_com_y + prev_offset;
+      fine_com_z = state->pyramid_com_z + prev_offset;
+    }
+    const std::size_t offset = state->pyramid_offset[level];
+    const std::size_t level_cells = static_cast<std::size_t>(state->pyramid_nx[level]) *
+                                    static_cast<std::size_t>(state->pyramid_ny[level]) *
+                                    static_cast<std::size_t>(state->pyramid_nz[level]);
+    const int level_blocks =
+        static_cast<int>((level_cells + threads_per_block - 1) / threads_per_block);
+    coarsen_cell_moments<<<level_blocks, threads_per_block, 0, state->compute_stream>>>(
+        fine_mass,
+        fine_com_x,
+        fine_com_y,
+        fine_com_z,
+        state->pyramid_nx[level - 1],
+        state->pyramid_ny[level - 1],
+        state->pyramid_nz[level - 1],
+        state->pyramid_mass + offset,
+        state->pyramid_com_x + offset,
+        state->pyramid_com_y + offset,
+        state->pyramid_com_z + offset,
+        state->pyramid_nx[level],
+        state->pyramid_ny[level],
+        state->pyramid_nz[level]);
+    cuda_status = cudaGetLastError();
     if (cuda_status != cudaSuccess) {
-      fill_cuda_error(error_buffer, error_buffer_len, "local density grid clear failed", cuda_status);
+      fill_cuda_error(error_buffer, error_buffer_len, "cell pyramid coarsen kernel failed", cuda_status);
       return 1;
     }
+  }
+  if (finish_stage("short_range.build_pyramid", stage_start) != 0) {
+    return 1;
+  }
 
-    deposit_mass_cic_local<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
+  stage_start = std::chrono::steady_clock::now();
+  {
+    const int cell_pack_blocks =
+        static_cast<int>((state->short_cell_count + threads_per_block - 1) / threads_per_block);
+    pack_cell_moments_f4<<<cell_pack_blocks, threads_per_block, 0, state->compute_stream>>>(
+        state->short_cell_mass,
+        state->short_cell_com_x,
+        state->short_cell_com_y,
+        state->short_cell_com_z,
+        state->short_cell_count,
+        state->short_domain_origin[0],
+        state->short_domain_origin[1],
+        state->short_domain_origin[2],
+        state->cell_moments_f4);
+    if (state->pyramid_total_cells > 0) {
+      const int pyramid_pack_blocks = static_cast<int>(
+          (state->pyramid_total_cells + threads_per_block - 1) / threads_per_block);
+      pack_cell_moments_f4<<<pyramid_pack_blocks, threads_per_block, 0, state->compute_stream>>>(
+          state->pyramid_mass,
+          state->pyramid_com_x,
+          state->pyramid_com_y,
+          state->pyramid_com_z,
+          state->pyramid_total_cells,
+          state->short_domain_origin[0],
+          state->short_domain_origin[1],
+          state->short_domain_origin[2],
+          state->cell_moments_f4 + state->short_cell_count);
+    }
+    const std::size_t octant_count = state->short_cell_count * 8u;
+    const int octant_pack_blocks =
+        static_cast<int>((octant_count + threads_per_block - 1) / threads_per_block);
+    pack_octant_moments_f4<<<octant_pack_blocks, threads_per_block, 0, state->compute_stream>>>(
+        state->short_cell_octant_mass,
+        state->short_cell_octant_com_x,
+        state->short_cell_octant_com_y,
+        state->short_cell_octant_com_z,
+        octant_count,
+        state->short_domain_origin[0],
+        state->short_domain_origin[1],
+        state->short_domain_origin[2],
+        state->octant_moments_f4);
+    gather_sorted_sources<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
         state->particles,
-        state->particle_count,
-        mesh.density_grid,
-        mesh.nx,
-        mesh.ny,
-        mesh.nz,
-        patch.domain_origin[0],
-        patch.domain_origin[1],
-        patch.domain_origin[2],
-        cell_size[0],
-        cell_size[1],
-        cell_size[2],
-        static_cast<float>(1.0 / (cell_size[0] * cell_size[1] * cell_size[2])));
+        state->short_sorted_particle_indices,
+        state->short_source_particle_count,
+        state->sorted_source_x,
+        state->sorted_source_y,
+        state->sorted_source_z,
+        state->sorted_source_mass,
+        state->sorted_source_softening);
     cuda_status = cudaGetLastError();
     if (cuda_status != cudaSuccess) {
-      fill_cuda_error(error_buffer, error_buffer_len, "local mass deposit kernel failed", cuda_status);
+      fill_cuda_error(error_buffer, error_buffer_len, "moment packing kernels failed", cuda_status);
       return 1;
     }
-
-    const cufftResult forward_status = cufftExecR2C(mesh.forward_plan, mesh.density_grid, mesh.density_k);
-    if (forward_status != CUFFT_SUCCESS) {
-      fill_cufft_error(error_buffer, error_buffer_len, "local forward density FFT failed", forward_status);
-      return 1;
-    }
-
-    const int complex_blocks =
-        static_cast<int>((mesh.complex_count + threads_per_block - 1) / threads_per_block);
-    apply_potential_spectrum<<<complex_blocks, threads_per_block, 0, state->compute_stream>>>(
-        mesh.density_k,
-        mesh.force_k,
-        mesh.nx,
-        mesh.ny,
-        mesh.nz,
-        mesh.nz_complex,
-        patch.box_length[0],
-        patch.box_length[1],
-        patch.box_length[2],
-        cell_size[0],
-        cell_size[1],
-        cell_size[2],
-        0.0,
-        static_cast<float>(state->grav_const));
-    cuda_status = cudaGetLastError();
-    if (cuda_status != cudaSuccess) {
-      fill_cuda_error(error_buffer, error_buffer_len, "local potential spectrum kernel failed", cuda_status);
-      return 1;
-    }
-
-    const cufftResult inverse_status = cufftExecC2R(mesh.inverse_plan, mesh.force_k, mesh.density_grid);
-    if (inverse_status != CUFFT_SUCCESS) {
-      fill_cufft_error(error_buffer, error_buffer_len, "local inverse potential FFT failed", inverse_status);
-      return 1;
-    }
-
-    const int real_blocks =
-        static_cast<int>((mesh.real_count + threads_per_block - 1) / threads_per_block);
-    compute_force_from_potential_clamped<<<real_blocks, threads_per_block, 0, state->compute_stream>>>(
-        mesh.density_grid,
-        mesh.force_x,
-        mesh.force_y,
-        mesh.force_z,
-        mesh.nx,
-        mesh.ny,
-        mesh.nz,
-        cell_size[0],
-        cell_size[1],
-        cell_size[2]);
-    cuda_status = cudaGetLastError();
-    if (cuda_status != cudaSuccess) {
-      fill_cuda_error(error_buffer, error_buffer_len, "local force gradient kernel failed", cuda_status);
-      return 1;
-    }
-
-    return 0;
-  };
-
-  if (build_mesh(patch.fine, patch.cell_size_fine) != 0) {
+  }
+  if (finish_stage("short_range.pack_moments", stage_start) != 0) {
     return 1;
   }
-  if (build_mesh(patch.coarse, patch.cell_size_coarse) != 0) {
-    return 1;
-  }
+
   return 0;
 }
 
@@ -3954,7 +3028,6 @@ int build_force_state(DeviceState* state,
 int apply_force_kick_from_state(DeviceState* state,
                                 const int particle_blocks,
                                 const int threads_per_block,
-                                const double inv_fft_cells,
                                 const double dt_myr,
                                 char* error_buffer,
                                 const std::size_t error_buffer_len) {
@@ -3964,6 +3037,24 @@ int apply_force_kick_from_state(DeviceState* state,
     fill_cuda_error(error_buffer, error_buffer_len, "max acceleration clear failed", cuda_status);
     return 1;
   }
+  PyramidDeviceView pyramid;
+  std::uint32_t source_count = 0;
+  if (state->short_cell_count > 0 && state->short_source_particle_count > 0) {
+    source_count = state->short_source_particle_count;
+    pyramid.level_count = state->pyramid_level_count;
+    for (int level = 0; level < state->pyramid_level_count; ++level) {
+      pyramid.nx[level] = state->pyramid_nx[level];
+      pyramid.ny[level] = state->pyramid_ny[level];
+      pyramid.nz[level] = state->pyramid_nz[level];
+      pyramid.moments[level] = level == 0
+          ? state->cell_moments_f4
+          : state->cell_moments_f4 + state->short_cell_count + state->pyramid_offset[level];
+    }
+  }
+  const int direct_neighborhood_threshold =
+      state->particle_count <= 300'000u ? kShortRangeDirectNeighborhoodThresholdLowN
+                                        : kShortRangeDirectNeighborhoodThresholdDefault;
+
   kick_particles_global<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
       state->particles,
       state->particle_count,
@@ -3976,33 +3067,24 @@ int apply_force_kick_from_state(DeviceState* state,
       state->domain_origin[0],
       state->domain_origin[1],
       state->domain_origin[2],
-      state->box_length[0],
-      state->box_length[1],
-      state->box_length[2],
       state->cell_size[0],
       state->cell_size[1],
       state->cell_size[2],
-      inv_fft_cells,
       state->short_sorted_particle_indices,
+      state->non_source_indices,
+      source_count,
       state->short_cell_start,
       state->short_cell_end,
-      state->short_cell_interaction_start,
-      state->short_cell_mass,
-      state->short_cell_com_x,
-      state->short_cell_com_y,
-      state->short_cell_com_z,
-      state->short_cell_octant_mass,
-      state->short_cell_octant_com_x,
-      state->short_cell_octant_com_y,
-      state->short_cell_octant_com_z,
-      state->short_cell_interactions,
+      state->sorted_source_x,
+      state->sorted_source_y,
+      state->sorted_source_z,
+      state->sorted_source_mass,
+      state->sorted_source_softening,
+      state->octant_moments_f4,
       state->short_force_factor_lut,
       kShortRangeForceFactorLutSize,
       state->short_force_factor_lut_scale,
-      state->short_tree_nodes,
-      state->short_tree_root,
-      state->short_tree_node_count,
-      state->short_tree_particle_mode ? 1 : 0,
+      pyramid,
       state->short_nx,
       state->short_ny,
       state->short_nz,
@@ -4014,7 +3096,8 @@ int apply_force_kick_from_state(DeviceState* state,
       state->short_cell_size[2],
       state->short_cutoff_kpc,
       state->short_pm_softening_kpc,
-      state->opening_angle,
+      state->max_softening_kpc,
+      direct_neighborhood_threshold,
       state->short_range_target_baryons_only ? 1 : 0,
       state->galaxy_smbh_indices,
       state->galaxy_count,
@@ -4046,7 +3129,6 @@ int run_steps(DeviceState* state,
   const int threads_per_block = 256;
   const int particle_blocks =
       static_cast<int>((state->particle_count + threads_per_block - 1) / threads_per_block);
-  const double inv_fft_cells = 1.0 / static_cast<double>(state->real_count);
   const bool profile_stages = profile_force_stages();
 
   auto finish_profile_stage = [&](const char* label,
@@ -4069,30 +3151,33 @@ int run_steps(DeviceState* state,
     const double substep_dt_myr = dt_myr / static_cast<double>(std::max(1u, substeps));
     const double half_substep_dt_myr = 0.5 * substep_dt_myr;
 
+    // Kick-drift-kick with merged interior kicks: the closing half-kick of one
+    // substep and the opening half-kick of the next share the same force
+    // state, so they collapse into a single full kick. Positions and
+    // velocities are re-synchronized by the trailing half-kick, keeping every
+    // FFI call boundary a valid phase-space snapshot.
+    auto stage_start = std::chrono::steady_clock::now();
+    if (!state->force_state_valid &&
+        build_force_state(state, error_buffer, error_buffer_len) != 0) {
+      return 1;
+    }
+    if (finish_profile_stage("run_steps.build_force_state_open", stage_start) != 0) {
+      return 1;
+    }
+    stage_start = std::chrono::steady_clock::now();
+    if (apply_force_kick_from_state(state,
+                                    particle_blocks,
+                                    threads_per_block,
+                                    half_substep_dt_myr,
+                                    error_buffer,
+                                    error_buffer_len) != 0) {
+      return 1;
+    }
+    if (finish_profile_stage("run_steps.kick_open", stage_start) != 0) {
+      return 1;
+    }
+
     for (std::uint32_t substep = 0; substep < substeps; ++substep) {
-      auto stage_start = std::chrono::steady_clock::now();
-      if (!state->force_state_valid &&
-          build_force_state(state, error_buffer, error_buffer_len) != 0) {
-        return 1;
-      }
-      if (finish_profile_stage("run_steps.build_force_state_a", stage_start) != 0) {
-        return 1;
-      }
-
-      stage_start = std::chrono::steady_clock::now();
-      if (apply_force_kick_from_state(state,
-                                      particle_blocks,
-                                      threads_per_block,
-                                      inv_fft_cells,
-                                      half_substep_dt_myr,
-                                      error_buffer,
-                                      error_buffer_len) != 0) {
-        return 1;
-      }
-      if (finish_profile_stage("run_steps.kick_a", stage_start) != 0) {
-        return 1;
-      }
-
       stage_start = std::chrono::steady_clock::now();
       drift_particles<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
           state->particles, state->particle_count, substep_dt_myr);
@@ -4110,21 +3195,22 @@ int run_steps(DeviceState* state,
       if (build_force_state(state, error_buffer, error_buffer_len) != 0) {
         return 1;
       }
-      if (finish_profile_stage("run_steps.build_force_state_b", stage_start) != 0) {
+      if (finish_profile_stage("run_steps.build_force_state", stage_start) != 0) {
         return 1;
       }
 
+      const bool last_substep = substep + 1 == substeps;
+      const double kick_dt_myr = last_substep ? half_substep_dt_myr : substep_dt_myr;
       stage_start = std::chrono::steady_clock::now();
       if (apply_force_kick_from_state(state,
                                       particle_blocks,
                                       threads_per_block,
-                                      inv_fft_cells,
-                                      half_substep_dt_myr,
+                                      kick_dt_myr,
                                       error_buffer,
                                       error_buffer_len) != 0) {
         return 1;
       }
-      if (finish_profile_stage("run_steps.kick_b", stage_start) != 0) {
+      if (finish_profile_stage("run_steps.kick", stage_start) != 0) {
         return 1;
       }
     }
@@ -4132,6 +3218,11 @@ int run_steps(DeviceState* state,
 
   state->sim_time_myr += advanced_myr;
   fill_basic_diagnostics(*state, advanced_myr, diagnostics);
+  double potential_energy = 0.0;
+  if (compute_potential_energy(state, &potential_energy, error_buffer, error_buffer_len) != 0) {
+    return 1;
+  }
+  diagnostics->estimated_potential_energy = potential_energy;
   return 0;
 }
 
@@ -4139,11 +3230,10 @@ int run_steps(DeviceState* state,
 
 extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
                                const SimCudaParticle* particles,
-                               const SimCudaGalaxy* galaxies,
                                void** out_handle,
                                char* error_buffer,
                                std::size_t error_buffer_len) {
-  if (params == nullptr || particles == nullptr || galaxies == nullptr || out_handle == nullptr) {
+  if (params == nullptr || particles == nullptr || out_handle == nullptr) {
     fill_error(error_buffer, error_buffer_len, "invalid create parameters");
     return 1;
   }
@@ -4242,6 +3332,7 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
 
   state->galaxy_smbh_indices_host = galaxy_smbh_indices;
   std::vector<int> short_source_particle_indices_host;
+  std::vector<int> non_source_indices_host;
   std::vector<int> preview_visible_particle_indices_host;
   short_source_particle_indices_host.reserve(params->particle_count / 3);
   preview_visible_particle_indices_host.reserve(params->particle_count / 8);
@@ -4251,16 +3342,16 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
     if (particles[i].component != 0u && particles[i].component != 3u && particles[i].mass_msun > 0.0) {
       preview_visible_particle_indices_host.push_back(static_cast<int>(i));
     }
-    if (particles[i].component == 3u || !(particles[i].mass_msun > 0.0)) {
-      continue;
-    }
-    if (baryons_only && particles[i].component == 0u) {
+    if (particles[i].component == 3u || !(particles[i].mass_msun > 0.0) ||
+        (baryons_only && particles[i].component == 0u)) {
+      non_source_indices_host.push_back(static_cast<int>(i));
       continue;
     }
     short_source_particle_indices_host.push_back(static_cast<int>(i));
   }
   state->short_source_particle_count =
       static_cast<std::uint32_t>(short_source_particle_indices_host.size());
+  state->non_source_count = static_cast<std::uint32_t>(non_source_indices_host.size());
   state->preview_visible_particle_count =
       static_cast<std::uint32_t>(preview_visible_particle_indices_host.size());
   cuda_status = cudaMalloc(reinterpret_cast<void**>(&state->max_accel_sq), sizeof(double));
@@ -4300,6 +3391,46 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
       fill_cuda_error(error_buffer,
                       error_buffer_len,
                       "cudaMemcpy for short-range source indices failed",
+                      cuda_status);
+      destroy_state(state);
+      return 1;
+    }
+
+    const std::size_t source_count = state->short_source_particle_count;
+    if (cudaMalloc(reinterpret_cast<void**>(&state->sorted_source_x),
+                   sizeof(double) * source_count) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->sorted_source_y),
+                   sizeof(double) * source_count) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->sorted_source_z),
+                   sizeof(double) * source_count) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->sorted_source_mass),
+                   sizeof(double) * source_count) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->sorted_source_softening),
+                   sizeof(double) * source_count) != cudaSuccess) {
+      fill_error(error_buffer, error_buffer_len, "cudaMalloc for sorted source SoA failed");
+      destroy_state(state);
+      return 1;
+    }
+  }
+  if (state->non_source_count > 0) {
+    cuda_status = cudaMalloc(reinterpret_cast<void**>(&state->non_source_indices),
+                             sizeof(int) * state->non_source_count);
+    if (cuda_status != cudaSuccess) {
+      fill_cuda_error(error_buffer,
+                      error_buffer_len,
+                      "cudaMalloc for non-source indices failed",
+                      cuda_status);
+      destroy_state(state);
+      return 1;
+    }
+    cuda_status = cudaMemcpy(state->non_source_indices,
+                             non_source_indices_host.data(),
+                             sizeof(int) * state->non_source_count,
+                             cudaMemcpyHostToDevice);
+    if (cuda_status != cudaSuccess) {
+      fill_cuda_error(error_buffer,
+                      error_buffer_len,
+                      "cudaMemcpy for non-source indices failed",
                       cuda_status);
       destroy_state(state);
       return 1;
@@ -4419,6 +3550,22 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
       reinterpret_cast<void**>(&state->force_z), sizeof(cufftReal) * state->real_count);
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for force_z failed", cuda_status);
+    destroy_state(state);
+    return 1;
+  }
+
+  cuda_status = cudaMalloc(
+      reinterpret_cast<void**>(&state->potential_grid), sizeof(cufftReal) * state->real_count);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for potential grid failed", cuda_status);
+    destroy_state(state);
+    return 1;
+  }
+
+  cuda_status = cudaMalloc(
+      reinterpret_cast<void**>(&state->greens_k), sizeof(cufftComplex) * state->complex_count);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for Green's function spectrum failed", cuda_status);
     destroy_state(state);
     return 1;
   }

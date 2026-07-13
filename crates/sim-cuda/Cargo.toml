@@ -3,6 +3,7 @@ name = "sim-cuda"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+links = "sim_cuda"
 
 [dependencies]
 anyhow.workspace = true

@@ -2,8 +2,7 @@ use crate::config::{
     GalaxyConfig, GalaxyInitialProfile, GravityConfig, ObserverEffectsConfig, PreviewConfig,
     RelativityConfig, SimulationConfig, SmbhConfig, SnapshotConfig, TimeIntegrationConfig,
 };
-
-const GRAV_CONST_KPC_KMS2_PER_MSUN: f64 = 4.300_91e-6;
+use crate::math::GRAV_CONST_KPC_KMS2_PER_MSUN;
 
 #[derive(Debug, Clone)]
 pub struct MergerPreset {
@@ -24,18 +23,17 @@ pub fn built_in_presets() -> Vec<MergerPreset> {
     ]
 }
 
-fn generated_equilibrium_snapshot_path(preset_id: &str, galaxy_index: usize) -> String {
-    format!("/galaxy/output/equilibrium/{preset_id}/galaxy-{galaxy_index}/manifest.json")
-}
-
 fn gravity_defaults() -> GravityConfig {
     GravityConfig {
-        grav_const_kpc_kms2_per_msun: 4.300_91e-6,
+        grav_const_kpc_kms2_per_msun: GRAV_CONST_KPC_KMS2_PER_MSUN,
         halo_softening_kpc: 0.08,
         disk_softening_kpc: 0.03,
         bulge_softening_kpc: 0.02,
         opening_angle: 0.55,
-        mesh_resolution: [192, 192, 96],
+        // Merger halos are close to spherical, so keep the mesh cubic; a
+        // coarser z-axis would inflate the TreePM split radius (and with it
+        // the short-range cutoff) for every axis.
+        mesh_resolution: [192, 192, 192],
     }
 }
 
@@ -55,7 +53,6 @@ fn relativity_defaults() -> RelativityConfig {
 fn preview_defaults() -> PreviewConfig {
     PreviewConfig {
         particle_budget: 500_000,
-        density_grid: [960, 540],
         target_fps: 120,
     }
 }
@@ -64,7 +61,6 @@ fn snapshot_defaults() -> SnapshotConfig {
     SnapshotConfig {
         directory: "output/snapshots".to_string(),
         cadence_steps: 120,
-        compress: false,
     }
 }
 
@@ -104,6 +100,10 @@ fn set_bound_pair_orbit(
         ((pericenter_kpc - current_radius) / (current_radius * cos_f - pericenter_kpc))
             .clamp(0.05, 0.92);
     let semi_latus_rectum = pericenter_kpc * (1.0 + eccentricity);
+    // If the eccentricity clamp engaged, the requested radius no longer lies on the
+    // conic; recompute the starting separation from the clamped orbit so positions
+    // and velocities describe the same ellipse.
+    let current_radius = semi_latus_rectum / (1.0 + eccentricity * cos_f);
     let orbital_speed_scale =
         (GRAV_CONST_KPC_KMS2_PER_MSUN * total_mass / semi_latus_rectum.max(1.0e-6)).sqrt();
     let relative_radial_speed = orbital_speed_scale * eccentricity * sin_f;
@@ -188,7 +188,7 @@ fn set_equal_triple_ring_orbit(galaxies: &mut [GalaxyConfig], orbital_radius_kpc
 fn major_merger() -> MergerPreset {
     let mut primary = GalaxyConfig {
         label: "Primary".to_string(),
-        equilibrium_snapshot: Some(generated_equilibrium_snapshot_path("major-merger", 0)),
+        equilibrium_snapshot: None,
         initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
         halo_mass_msun: 4.2e12,
         halo_scale_radius_kpc: 14.0,
@@ -212,7 +212,7 @@ fn major_merger() -> MergerPreset {
     };
     let mut secondary = GalaxyConfig {
         label: "Secondary".to_string(),
-        equilibrium_snapshot: Some(generated_equilibrium_snapshot_path("major-merger", 1)),
+        equilibrium_snapshot: None,
         initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
         halo_mass_msun: 3.8e12,
         halo_scale_radius_kpc: 12.0,
@@ -274,7 +274,6 @@ fn uniform_sphere_collapse() -> MergerPreset {
             relativity: relativity_defaults(),
             preview: PreviewConfig {
                 particle_budget: 131_072,
-                density_grid: [960, 540],
                 target_fps: 120,
             },
             snapshots: snapshot_defaults(),
@@ -377,7 +376,6 @@ fn triple_sphere_orbit_debug() -> MergerPreset {
             relativity: relativity_defaults(),
             preview: PreviewConfig {
                 particle_budget: 98_304,
-                density_grid: [960, 540],
                 target_fps: 120,
             },
             snapshots: snapshot_defaults(),
@@ -406,10 +404,6 @@ fn major_merger_debug() -> MergerPreset {
     config.galaxies[1].halo_particle_count = 72_000;
     config.galaxies[1].disk_particle_count = 28_000;
     config.galaxies[1].bulge_particle_count = 5_600;
-    config.galaxies[0].equilibrium_snapshot =
-        Some(generated_equilibrium_snapshot_path("major-merger-debug", 0));
-    config.galaxies[1].equilibrium_snapshot =
-        Some(generated_equilibrium_snapshot_path("major-merger-debug", 1));
 
     MergerPreset {
         id: "major-merger-debug",
@@ -429,8 +423,6 @@ fn polar_flyby() -> MergerPreset {
         set_bound_pair_orbit(&mut primary[0], &mut secondary[0], 30.0, 14.0);
     config.galaxies[1].disk_tilt_deg = [88.0, 10.0, 12.0];
     config.galaxies[1].color_rgba = [0.78, 0.54, 1.0, 1.0];
-    config.galaxies[1].equilibrium_snapshot =
-        Some(generated_equilibrium_snapshot_path("polar-flyby", 1));
     MergerPreset {
         id: "polar-flyby",
         title: "Polar Fly-By",
@@ -445,15 +437,16 @@ fn minor_merger() -> MergerPreset {
     config.output_directory = "output/minor-merger".to_string();
     config.initial_separation_kpc = 32.0;
     config.galaxies[1].halo_mass_msun = 1.0e12;
-    config.galaxies[1].halo_particle_count = 950_000;
+    // Match the primary's halo mass-per-particle (~5.25e6 Msun) so the overlapping
+    // halos don't two-body heat each other; halo particles are invisible in the
+    // viewer, so extra resolution here buys nothing visually.
+    config.galaxies[1].halo_particle_count = 190_000;
     config.galaxies[1].disk_mass_msun = 4.6e10;
     config.galaxies[1].disk_particle_count = 360_000;
     config.galaxies[1].bulge_mass_msun = 7.5e9;
     config.galaxies[1].bulge_particle_count = 48_000;
     config.galaxies[1].smbh.mass_msun = 3.0e6;
     config.galaxies[1].color_rgba = [0.59, 1.0, 0.74, 1.0];
-    config.galaxies[1].equilibrium_snapshot =
-        Some(generated_equilibrium_snapshot_path("minor-merger", 1));
     let (primary, secondary) = config.galaxies.split_at_mut(1);
     config.initial_relative_velocity_kms =
         set_direct_infall_pair_orbit(&mut primary[0], &mut secondary[0], 32.0, 0.30, 0.20);

@@ -929,7 +929,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "bincode",
  "bytes",
  "futures-util",
  "parking_lot",
@@ -937,6 +936,7 @@ dependencies = [
  "serde_json",
  "sim-core",
  "sim-cuda",
+ "thiserror",
  "tokio",
  "tower",
  "tower-http",
@@ -949,7 +949,6 @@ dependencies = [
 name = "sim-viewer"
 version = "0.1.0"
 dependencies = [
- "bincode",
  "getrandom 0.3.4",
  "js-sys",
  "sim-core",

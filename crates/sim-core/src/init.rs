@@ -6,12 +6,12 @@ use thiserror::Error;
 
 use crate::{
     GalaxyInitialProfile, GravityConfig, SimulationConfig, Vec3, load_particle_snapshot,
+    math::GRAV_CONST_KPC_KMS2_PER_MSUN,
 };
 
-const GRAV_CONST_KPC_KMS2_PER_MSUN: f64 = 4.300_91e-6;
 const NFW_CONCENTRATION: f64 = 12.0;
 const TOOMRE_Q_TARGET: f64 = 1.0;
-const EQUILIBRIUM_SAMPLES: usize = 320;
+const EQUILIBRIUM_SAMPLES: usize = 384;
 const DISK_TRUNCATION_SCALE_RADII: f64 = 5.5;
 const DISK_SIGMA_R_MAX_VC_FRACTION: f64 = 0.36;
 const DISK_SIGMA_Z_MAX_VC_FRACTION: f64 = 0.17;
@@ -144,6 +144,16 @@ pub fn generate_analytic_galaxy(
             velocity_dispersion_kms,
             edge_rotation_speed_kms,
         );
+    }
+
+    // The equilibrium tables below bake in the shared G; a config that overrides
+    // gravity.grav_const would silently get ICs equilibrated for the wrong force law.
+    let configured_g = config.gravity.grav_const_kpc_kms2_per_msun;
+    if (configured_g - GRAV_CONST_KPC_KMS2_PER_MSUN).abs() > GRAV_CONST_KPC_KMS2_PER_MSUN * 1.0e-3 {
+        return Err(InitialConditionError::InvalidConfig(format!(
+            "analytic initial conditions assume G = {GRAV_CONST_KPC_KMS2_PER_MSUN:e} \
+             kpc (km/s)^2/Msun but the config requests {configured_g:e}"
+        )));
     }
 
     let rotation = rotation_from_euler_deg(galaxy.disk_tilt_deg);
@@ -356,7 +366,7 @@ fn extend_nfw_halo(
         ));
     }
     let particle_mass = total_mass_msun / count as f64;
-    let virial_radius = scale_radius_kpc * 12.0;
+    let virial_radius = nfw_virial_radius_kpc(scale_radius_kpc);
 
     for _ in 0..count {
         let r = sample_nfw_radius(rng, scale_radius_kpc, virial_radius);
@@ -477,11 +487,26 @@ fn extend_exponential_disk(
     for _ in 0..count {
         // For a 2D exponential disk, p(R) dR ∝ R exp(-R/Rd) dR, i.e. a Gamma(k=2, theta=Rd).
         // Sampling a plain exponential overconcentrates the disk and destabilizes the live system.
+        // Thin by the logistic taper so the particle distribution matches the tapered surface
+        // density the Jeans equilibrium table is built from.
         let radius = loop {
             let u1: f64 = rng.random::<f64>().clamp(1.0e-8, 1.0 - 1.0e-8);
             let u2: f64 = rng.random::<f64>().clamp(1.0e-8, 1.0 - 1.0e-8);
             let sampled = -scale_radius_kpc * (u1 * u2).ln();
-            if sampled <= max_radius {
+            if sampled > max_radius {
+                continue;
+            }
+            let taper = tapered_exponential_disk_surface_density_msun_per_kpc2(
+                total_mass_msun,
+                scale_radius_kpc,
+                sampled,
+            ) / exponential_disk_surface_density_msun_per_kpc2(
+                total_mass_msun,
+                scale_radius_kpc,
+                sampled,
+            )
+            .max(1.0e-300);
+            if rng.random::<f64>() <= taper {
                 break sampled;
             }
         };
@@ -587,7 +612,13 @@ fn extend_hernquist_bulge(
 
 fn sample_nfw_radius(rng: &mut SmallRng, scale_radius_kpc: f64, virial_radius_kpc: f64) -> f64 {
     let max_x = virial_radius_kpc / scale_radius_kpc;
-    let max_pdf = max_x / (1.0 + max_x).powi(2);
+    // The radial pdf x/(1+x)^2 peaks at x=1 with value 1/4; the envelope must
+    // dominate the pdf everywhere or rejection sampling flattens the profile.
+    let max_pdf = if max_x >= 1.0 {
+        0.25
+    } else {
+        max_x / (1.0 + max_x).powi(2)
+    };
     loop {
         let x = rng.random::<f64>() * max_x;
         let y = rng.random::<f64>() * max_pdf;
@@ -639,11 +670,16 @@ fn build_equilibrium_table(
         bulge_kpc: gravity.bulge_softening_kpc.max(1.0e-3),
         smbh_kpc: galaxy.smbh.softening_kpc.max(1.0e-4),
     };
+    // Extend the table well past the outermost sampled particle so the inward Jeans
+    // integral does not truncate right where particles are actually placed (which
+    // would bias the edge dispersions low). Lookups clamp to the grid, so the extra
+    // range only affects integration accuracy.
     let max_radius = nfw_virial_radius_kpc(galaxy.halo_scale_radius_kpc)
         .max(galaxy.disk_scale_radius_kpc * 20.0)
         .max(galaxy.bulge_scale_radius_kpc * 40.0)
         .max(galaxy.disk_scale_height_kpc * 50.0)
-        .max(8.0);
+        .max(8.0)
+        * 3.0;
     let min_radius = gravity
         .bulge_softening_kpc
         .min(gravity.disk_softening_kpc)
@@ -756,7 +792,6 @@ fn build_equilibrium_table(
     let mut tracer_pressure = vec![0.0; EQUILIBRIUM_SAMPLES];
 
     for i in 0..EQUILIBRIUM_SAMPLES {
-        let radius = radii_kpc[i];
         let omega = omega_sq[i].sqrt();
         let kappa = epicyclic_kappa_sq[i].sqrt();
         let sigma_r = if surface_density[i] > 0.0 {
@@ -767,8 +802,10 @@ fn build_equilibrium_table(
         } else {
             0.0
         };
+        // The epicyclic ratio kappa/(2*Omega) physically spans [0.5, 1.0]
+        // (Keplerian outskirts to solid-body core).
         let sigma_phi =
-            (sigma_r * kappa / (2.0 * omega.max(1.0e-4))).max(0.3 * sigma_r).min(0.7 * sigma_r);
+            (sigma_r * kappa / (2.0 * omega.max(1.0e-4))).max(0.5 * sigma_r).min(sigma_r);
         let sigma_z = (std::f64::consts::PI
             * GRAV_CONST_KPC_KMS2_PER_MSUN
             * surface_density[i]
@@ -781,8 +818,6 @@ fn build_equilibrium_table(
         disk_sigma_phi_sq[i] = sigma_phi * sigma_phi;
         disk_sigma_z_sq[i] = sigma_z * sigma_z;
         tracer_pressure[i] = (surface_density[i] * disk_sigma_r_sq[i]).max(1.0e-12);
-
-        let _ = radius;
     }
 
     for i in 0..EQUILIBRIUM_SAMPLES {
@@ -888,10 +923,18 @@ fn recenter_galaxy(
         return;
     }
 
+    // The SMBH is pinned exactly to the configured origin, so recenter the rest of
+    // the galaxy around it; shifting everything and then re-pinning the SMBH would
+    // move the total COM off the origin by the SMBH mass fraction.
+    let is_smbh = |particle: &Particle| {
+        particle.galaxy_index == galaxy_index
+            && matches!(particle.component, ParticleComponent::Smbh)
+    };
+
     let mut total_mass = 0.0;
     let mut center_of_mass = Vec3::ZERO;
     let mut center_velocity = Vec3::ZERO;
-    for particle in particles.iter() {
+    for particle in particles.iter().filter(|particle| !is_smbh(particle)) {
         total_mass += particle.mass_msun;
         center_of_mass += particle.position_kpc * particle.mass_msun;
         center_velocity += particle.velocity_kms * particle.mass_msun;
@@ -904,15 +947,13 @@ fn recenter_galaxy(
     let position_shift = origin - center_of_mass;
     let velocity_shift = bulk_velocity - center_velocity;
     for particle in particles.iter_mut() {
-        particle.position_kpc += position_shift;
-        particle.velocity_kms += velocity_shift;
-    }
-
-    if let Some(smbh) = particles.iter_mut().find(|particle| {
-        particle.galaxy_index == galaxy_index && matches!(particle.component, ParticleComponent::Smbh)
-    }) {
-        smbh.position_kpc = origin;
-        smbh.velocity_kms = bulk_velocity;
+        if is_smbh(particle) {
+            particle.position_kpc = origin;
+            particle.velocity_kms = bulk_velocity;
+        } else {
+            particle.position_kpc += position_shift;
+            particle.velocity_kms += velocity_shift;
+        }
     }
 }
 
@@ -1003,14 +1044,6 @@ fn nfw_density_msun_per_kpc3(total_mass_msun: f64, scale_radius_kpc: f64, radius
     rho0 / (x * (1.0 + x).powi(2))
 }
 
-fn nfw_circular_velocity_sq(mass_msun: f64, scale_radius_kpc: f64, radius_kpc: f64) -> f64 {
-    if !(mass_msun > 0.0 && scale_radius_kpc > 0.0 && radius_kpc > 0.0) {
-        return 0.0;
-    }
-    GRAV_CONST_KPC_KMS2_PER_MSUN * nfw_enclosed_mass_msun(mass_msun, scale_radius_kpc, radius_kpc)
-        / radius_kpc
-}
-
 fn hernquist_enclosed_mass_msun(mass_msun: f64, scale_radius_kpc: f64, radius_kpc: f64) -> f64 {
     if !(mass_msun > 0.0 && scale_radius_kpc > 0.0 && radius_kpc > 0.0) {
         return 0.0;
@@ -1073,16 +1106,6 @@ fn exponential_disk_enclosed_mass_msun(
     mass_msun * (1.0 - (-x).exp() * (1.0 + x))
 }
 
-fn hernquist_circular_velocity_sq(mass_msun: f64, scale_radius_kpc: f64, radius_kpc: f64) -> f64 {
-    if !(mass_msun > 0.0 && scale_radius_kpc > 0.0 && radius_kpc > 0.0) {
-        return 0.0;
-    }
-
-    GRAV_CONST_KPC_KMS2_PER_MSUN
-        * hernquist_enclosed_mass_msun(mass_msun, scale_radius_kpc, radius_kpc)
-        / radius_kpc
-}
-
 fn miyamoto_nagai_circular_velocity_sq(
     mass_msun: f64,
     scale_radius_kpc: f64,
@@ -1105,14 +1128,6 @@ fn miyamoto_nagai_circular_velocity_sq(
 
     GRAV_CONST_KPC_KMS2_PER_MSUN * mass_msun * cylindrical_radius_kpc * cylindrical_radius_kpc
         / denom
-}
-
-fn point_mass_circular_velocity_sq(mass_msun: f64, radius_kpc: f64) -> f64 {
-    if !(mass_msun > 0.0 && radius_kpc > 0.0) {
-        return 0.0;
-    }
-
-    GRAV_CONST_KPC_KMS2_PER_MSUN * mass_msun / radius_kpc
 }
 
 fn rotation_from_euler_deg(angles_deg: [f64; 3]) -> [[f64; 3]; 3] {
@@ -1148,4 +1163,39 @@ pub fn validate_particle_count(config: &SimulationConfig) -> anyhow::Result<u64>
         bail!("configuration produced zero particles");
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
+
+    use super::{NFW_CONCENTRATION, sample_nfw_radius};
+
+    fn nfw_enclosed_mass_fraction(x: f64, concentration: f64) -> f64 {
+        let m = |t: f64| (1.0 + t).ln() - t / (1.0 + t);
+        m(x) / m(concentration)
+    }
+
+    #[test]
+    fn nfw_radius_sampling_matches_enclosed_mass_profile() {
+        let scale_radius_kpc = 1.0;
+        let virial_radius_kpc = NFW_CONCENTRATION;
+        let mut rng = SmallRng::seed_from_u64(1234);
+        let samples = 200_000;
+        let mut radii: Vec<f64> = (0..samples)
+            .map(|_| sample_nfw_radius(&mut rng, scale_radius_kpc, virial_radius_kpc))
+            .collect();
+        radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        for quantile in [0.1, 0.25, 0.5, 0.75, 0.9] {
+            let sampled = radii[((samples as f64 - 1.0) * quantile) as usize];
+            let empirical = nfw_enclosed_mass_fraction(sampled, NFW_CONCENTRATION);
+            assert!(
+                (empirical - quantile).abs() < 0.01,
+                "NFW quantile {quantile}: enclosed-mass fraction at sampled radius {sampled:.3} \
+                 was {empirical:.4}, expected ~{quantile}"
+            );
+        }
+    }
 }

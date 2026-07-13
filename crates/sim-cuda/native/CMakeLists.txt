@@ -1,4 +1,11 @@
 cmake_minimum_required(VERSION 3.24)
+
+# Allow builders (or CI without a GPU) to pin the target architecture; default
+# to detecting the local GPU, with GB10 (sm_121) as the documented target.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CMAKE_CUDA_ARCHITECTURES})
+  set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
+
 project(sim_cuda LANGUAGES CXX CUDA)
 
 find_package(CUDAToolkit REQUIRED)
@@ -15,7 +22,6 @@ set_target_properties(
     CUDA_STANDARD_REQUIRED ON
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
-    CUDA_ARCHITECTURES native
 )
 
 install(TARGETS sim_cuda

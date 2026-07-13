@@ -1,4 +1,9 @@
-const VIEWER_BUNDLE_VERSION = "20260413-2059";
+const VIEWER_BUNDLE_VERSION = "20260713-1";
+
+// A freshly created session may take a moment before its first frame is
+// published; give the WASM path a generous window before demoting to the
+// heavier JSON fallback (an explicit galaxy-viewer-error still fails fast).
+const FIRST_FRAME_TIMEOUT_MS = 4000;
 
 export async function tryBootRustViewer(sessionId) {
   const params = new URLSearchParams(window.location.search);
@@ -20,7 +25,7 @@ export async function tryBootRustViewer(sessionId) {
         const timeout = window.setTimeout(() => {
           cleanup();
           resolve(false);
-        }, 1500);
+        }, FIRST_FRAME_TIMEOUT_MS);
         const onFrame = () => {
           cleanup();
           resolve(true);
