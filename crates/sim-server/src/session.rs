@@ -574,6 +574,10 @@ fn publish_frame(ctx: &mut SessionContext) -> anyhow::Result<()> {
     let backend = &mut ctx.backend;
     let (payload, diagnostics) =
         run_backend_blocking(|| backend.preview_packet_bytes(preview_budget))?;
+    // A synchronous publish captures the current state too; without this the
+    // first ticker after a resume re-captures (and re-publishes) the identical
+    // pause frame, wasting the capture slot for a whole step.
+    ctx.last_captured_sim_time = diagnostics.sim_time_myr;
     if profile_session_loop() {
         info!(
             "session publish preview_budget={} preview_count={} wall_ms={:.3} bytes={}",

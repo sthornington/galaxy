@@ -40,6 +40,7 @@ uniform vec3 u_posScale1;
 uniform vec3 u_velMin1;
 uniform vec3 u_velScale1;
 uniform vec2 u_massLog; // (log2 min, log2 scale) of the current frame
+uniform float u_style;  // 0 = soft glow sprites, 1 = small crisp dots
 
 layout(location = 0) in vec3 a_prevPos;   // normalized u16
 layout(location = 1) in vec3 a_prevVel;   // normalized u16
@@ -99,6 +100,14 @@ void main() {
   vec3 color = dopplerShift(base, dot(velocity, u_forward));
 
   float perspective = clamp((u_pointScale / clip.w) * 0.18, 0.02, 3.5);
+  if (u_style > 0.5) {
+    // Crisp dots: tiny fixed-ish footprint (near-zero fill cost), mild
+    // distance attenuation, energy carried by the dot itself.
+    gl_PointSize = clamp((1.7 + 1.3 * renderLuminosity) * pow(perspective, 0.35) * u_sizeBoost,
+                         1.5, 6.0);
+    v_color = color * (0.05 + 0.11 * renderLuminosity);
+    return;
+  }
   float size = 2.6 * renderLuminosity * pow(perspective, 0.9) * u_sizeBoost;
   gl_PointSize = clamp(size, 1.25, 48.0);
 
@@ -114,6 +123,7 @@ void main() {
 const FRAGMENT_SHADER = `#version 300 es
 precision mediump float;
 
+uniform float u_style;
 in vec3 v_color;
 out vec4 fragColor;
 
@@ -122,6 +132,11 @@ void main() {
   float r2 = dot(offset, offset);
   if (r2 > 1.0) {
     discard;
+  }
+  if (u_style > 0.5) {
+    // Crisp dot: solid disc with a barely softened rim.
+    fragColor = vec4(v_color * smoothstep(1.0, 0.7, r2), 1.0);
+    return;
   }
   // Bright core + soft gaussian skirt.
   float weight = 0.55 * exp(-r2 * 14.0) + 0.45 * exp(-r2 * 3.2);
@@ -349,6 +364,7 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     velMin1: gl.getUniformLocation(pointProgram, "u_velMin1"),
     velScale1: gl.getUniformLocation(pointProgram, "u_velScale1"),
     massLog: gl.getUniformLocation(pointProgram, "u_massLog"),
+    style: gl.getUniformLocation(pointProgram, "u_style"),
   };
   const tonemapUniforms = tonemapProgram
     ? {
@@ -416,15 +432,17 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     if (!hdrExtension) {
       return false;
     }
-    if (hdrTexture && hdrWidth === canvas.width && hdrHeight === canvas.height) {
+    const targetWidth = Math.max(64, Math.round(canvas.width * state.renderScale));
+    const targetHeight = Math.max(36, Math.round(canvas.height * state.renderScale));
+    if (hdrTexture && hdrWidth === targetWidth && hdrHeight === targetHeight) {
       return true;
     }
     if (hdrTexture) {
       gl.deleteTexture(hdrTexture);
       gl.deleteFramebuffer(hdrFramebuffer);
     }
-    hdrWidth = canvas.width;
-    hdrHeight = canvas.height;
+    hdrWidth = targetWidth;
+    hdrHeight = targetHeight;
     hdrTexture = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, hdrTexture);
     gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, hdrWidth, hdrHeight);
@@ -459,6 +477,7 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     disposed: false,
     // Playback clock in sim-time units.
     playbackSimTime: null,
+    lastArrivalWallMs: 0,
     lastRafMs: 0,
     // Self-tuning jitter depth: deepen on underruns, decay very slowly.
     lagIntervals: 2.5,
@@ -467,7 +486,31 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     // querying layout every frame.
     cssWidth: 0,
     cssHeight: 0,
+    // Internal resolution of the HDR glow pass relative to the canvas. The
+    // sprites are soft by design, so accumulating them at reduced resolution
+    // and upscaling in the tonemap is visually free while the fill cost drops
+    // with the square of the scale. Auto-tuned against the frame budget.
+    renderScale: 0.75,
+    renderScaleLocked: false,
+    frameCostEmaMs: 0,
+    qualityCooldown: 0,
   };
+
+  let dotStyle = false;
+  {
+    const params = new URLSearchParams(window.location.search);
+    dotStyle = params.get("style") === "dots";
+    const quality = Number.parseFloat(params.get("quality") ?? "");
+    if (Number.isFinite(quality) && quality > 0.2 && quality <= 1.0) {
+      state.renderScale = quality;
+      state.renderScaleLocked = true;
+    } else if (dotStyle) {
+      // Dots have near-zero fill cost and downscaling would blur them away:
+      // pin the glow pass to full resolution.
+      state.renderScale = 1.0;
+      state.renderScaleLocked = true;
+    }
+  }
 
   // Preallocated render scratch.
   const projMatrix = new Float32Array(16);
@@ -590,6 +633,17 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     slot.wallMs = performance.now();
     ringFrames = Math.min(ringFrames + 1, RING_SIZE);
 
+    // A long silence (pause, reconnect) is a stream discontinuity: frames on
+    // either side of it must not be interpolated across or fed into the rate
+    // window, so restart playback from this frame alone.
+    if (state.lastArrivalWallMs > 0 && slot.wallMs - state.lastArrivalWallMs > 2500) {
+      ringFrames = 1;
+      state.playbackSimTime = null;
+      state.lagIntervals = 2.5;
+      state.underrunStreak = 0;
+    }
+    state.lastArrivalWallMs = slot.wallMs;
+
     updateSceneBoundsFromSlot(slot);
     state.simTimeMyr = simTime;
 
@@ -702,6 +756,12 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
 
     const latest = ring[ringHead];
     const oldest = ring[(ringHead - (ringFrames - 1) + RING_SIZE * 2) % RING_SIZE];
+    // Playback floor: keep two slots of headroom above the oldest entry so an
+    // arriving frame never overwrites an actively-bound interpolation
+    // endpoint (the write head reuses the oldest slot in place).
+    const floorSlots = ringFrames > 4 ? 2 : 0;
+    const playbackFloor =
+      ring[(ringHead - (ringFrames - 1) + floorSlots + RING_SIZE * 2) % RING_SIZE];
 
     // Estimate the sim rate over the whole buffered window rather than from
     // per-arrival gaps: TCP delivery bursts (a long gap followed by a
@@ -730,17 +790,22 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
 
     // Underruns mean the delivery jitter exceeds the current lag: deepen the
     // buffer (more latency, no stutter), and let it creep back down slowly.
+    // Only while frames are actually flowing — an idle stream (paused
+    // session) is supposed to sit pinned at the newest frame.
+    const streamLive = nowMs - state.lastArrivalWallMs < 1500;
     if (state.playbackSimTime >= latest.simTime) {
-      state.underrunStreak += 1;
-      if (state.underrunStreak > 8) {
-        state.lagIntervals = Math.min(6, state.lagIntervals + 0.5);
-        state.underrunStreak = 0;
+      if (streamLive) {
+        state.underrunStreak += 1;
+        if (state.underrunStreak > 8) {
+          state.lagIntervals = Math.min(6, state.lagIntervals + 0.5);
+          state.underrunStreak = 0;
+        }
       }
     } else {
       state.underrunStreak = 0;
       state.lagIntervals = Math.max(2.5, state.lagIntervals - 0.0003);
     }
-    state.playbackSimTime = clamp(state.playbackSimTime, oldest.simTime, latest.simTime);
+    state.playbackSimTime = clamp(state.playbackSimTime, playbackFloor.simTime, latest.simTime);
 
     let previous = oldest;
     let current = latest;
@@ -803,11 +868,36 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     gl.disableVertexAttribArray(1);
   }
 
+  // Frame-budget feedback: when rAF intervals persistently exceed 60 fps the
+  // glow pass drops internal resolution (fill-rate is the dominant cost of
+  // the soft sprites); with ample headroom it recovers toward full quality.
+  function updateAutoQuality(nowMs) {
+    if (state.renderScaleLocked) {
+      return;
+    }
+    const frameCost = state.lastRafMs > 0 ? Math.min(100, nowMs - state.lastRafMs) : 16.7;
+    state.frameCostEmaMs = state.frameCostEmaMs > 0
+      ? state.frameCostEmaMs * 0.9 + frameCost * 0.1
+      : frameCost;
+    if (state.qualityCooldown > 0) {
+      state.qualityCooldown -= 1;
+      return;
+    }
+    if (state.frameCostEmaMs > 19 && state.renderScale > 0.35) {
+      state.renderScale = Math.max(0.35, state.renderScale * 0.85);
+      state.qualityCooldown = 30;
+    } else if (state.frameCostEmaMs < 12 && state.renderScale < 1.0) {
+      state.renderScale = Math.min(1.0, state.renderScale * 1.08);
+      state.qualityCooldown = 60;
+    }
+  }
+
   function render(nowMs) {
     if (state.disposed) {
       return;
     }
     state.rafHandle = window.requestAnimationFrame(render);
+    updateAutoQuality(nowMs);
     const pair = selectFramePair(nowMs);
     if (!pair || pair.current.count === 0) {
       return;
@@ -828,11 +918,14 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     );
     lookAtInto(viewMatrix, basis.eye, camera.focus, WORLD_UP);
     multiplyInto(viewProjMatrix, projMatrix, viewMatrix);
-    const focalLength = (Math.min(width, height) * 0.5) / Math.tan(Math.PI / 8);
 
     const useHdr = ensureHdrTarget();
+    const passWidth = useHdr ? hdrWidth : width;
+    const passHeight = useHdr ? hdrHeight : height;
+    const focalLength = (Math.min(passWidth, passHeight) * 0.5) / Math.tan(Math.PI / 8);
+
     gl.bindFramebuffer(gl.FRAMEBUFFER, useHdr ? hdrFramebuffer : null);
-    gl.viewport(0, 0, width, height);
+    gl.viewport(0, 0, passWidth, passHeight);
     gl.clearColor(useHdr ? 0 : 0.008, useHdr ? 0 : 0.031, useHdr ? 0 : 0.063, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
@@ -841,7 +934,7 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     gl.uniform3fv(uniforms.forward, basis.forward);
     gl.uniform1f(uniforms.alpha, pair.alpha);
     gl.uniform1f(uniforms.pointScale, focalLength);
-    gl.uniform1f(uniforms.sizeBoost, Math.min(2, window.devicePixelRatio || 1));
+    gl.uniform1f(uniforms.sizeBoost, Math.max(1, passWidth / Math.max(1, state.cssWidth)));
     gl.uniform3fv(uniforms.posMin0, pair.previous.posMin);
     gl.uniform3fv(uniforms.posScale0, pair.previous.posScale);
     gl.uniform3fv(uniforms.velMin0, pair.previous.velMin);
@@ -851,6 +944,7 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     gl.uniform3fv(uniforms.velMin1, pair.current.velMin);
     gl.uniform3fv(uniforms.velScale1, pair.current.velScale);
     gl.uniform2fv(uniforms.massLog, pair.current.massLog);
+    gl.uniform1f(uniforms.style, dotStyle ? 1.0 : 0.0);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE);
     gl.bindVertexArray(vao);
