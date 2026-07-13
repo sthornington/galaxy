@@ -6,9 +6,10 @@
 // tonemap pass maps the HDR sum to the screen.
 
 const HEADER_BYTES = 80;
-const PARTICLE_STRIDE = 32;
+const QUANT_BLOCK_BYTES = 56;
+const PARTICLE_STRIDE = 16;
 const PACKET_MAGIC = 0x54_4b_50_47; // "GPKT" little-endian
-const PACKET_VERSION = 1;
+const PACKET_VERSION = 2;
 
 const VERTEX_SHADER = `#version 300 es
 precision highp float;
@@ -19,12 +20,22 @@ uniform vec3 u_forward;
 uniform float u_alpha;
 uniform float u_pointScale;
 uniform float u_sizeBoost;
+// Per-endpoint dequantization ranges (frames carry their own quant blocks).
+uniform vec3 u_posMin0;
+uniform vec3 u_posScale0;
+uniform vec3 u_velMin0;
+uniform vec3 u_velScale0;
+uniform vec3 u_posMin1;
+uniform vec3 u_posScale1;
+uniform vec3 u_velMin1;
+uniform vec3 u_velScale1;
+uniform vec2 u_massLog; // (log2 min, log2 scale) of the current frame
 
-layout(location = 0) in vec3 a_prevPos;
-layout(location = 1) in vec3 a_prevVel;
-layout(location = 2) in vec3 a_pos;
-layout(location = 3) in vec3 a_vel;
-layout(location = 4) in float a_mass;
+layout(location = 0) in vec3 a_prevPos;   // normalized u16
+layout(location = 1) in vec3 a_prevVel;   // normalized u16
+layout(location = 2) in vec3 a_pos;       // normalized u16
+layout(location = 3) in vec3 a_vel;       // normalized u16
+layout(location = 4) in float a_mass;     // normalized u16 (log2-encoded)
 layout(location = 5) in uint a_component;
 
 out vec3 v_color;
@@ -50,8 +61,12 @@ void main() {
     return;
   }
 
-  vec3 position = mix(a_prevPos, a_pos, u_alpha);
-  vec3 velocity = mix(a_prevVel, a_vel, u_alpha);
+  vec3 position = mix(u_posMin0 + a_prevPos * u_posScale0,
+                      u_posMin1 + a_pos * u_posScale1,
+                      u_alpha);
+  vec3 velocity = mix(u_velMin0 + a_prevVel * u_velScale0,
+                      u_velMin1 + a_vel * u_velScale1,
+                      u_alpha);
   vec4 clip = u_viewProj * vec4(position, 1.0);
   gl_Position = clip;
   if (clip.w <= 0.1) {
@@ -60,8 +75,7 @@ void main() {
     return;
   }
 
-  float mass = max(a_mass, 1.0);
-  float logMass = log2(mass) * 0.3010299957;
+  float logMass = (u_massLog.x + a_mass * u_massLog.y) * 0.3010299957;
   float luminosity = clamp((logMass - 3.7) / 2.2, 0.25, 1.8);
   float renderLuminosity = pow(luminosity, 0.58);
   float massBias = clamp((logMass - 4.2) / 1.6, 0.0, 1.0);
@@ -296,6 +310,15 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     alpha: gl.getUniformLocation(pointProgram, "u_alpha"),
     pointScale: gl.getUniformLocation(pointProgram, "u_pointScale"),
     sizeBoost: gl.getUniformLocation(pointProgram, "u_sizeBoost"),
+    posMin0: gl.getUniformLocation(pointProgram, "u_posMin0"),
+    posScale0: gl.getUniformLocation(pointProgram, "u_posScale0"),
+    velMin0: gl.getUniformLocation(pointProgram, "u_velMin0"),
+    velScale0: gl.getUniformLocation(pointProgram, "u_velScale0"),
+    posMin1: gl.getUniformLocation(pointProgram, "u_posMin1"),
+    posScale1: gl.getUniformLocation(pointProgram, "u_posScale1"),
+    velMin1: gl.getUniformLocation(pointProgram, "u_velMin1"),
+    velScale1: gl.getUniformLocation(pointProgram, "u_velScale1"),
+    massLog: gl.getUniformLocation(pointProgram, "u_massLog"),
   };
   const tonemapUniforms = tonemapProgram
     ? {
@@ -313,7 +336,13 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
   const RING_SIZE = 12;
   const ring = [];
   for (let i = 0; i < RING_SIZE; i += 1) {
-    ring.push({ buffer: gl.createBuffer(), simTime: -Infinity, count: 0 });
+    ring.push({
+      buffer: gl.createBuffer(),
+      simTime: -Infinity,
+      count: 0,
+      capacityBytes: 0,
+      quant: null,
+    });
   }
   let ringHead = -1;
   let ringFrames = 0;
@@ -331,18 +360,18 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     gl.bindVertexArray(vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, prevBuffer);
     gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, PARTICLE_STRIDE, 0);
+    gl.vertexAttribPointer(0, 3, gl.UNSIGNED_SHORT, true, PARTICLE_STRIDE, 0);
     gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, PARTICLE_STRIDE, 12);
+    gl.vertexAttribPointer(1, 3, gl.UNSIGNED_SHORT, true, PARTICLE_STRIDE, 6);
     gl.bindBuffer(gl.ARRAY_BUFFER, curBuffer);
     gl.enableVertexAttribArray(2);
-    gl.vertexAttribPointer(2, 3, gl.FLOAT, false, PARTICLE_STRIDE, 0);
+    gl.vertexAttribPointer(2, 3, gl.UNSIGNED_SHORT, true, PARTICLE_STRIDE, 0);
     gl.enableVertexAttribArray(3);
-    gl.vertexAttribPointer(3, 3, gl.FLOAT, false, PARTICLE_STRIDE, 12);
+    gl.vertexAttribPointer(3, 3, gl.UNSIGNED_SHORT, true, PARTICLE_STRIDE, 6);
     gl.enableVertexAttribArray(4);
-    gl.vertexAttribPointer(4, 1, gl.FLOAT, false, PARTICLE_STRIDE, 24);
+    gl.vertexAttribPointer(4, 1, gl.UNSIGNED_SHORT, true, PARTICLE_STRIDE, 12);
     gl.enableVertexAttribArray(5);
-    gl.vertexAttribIPointer(5, 1, gl.UNSIGNED_INT, PARTICLE_STRIDE, 28);
+    gl.vertexAttribIPointer(5, 1, gl.UNSIGNED_BYTE, PARTICLE_STRIDE, 14);
     gl.bindVertexArray(null);
   }
 
@@ -397,14 +426,16 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     sawFirstFrame: false,
     rafHandle: null,
     disposed: false,
-    latestPacket: null,
-    latestCount: 0,
     // Playback clock in sim-time units.
     playbackSimTime: null,
     playbackRate: 0, // Myr per wall ms, EMA over arrivals
     frameIntervalMyr: 0, // EMA of sim-time spacing between frames
     lastArrivalWallMs: 0,
     lastRafMs: 0,
+    // Self-tuning jitter depth: deepen on underruns, decay very slowly.
+    lagIntervals: 2.5,
+    underrunStreak: 0,
+    latestQuant: null,
   };
 
   function clamp(value, min, max) {
@@ -442,44 +473,23 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     return { distance, eye, forward, right, up };
   }
 
-  function updateSceneBounds(particleBytes, count, force = false) {
+  // Frame bounds come for free from the packet's quantization ranges.
+  function updateSceneBoundsFromQuant(quant, force = false) {
     if (!camera.autoFrame && !force) {
       return;
     }
-    const floats = new Float32Array(particleBytes.buffer, particleBytes.byteOffset, count * 8);
-    const words = new Uint32Array(particleBytes.buffer, particleBytes.byteOffset, count * 8);
-    let sumX = 0;
-    let sumY = 0;
-    let sumZ = 0;
-    let luminous = 0;
-    for (let i = 0; i < count; i += 1) {
-      const component = words[i * 8 + 7];
-      if (component === 0 || component === 3) {
-        continue;
-      }
-      sumX += floats[i * 8];
-      sumY += floats[i * 8 + 1];
-      sumZ += floats[i * 8 + 2];
-      luminous += 1;
-    }
-    if (luminous === 0) {
-      return;
-    }
-    camera.focus = [sumX / luminous, sumY / luminous, sumZ / luminous];
-    let maxRadius = 1;
-    for (let i = 0; i < count; i += 1) {
-      const component = words[i * 8 + 7];
-      if (component === 0 || component === 3) {
-        continue;
-      }
-      const dx = floats[i * 8] - camera.focus[0];
-      const dy = floats[i * 8 + 1] - camera.focus[1];
-      const dz = floats[i * 8 + 2] - camera.focus[2];
-      maxRadius = Math.max(maxRadius, Math.hypot(dx, dy, dz));
-    }
-    camera.sceneRadius = maxRadius;
-    camera.baseDistance = (maxRadius * 0.9) / Math.tan(Math.PI / 8);
-    if (!force && luminous >= 32 && maxRadius > 0.5) {
+    camera.focus = [
+      quant.posMin[0] + quant.posScale[0] * 0.5,
+      quant.posMin[1] + quant.posScale[1] * 0.5,
+      quant.posMin[2] + quant.posScale[2] * 0.5,
+    ];
+    const radius = Math.max(
+      1,
+      0.5 * Math.hypot(quant.posScale[0], quant.posScale[1], quant.posScale[2])
+    );
+    camera.sceneRadius = radius;
+    camera.baseDistance = (radius * 0.9) / Math.tan(Math.PI / 8);
+    if (!force && radius > 0.5) {
       camera.autoFrame = false;
     }
   }
@@ -545,12 +555,25 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
 
     // Advance the clock at the observed sim rate, then ease it toward the
     // target lag point so rate drift never accumulates into a visible jump.
-    const target = latest.simTime - 2.5 * state.frameIntervalMyr;
+    const target = latest.simTime - state.lagIntervals * state.frameIntervalMyr;
     if (state.playbackSimTime === null) {
       state.playbackSimTime = target;
     }
     state.playbackSimTime += state.playbackRate * dtWall;
     state.playbackSimTime += (target - state.playbackSimTime) * 0.04;
+
+    // Underruns mean the delivery jitter exceeds the current lag: deepen the
+    // buffer (more latency, no stutter), and let it creep back down slowly.
+    if (state.playbackSimTime >= latest.simTime) {
+      state.underrunStreak += 1;
+      if (state.underrunStreak > 8) {
+        state.lagIntervals = Math.min(6, state.lagIntervals + 0.5);
+        state.underrunStreak = 0;
+      }
+    } else {
+      state.underrunStreak = 0;
+      state.lagIntervals = Math.max(2.5, state.lagIntervals - 0.0003);
+    }
     state.playbackSimTime = clamp(
       state.playbackSimTime,
       ordered[0].simTime,
@@ -619,6 +642,17 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     gl.uniform1f(uniforms.alpha, alpha);
     gl.uniform1f(uniforms.pointScale, focalLength);
     gl.uniform1f(uniforms.sizeBoost, Math.min(2, window.devicePixelRatio || 1));
+    const prevQuant = pair.previous.quant;
+    const curQuant = pair.current.quant;
+    gl.uniform3fv(uniforms.posMin0, prevQuant.posMin);
+    gl.uniform3fv(uniforms.posScale0, prevQuant.posScale);
+    gl.uniform3fv(uniforms.velMin0, prevQuant.velMin);
+    gl.uniform3fv(uniforms.velScale0, prevQuant.velScale);
+    gl.uniform3fv(uniforms.posMin1, curQuant.posMin);
+    gl.uniform3fv(uniforms.posScale1, curQuant.posScale);
+    gl.uniform3fv(uniforms.velMin1, curQuant.velMin);
+    gl.uniform3fv(uniforms.velScale1, curQuant.velScale);
+    gl.uniform2f(uniforms.massLog, curQuant.massLogMin, curQuant.massLogScale);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE);
     gl.bindVertexArray(vao);
@@ -662,7 +696,10 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     }
     const previewCount = view.getUint32(16, true);
     const simTime = view.getFloat64(24, true);
-    if (event.data.byteLength !== HEADER_BYTES + previewCount * PARTICLE_STRIDE) {
+    if (
+      event.data.byteLength !==
+      HEADER_BYTES + QUANT_BLOCK_BYTES + previewCount * PARTICLE_STRIDE
+    ) {
       dispatchEvent("galaxy-viewer-error");
       return;
     }
@@ -670,19 +707,55 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
       return;
     }
 
-    const particleBytes = new Uint8Array(event.data, HEADER_BYTES);
-    updateSceneBounds(particleBytes, previewCount);
+    const quant = {
+      posMin: [
+        view.getFloat32(80, true),
+        view.getFloat32(84, true),
+        view.getFloat32(88, true),
+      ],
+      posScale: [
+        view.getFloat32(92, true),
+        view.getFloat32(96, true),
+        view.getFloat32(100, true),
+      ],
+      velMin: [
+        view.getFloat32(104, true),
+        view.getFloat32(108, true),
+        view.getFloat32(112, true),
+      ],
+      velScale: [
+        view.getFloat32(116, true),
+        view.getFloat32(120, true),
+        view.getFloat32(124, true),
+      ],
+      massLogMin: view.getFloat32(128, true),
+      massLogScale: view.getFloat32(132, true),
+    };
+    updateSceneBoundsFromQuant(quant);
+
+    const particleBytes = new Uint8Array(
+      event.data,
+      HEADER_BYTES + QUANT_BLOCK_BYTES
+    );
 
     // Write into the next ring slot; the playback clock lags far enough
     // behind that the overwritten slot is never part of the active pair.
+    // Stores are preallocated once and updated with bufferSubData so the
+    // driver never reallocates in the hot path.
     ringHead = (ringHead + 1) % RING_SIZE;
     const slot = ring[ringHead];
     gl.bindBuffer(gl.ARRAY_BUFFER, slot.buffer);
-    gl.bufferData(gl.ARRAY_BUFFER, particleBytes, gl.DYNAMIC_DRAW);
+    if (slot.capacityBytes < particleBytes.byteLength) {
+      gl.bufferData(gl.ARRAY_BUFFER, particleBytes.byteLength, gl.DYNAMIC_DRAW);
+      slot.capacityBytes = particleBytes.byteLength;
+    }
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, particleBytes);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
     slot.simTime = simTime;
     slot.count = previewCount;
+    slot.quant = quant;
     ringFrames = Math.min(ringFrames + 1, RING_SIZE);
+    state.latestQuant = quant;
 
     // Track the sim-time playback rate and frame spacing (EMAs) that drive
     // the jitter-buffered clock in render().
@@ -700,8 +773,6 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     }
     state.lastArrivalWallMs = now;
     state.simTimeMyr = simTime;
-    state.latestPacket = particleBytes;
-    state.latestCount = previewCount;
 
     if (!state.sawFirstFrame) {
       state.sawFirstFrame = true;
@@ -808,8 +879,8 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
       camera.pitch = 0.9;
       camera.distanceScale = 1.2;
       camera.autoFrame = true;
-      if (state.latestPacket) {
-        updateSceneBounds(state.latestPacket, state.latestCount, true);
+      if (state.latestQuant) {
+        updateSceneBoundsFromQuant(state.latestQuant, true);
       }
     },
   };
