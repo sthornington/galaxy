@@ -298,6 +298,7 @@ struct SessionContext {
     running: bool,
     preview_budget: u32,
     preview_pending: bool,
+    last_captured_sim_time: f64,
 }
 
 enum RequestOutcome {
@@ -359,6 +360,7 @@ async fn session_task(
         running: false,
         preview_budget,
         preview_pending: false,
+        last_captured_sim_time: f64::NAN,
     };
 
     if let Err(error) = publish_frame(&mut ctx) {
@@ -405,12 +407,21 @@ async fn session_task(
                     }
                 }
                 if !ctx.preview_pending {
-                    if let Err(error) = request_preview_capture(&mut ctx) {
-                        error!("session {id} failed while queueing preview frame: {error:#}");
-                        ctx.summary.write().state = SessionState::Failed;
-                        return;
+                    // Only capture states the clients haven't seen: consecutive
+                    // ticker firings can land between two advances, and a
+                    // second capture of the same sim time would publish an
+                    // identical frame while wasting the capture slot for the
+                    // whole next advance (halving the effective frame rate).
+                    let current_sim_time = ctx.summary.read().sim_time_myr;
+                    if current_sim_time != ctx.last_captured_sim_time {
+                        if let Err(error) = request_preview_capture(&mut ctx) {
+                            error!("session {id} failed while queueing preview frame: {error:#}");
+                            ctx.summary.write().state = SessionState::Failed;
+                            return;
+                        }
+                        ctx.preview_pending = true;
+                        ctx.last_captured_sim_time = current_sim_time;
                     }
-                    ctx.preview_pending = true;
                 }
             }
             _ = tokio::task::yield_now() => {

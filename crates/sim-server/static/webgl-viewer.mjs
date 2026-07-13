@@ -364,6 +364,7 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     ring.push({
       buffer: gl.createBuffer(),
       simTime: -Infinity,
+      wallMs: 0,
       count: 0,
       capacityBytes: 0,
       posMin: new Float32Array(3),
@@ -458,9 +459,6 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     disposed: false,
     // Playback clock in sim-time units.
     playbackSimTime: null,
-    playbackRate: 0, // Myr per wall ms, EMA over arrivals
-    frameIntervalMyr: 0, // EMA of sim-time spacing between frames
-    lastArrivalWallMs: 0,
     lastRafMs: 0,
     // Self-tuning jitter depth: deepen on underruns, decay very slowly.
     lagIntervals: 2.5,
@@ -589,23 +587,10 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
     slot.count = count;
     slot.simTime = simTime;
+    slot.wallMs = performance.now();
     ringFrames = Math.min(ringFrames + 1, RING_SIZE);
 
     updateSceneBoundsFromSlot(slot);
-
-    const now = performance.now();
-    if (state.lastArrivalWallMs > 0 && state.simTimeMyr > -Infinity) {
-      const wallGap = Math.max(1, now - state.lastArrivalWallMs);
-      const simGap = simTime - state.simTimeMyr;
-      const instantaneousRate = simGap / wallGap;
-      state.playbackRate = state.playbackRate > 0
-        ? state.playbackRate * 0.75 + instantaneousRate * 0.25
-        : instantaneousRate;
-      state.frameIntervalMyr = state.frameIntervalMyr > 0
-        ? state.frameIntervalMyr * 0.75 + simGap * 0.25
-        : simGap;
-    }
-    state.lastArrivalWallMs = now;
     state.simTimeMyr = simTime;
 
     if (!state.sawFirstFrame) {
@@ -717,7 +702,16 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
 
     const latest = ring[ringHead];
     const oldest = ring[(ringHead - (ringFrames - 1) + RING_SIZE * 2) % RING_SIZE];
-    if (ringFrames === 1 || state.playbackRate <= 0) {
+
+    // Estimate the sim rate over the whole buffered window rather than from
+    // per-arrival gaps: TCP delivery bursts (a long gap followed by a
+    // back-to-back catch-up frame) make instantaneous gap ratios wildly wrong
+    // and a poisoned rate estimate pins the clock against the newest frame.
+    const spanSim = latest.simTime - oldest.simTime;
+    const spanWall = Math.max(1, latest.wallMs - oldest.wallMs);
+    const playbackRate = spanSim / spanWall;
+    const frameIntervalMyr = spanSim / (ringFrames - 1);
+    if (ringFrames === 1 || !(playbackRate > 0)) {
       state.playbackSimTime = latest.simTime;
       pairScratch.previous = latest;
       pairScratch.current = latest;
@@ -727,12 +721,12 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
 
     // Advance the clock at the observed sim rate, then ease it toward the
     // target lag point so rate drift never accumulates into a visible jump.
-    const target = latest.simTime - state.lagIntervals * state.frameIntervalMyr;
+    const target = latest.simTime - state.lagIntervals * frameIntervalMyr;
     if (state.playbackSimTime === null) {
       state.playbackSimTime = target;
     }
-    state.playbackSimTime += state.playbackRate * dtWall;
-    state.playbackSimTime += (target - state.playbackSimTime) * 0.04;
+    state.playbackSimTime += playbackRate * dtWall;
+    state.playbackSimTime += (target - state.playbackSimTime) * 0.08;
 
     // Underruns mean the delivery jitter exceeds the current lag: deepen the
     // buffer (more latency, no stutter), and let it creep back down slowly.
