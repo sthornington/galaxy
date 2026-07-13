@@ -1,15 +1,25 @@
-// WebGL2 instanced point-sprite renderer: binary preview packets go straight
-// from the WebSocket into GPU vertex buffers (no per-particle JS objects), and
-// projection, frame interpolation, mass->luminosity, and Doppler tinting all
-// run in the vertex shader. Additive blending is order-independent, so there
-// is no CPU depth sort; splats accumulate into an RGBA16F target and a
-// tonemap pass maps the HDR sum to the screen.
+// WebGL2 point-sprite renderer with an allocation-free steady state.
+//
+// - The preview WebSocket lives in a worker; frames arrive as transferable
+//   buffers from a fixed pool that ping-pongs between threads, so the ~4 MB
+//   per-message receive garbage is confined to the worker and the main thread
+//   never triggers large GCs.
+// - Frames are u16-quantized (packet v2); dequantization happens in the
+//   vertex shader against per-frame range uniforms.
+// - Playback runs on a jitter-buffered sim-time clock over a 12-frame GPU
+//   ring, interpolating between whichever pair brackets the clock; the lag
+//   deepens automatically if delivery ever underruns.
+// - The render loop reuses preallocated matrices, vectors, and scratch
+//   objects; per-frame allocations are limited to two ~100-byte typed-array
+//   views over each arriving transfer (unavoidable across a transfer).
 
+const META_BYTES = 72;
 const HEADER_BYTES = 80;
 const QUANT_BLOCK_BYTES = 56;
 const PARTICLE_STRIDE = 16;
 const PACKET_MAGIC = 0x54_4b_50_47; // "GPKT" little-endian
 const PACKET_VERSION = 2;
+const RING_SIZE = 12;
 
 const VERTEX_SHADER = `#version 300 es
 precision highp float;
@@ -113,7 +123,7 @@ void main() {
   if (r2 > 1.0) {
     discard;
   }
-  // Bright core + soft gaussian skirt, matching the two-arc Canvas2D look.
+  // Bright core + soft gaussian skirt.
   float weight = 0.55 * exp(-r2 * 14.0) + 0.45 * exp(-r2 * 3.2);
   fragColor = vec4(v_color * weight, 1.0);
 }
@@ -191,44 +201,63 @@ function compileProgram(gl, vertexSource, fragmentSource) {
   return program;
 }
 
-// --- minimal mat4 helpers (column-major, WebGL layout) ---
+// --- allocation-free mat4/vec3 helpers (column-major, WebGL layout) ---
 
-function perspectiveMatrix(fovY, aspect, near, far) {
+function perspectiveInto(out, fovY, aspect, near, far) {
   const f = 1 / Math.tan(fovY / 2);
-  const out = new Float32Array(16);
+  out.fill(0);
   out[0] = f / aspect;
   out[5] = f;
   out[10] = (far + near) / (near - far);
   out[11] = -1;
   out[14] = (2 * far * near) / (near - far);
-  return out;
 }
 
-function lookAtMatrix(eye, center, up) {
-  const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-  const cross = (a, b) => [
-    a[1] * b[2] - a[2] * b[1],
-    a[2] * b[0] - a[0] * b[2],
-    a[0] * b[1] - a[1] * b[0],
-  ];
-  const normalize = (v) => {
-    const length = Math.hypot(v[0], v[1], v[2]) || 1;
-    return [v[0] / length, v[1] / length, v[2] / length];
-  };
-  const zAxis = normalize(sub(eye, center));
-  const xAxis = normalize(cross(up, zAxis));
-  const yAxis = cross(zAxis, xAxis);
-  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-  return new Float32Array([
-    xAxis[0], yAxis[0], zAxis[0], 0,
-    xAxis[1], yAxis[1], zAxis[1], 0,
-    xAxis[2], yAxis[2], zAxis[2], 0,
-    -dot(xAxis, eye), -dot(yAxis, eye), -dot(zAxis, eye), 1,
-  ]);
+const lookScratch = {
+  x: new Float32Array(3),
+  y: new Float32Array(3),
+  z: new Float32Array(3),
+};
+
+function normalizeInto(v) {
+  const length = Math.hypot(v[0], v[1], v[2]) || 1;
+  v[0] /= length;
+  v[1] /= length;
+  v[2] /= length;
 }
 
-function multiplyMat4(a, b) {
-  const out = new Float32Array(16);
+function crossInto(out, a, b) {
+  const x = a[1] * b[2] - a[2] * b[1];
+  const y = a[2] * b[0] - a[0] * b[2];
+  const z = a[0] * b[1] - a[1] * b[0];
+  out[0] = x;
+  out[1] = y;
+  out[2] = z;
+}
+
+function dot3(a, b) {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+function lookAtInto(out, eye, center, up) {
+  const { x, y, z } = lookScratch;
+  z[0] = eye[0] - center[0];
+  z[1] = eye[1] - center[1];
+  z[2] = eye[2] - center[2];
+  normalizeInto(z);
+  crossInto(x, up, z);
+  normalizeInto(x);
+  crossInto(y, z, x);
+  out[0] = x[0]; out[1] = y[0]; out[2] = z[0]; out[3] = 0;
+  out[4] = x[1]; out[5] = y[1]; out[6] = z[1]; out[7] = 0;
+  out[8] = x[2]; out[9] = y[2]; out[10] = z[2]; out[11] = 0;
+  out[12] = -dot3(x, eye);
+  out[13] = -dot3(y, eye);
+  out[14] = -dot3(z, eye);
+  out[15] = 1;
+}
+
+function multiplyInto(out, a, b) {
   for (let column = 0; column < 4; column += 1) {
     for (let row = 0; row < 4; row += 1) {
       let sum = 0;
@@ -238,8 +267,9 @@ function multiplyMat4(a, b) {
       out[column * 4 + row] = sum;
     }
   }
-  return out;
 }
+
+const WORLD_UP = new Float32Array([0, 0, 1]);
 
 let active = null;
 
@@ -288,14 +318,14 @@ export function boot(canvasId, sessionId) {
   }
 
   try {
-    active = createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId);
+    active = createViewer(gl, canvas, restoreCanvas, sessionId);
   } catch (error) {
     restoreCanvas();
     throw error;
   }
 }
 
-function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
+function createViewer(gl, canvas, restoreCanvas, sessionId) {
   const hdrExtension = gl.getExtension("EXT_color_buffer_float");
 
   const pointProgram = compileProgram(gl, VERTEX_SHADER, FRAGMENT_SHADER);
@@ -328,12 +358,7 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     : null;
   const lineUniforms = { viewProj: gl.getUniformLocation(lineProgram, "u_viewProj") };
 
-  // Jitter buffer: physics frames arrive at an irregular ~5 Hz (the substep
-  // count varies step to step), so playback runs against a smoothed sim-time
-  // clock that lags the newest frame by ~2.5 frame intervals and interpolates
-  // inside whichever pair of buffered frames brackets it. Roughly half a
-  // second of latency in exchange for stutter-free motion.
-  const RING_SIZE = 12;
+  // GPU jitter ring; the quant arrays are written in place per arrival.
   const ring = [];
   for (let i = 0; i < RING_SIZE; i += 1) {
     ring.push({
@@ -341,12 +366,17 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
       simTime: -Infinity,
       count: 0,
       capacityBytes: 0,
-      quant: null,
+      posMin: new Float32Array(3),
+      posScale: new Float32Array(3),
+      velMin: new Float32Array(3),
+      velScale: new Float32Array(3),
+      massLog: new Float32Array(2),
     });
   }
   let ringHead = -1;
   let ringFrames = 0;
   const lineBuffer = gl.createBuffer();
+  let lineBufferCapacity = 0;
   const vao = gl.createVertexArray();
   let boundPrevBuffer = null;
   let boundCurBuffer = null;
@@ -417,7 +447,7 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     dragMode: "orbit",
     lastX: 0,
     lastY: 0,
-    focus: [0, 0, 0],
+    focus: new Float32Array(3),
     sceneRadius: 120,
   };
 
@@ -435,57 +465,63 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     // Self-tuning jitter depth: deepen on underruns, decay very slowly.
     lagIntervals: 2.5,
     underrunStreak: 0,
-    latestQuant: null,
+    // Cached canvas metrics, refreshed by the ResizeObserver instead of
+    // querying layout every frame.
+    cssWidth: 0,
+    cssHeight: 0,
   };
+
+  // Preallocated render scratch.
+  const projMatrix = new Float32Array(16);
+  const viewMatrix = new Float32Array(16);
+  const viewProjMatrix = new Float32Array(16);
+  const basis = {
+    distance: 0,
+    eye: new Float32Array(3),
+    forward: new Float32Array(3),
+    right: new Float32Array(3),
+    up: new Float32Array(3),
+  };
+  const pairScratch = { previous: null, current: null, alpha: 1 };
+  const axesVertices = new Float32Array(42);
+  const cursorDirection = new Float32Array(3);
 
   function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
   }
 
-  function cameraBasis() {
-    const distance = Math.max(0.08, camera.baseDistance * camera.distanceScale);
-    const eye = [
-      camera.focus[0] + distance * Math.cos(camera.pitch) * Math.cos(camera.yaw),
-      camera.focus[1] + distance * Math.cos(camera.pitch) * Math.sin(camera.yaw),
-      camera.focus[2] + distance * Math.sin(camera.pitch),
-    ];
-    const normalize = (v) => {
-      const length = Math.hypot(v[0], v[1], v[2]) || 1;
-      return [v[0] / length, v[1] / length, v[2] / length];
-    };
-    const forward = normalize([
-      camera.focus[0] - eye[0],
-      camera.focus[1] - eye[1],
-      camera.focus[2] - eye[2],
-    ]);
-    let right = [
-      forward[1] * 1 - forward[2] * 0,
-      forward[2] * 0 - forward[0] * 1,
-      forward[0] * 0 - forward[1] * 0,
-    ];
-    const rightLength = Math.hypot(right[0], right[1], right[2]);
-    right = rightLength <= 1e-6 ? [1, 0, 0] : right.map((v) => v / rightLength);
-    const up = [
-      right[1] * forward[2] - right[2] * forward[1],
-      right[2] * forward[0] - right[0] * forward[2],
-      right[0] * forward[1] - right[1] * forward[0],
-    ];
-    return { distance, eye, forward, right, up };
+  function updateBasis() {
+    basis.distance = Math.max(0.08, camera.baseDistance * camera.distanceScale);
+    const cosPitch = Math.cos(camera.pitch);
+    basis.eye[0] = camera.focus[0] + basis.distance * cosPitch * Math.cos(camera.yaw);
+    basis.eye[1] = camera.focus[1] + basis.distance * cosPitch * Math.sin(camera.yaw);
+    basis.eye[2] = camera.focus[2] + basis.distance * Math.sin(camera.pitch);
+    basis.forward[0] = camera.focus[0] - basis.eye[0];
+    basis.forward[1] = camera.focus[1] - basis.eye[1];
+    basis.forward[2] = camera.focus[2] - basis.eye[2];
+    normalizeInto(basis.forward);
+    crossInto(basis.right, basis.forward, WORLD_UP);
+    if (Math.hypot(basis.right[0], basis.right[1], basis.right[2]) <= 1e-6) {
+      basis.right[0] = 1;
+      basis.right[1] = 0;
+      basis.right[2] = 0;
+    } else {
+      normalizeInto(basis.right);
+    }
+    crossInto(basis.up, basis.right, basis.forward);
   }
 
   // Frame bounds come for free from the packet's quantization ranges.
-  function updateSceneBoundsFromQuant(quant, force = false) {
+  function updateSceneBoundsFromSlot(slot, force = false) {
     if (!camera.autoFrame && !force) {
       return;
     }
-    camera.focus = [
-      quant.posMin[0] + quant.posScale[0] * 0.5,
-      quant.posMin[1] + quant.posScale[1] * 0.5,
-      quant.posMin[2] + quant.posScale[2] * 0.5,
-    ];
+    camera.focus[0] = slot.posMin[0] + slot.posScale[0] * 0.5;
+    camera.focus[1] = slot.posMin[1] + slot.posScale[1] * 0.5;
+    camera.focus[2] = slot.posMin[2] + slot.posScale[2] * 0.5;
     const radius = Math.max(
       1,
-      0.5 * Math.hypot(quant.posScale[0], quant.posScale[1], quant.posScale[2])
+      0.5 * Math.hypot(slot.posScale[0], slot.posScale[1], slot.posScale[2])
     );
     camera.sceneRadius = radius;
     camera.baseDistance = (radius * 0.9) / Math.tan(Math.PI / 8);
@@ -494,48 +530,184 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     }
   }
 
-  function resizeToDisplay() {
+  function refreshCanvasMetrics() {
     const rect = canvas.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) {
+    state.cssWidth = rect.width;
+    state.cssHeight = rect.height;
+  }
+  const resizeObserver =
+    typeof ResizeObserver === "function" ? new ResizeObserver(refreshCanvasMetrics) : null;
+  resizeObserver?.observe(canvas);
+  refreshCanvasMetrics();
+
+  function resizeToDisplay() {
+    if (state.cssWidth <= 0 || state.cssHeight <= 0) {
       return;
     }
     const pixelRatio = Math.min(2, window.devicePixelRatio || 1);
-    const width = Math.round(rect.width * pixelRatio);
-    const height = Math.round(rect.height * pixelRatio);
+    const width = Math.round(state.cssWidth * pixelRatio);
+    const height = Math.round(state.cssHeight * pixelRatio);
     if (canvas.width !== width || canvas.height !== height) {
       canvas.width = width;
       canvas.height = height;
     }
   }
 
-  function drawAxes(viewProj) {
-    const axisLength = Math.max(1.4, camera.sceneRadius * 0.09);
-    const vertices = new Float32Array([
-      // x axis: red
-      0, 0, 0, 1.0, 0.43, 0.43, 0.56, axisLength, 0, 0, 1.0, 0.43, 0.43, 0.56,
-      // y axis: green
-      0, 0, 0, 0.47, 1.0, 0.67, 0.56, 0, axisLength, 0, 0.47, 1.0, 0.67, 0.56,
-      // z axis: blue
-      0, 0, 0, 0.43, 0.67, 1.0, 0.56, 0, 0, axisLength, 0.43, 0.67, 1.0, 0.56,
-    ]);
-    gl.useProgram(lineProgram);
-    gl.uniformMatrix4fv(lineUniforms.viewProj, false, viewProj);
-    gl.bindVertexArray(null);
-    gl.bindBuffer(gl.ARRAY_BUFFER, lineBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STREAM_DRAW);
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 28, 0);
-    gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 28, 12);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    gl.drawArrays(gl.LINES, 0, 6);
-    gl.disableVertexAttribArray(0);
-    gl.disableVertexAttribArray(1);
+  function bufferScale() {
+    return state.cssWidth > 0 ? canvas.width / state.cssWidth : 1;
   }
 
+  function dispatchEvent(name) {
+    window.dispatchEvent(new Event(name));
+  }
+
+  // --- frame ingestion (shared by the worker and inline socket paths) ---
+
+  function storeFrame(simTime, count, rangeView, rangeOffset, particleBytes) {
+    if (simTime <= state.simTimeMyr + 1e-9) {
+      return;
+    }
+    ringHead = (ringHead + 1) % RING_SIZE;
+    const slot = ring[ringHead];
+    for (let i = 0; i < 3; i += 1) {
+      slot.posMin[i] = rangeView.getFloat32(rangeOffset + i * 4, true);
+      slot.posScale[i] = rangeView.getFloat32(rangeOffset + 12 + i * 4, true);
+      slot.velMin[i] = rangeView.getFloat32(rangeOffset + 24 + i * 4, true);
+      slot.velScale[i] = rangeView.getFloat32(rangeOffset + 36 + i * 4, true);
+    }
+    slot.massLog[0] = rangeView.getFloat32(rangeOffset + 48, true);
+    slot.massLog[1] = rangeView.getFloat32(rangeOffset + 52, true);
+
+    // Stores are preallocated once and refreshed with bufferSubData so the
+    // driver never reallocates in the hot path.
+    gl.bindBuffer(gl.ARRAY_BUFFER, slot.buffer);
+    if (slot.capacityBytes < particleBytes.byteLength) {
+      gl.bufferData(gl.ARRAY_BUFFER, particleBytes.byteLength, gl.DYNAMIC_DRAW);
+      slot.capacityBytes = particleBytes.byteLength;
+    }
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, particleBytes);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    slot.count = count;
+    slot.simTime = simTime;
+    ringFrames = Math.min(ringFrames + 1, RING_SIZE);
+
+    updateSceneBoundsFromSlot(slot);
+
+    const now = performance.now();
+    if (state.lastArrivalWallMs > 0 && state.simTimeMyr > -Infinity) {
+      const wallGap = Math.max(1, now - state.lastArrivalWallMs);
+      const simGap = simTime - state.simTimeMyr;
+      const instantaneousRate = simGap / wallGap;
+      state.playbackRate = state.playbackRate > 0
+        ? state.playbackRate * 0.75 + instantaneousRate * 0.25
+        : instantaneousRate;
+      state.frameIntervalMyr = state.frameIntervalMyr > 0
+        ? state.frameIntervalMyr * 0.75 + simGap * 0.25
+        : simGap;
+    }
+    state.lastArrivalWallMs = now;
+    state.simTimeMyr = simTime;
+
+    if (!state.sawFirstFrame) {
+      state.sawFirstFrame = true;
+      dispatchEvent("galaxy-viewer-frame");
+    }
+  }
+
+  const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+  const frameUrl = `${scheme}://${window.location.host}/ws/frames/${sessionId}`;
+
+  let worker = null;
+  let inlineSocket = null;
+
+  function connectInline() {
+    inlineSocket = new WebSocket(frameUrl);
+    inlineSocket.binaryType = "arraybuffer";
+    inlineSocket.onmessage = (event) => {
+      if (state.disposed || !(event.data instanceof ArrayBuffer)) {
+        return;
+      }
+      const data = event.data;
+      if (data.byteLength < HEADER_BYTES + QUANT_BLOCK_BYTES) {
+        dispatchEvent("galaxy-viewer-error");
+        return;
+      }
+      const view = new DataView(data);
+      if (
+        view.getUint32(0, true) !== PACKET_MAGIC ||
+        view.getUint32(4, true) !== PACKET_VERSION
+      ) {
+        dispatchEvent("galaxy-viewer-error");
+        return;
+      }
+      const count = view.getUint32(16, true);
+      if (data.byteLength !== HEADER_BYTES + QUANT_BLOCK_BYTES + count * PARTICLE_STRIDE) {
+        dispatchEvent("galaxy-viewer-error");
+        return;
+      }
+      storeFrame(
+        view.getFloat64(24, true),
+        count,
+        view,
+        HEADER_BYTES,
+        new Uint8Array(data, HEADER_BYTES + QUANT_BLOCK_BYTES, count * PARTICLE_STRIDE)
+      );
+    };
+    inlineSocket.onclose = () => {
+      if (!state.disposed) {
+        dispatchEvent("galaxy-viewer-error");
+      }
+    };
+    inlineSocket.onerror = () => {
+      if (!state.disposed) {
+        dispatchEvent("galaxy-viewer-error");
+      }
+    };
+  }
+
+  try {
+    worker = new Worker("/webgl-stream-worker.js");
+    worker.onmessage = (event) => {
+      if (state.disposed) {
+        return;
+      }
+      const message = event.data;
+      if (message instanceof ArrayBuffer) {
+        // Pooled frame: [f64 simTime][u32 count][u32 dropped][56B quant][records].
+        const view = new DataView(message);
+        const simTime = view.getFloat64(0, true);
+        const count = view.getUint32(8, true);
+        storeFrame(
+          simTime,
+          count,
+          view,
+          16,
+          new Uint8Array(message, META_BYTES, count * PARTICLE_STRIDE)
+        );
+        // Send the buffer home for reuse.
+        worker.postMessage(message, [message]);
+        return;
+      }
+      if (message && (message.kind === "error" || message.kind === "closed")) {
+        dispatchEvent("galaxy-viewer-error");
+      }
+    };
+    worker.onerror = () => {
+      if (!state.disposed) {
+        dispatchEvent("galaxy-viewer-error");
+      }
+    };
+    worker.postMessage({ kind: "connect", url: frameUrl });
+  } catch (error) {
+    console.warn("frame stream worker unavailable; using inline socket", error);
+    worker = null;
+    connectInline();
+  }
+
+  // --- playback ---
+
   // Chooses the buffered frame pair bracketing the playback clock and the
-  // interpolation fraction between them.
+  // interpolation fraction between them (written into pairScratch).
   function selectFramePair(nowMs) {
     if (ringFrames === 0) {
       return null;
@@ -543,14 +715,14 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     const dtWall = clamp(nowMs - (state.lastRafMs || nowMs), 0, 100);
     state.lastRafMs = nowMs;
 
-    const ordered = [];
-    for (let i = ringFrames - 1; i >= 0; i -= 1) {
-      ordered.push(ring[(ringHead - i + RING_SIZE * 2) % RING_SIZE]);
-    }
-    const latest = ordered[ordered.length - 1];
-    if (ordered.length === 1 || state.playbackRate <= 0) {
+    const latest = ring[ringHead];
+    const oldest = ring[(ringHead - (ringFrames - 1) + RING_SIZE * 2) % RING_SIZE];
+    if (ringFrames === 1 || state.playbackRate <= 0) {
       state.playbackSimTime = latest.simTime;
-      return { previous: latest, current: latest, alpha: 1 };
+      pairScratch.previous = latest;
+      pairScratch.current = latest;
+      pairScratch.alpha = 1;
+      return pairScratch;
     }
 
     // Advance the clock at the observed sim rate, then ease it toward the
@@ -574,33 +746,67 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
       state.underrunStreak = 0;
       state.lagIntervals = Math.max(2.5, state.lagIntervals - 0.0003);
     }
-    state.playbackSimTime = clamp(
-      state.playbackSimTime,
-      ordered[0].simTime,
-      latest.simTime
-    );
+    state.playbackSimTime = clamp(state.playbackSimTime, oldest.simTime, latest.simTime);
 
-    let previous = ordered[0];
+    let previous = oldest;
     let current = latest;
-    for (let i = 0; i < ordered.length - 1; i += 1) {
-      if (
-        state.playbackSimTime >= ordered[i].simTime &&
-        state.playbackSimTime <= ordered[i + 1].simTime
-      ) {
-        previous = ordered[i];
-        current = ordered[i + 1];
+    for (let i = 0; i < ringFrames - 1; i += 1) {
+      const a = ring[(ringHead - (ringFrames - 1) + i + RING_SIZE * 2) % RING_SIZE];
+      const b = ring[(ringHead - (ringFrames - 1) + i + 1 + RING_SIZE * 2) % RING_SIZE];
+      if (state.playbackSimTime >= a.simTime && state.playbackSimTime <= b.simTime) {
+        previous = a;
+        current = b;
         break;
       }
     }
     if (previous.count !== current.count) {
       // Index-paired interpolation is meaningless across a budget change.
-      return { previous: current, current, alpha: 1 };
+      pairScratch.previous = current;
+      pairScratch.current = current;
+      pairScratch.alpha = 1;
+      return pairScratch;
     }
     const span = current.simTime - previous.simTime;
-    const alpha = span > 0
-      ? clamp((state.playbackSimTime - previous.simTime) / span, 0, 1)
-      : 1;
-    return { previous, current, alpha };
+    pairScratch.previous = previous;
+    pairScratch.current = current;
+    pairScratch.alpha =
+      span > 0 ? clamp((state.playbackSimTime - previous.simTime) / span, 0, 1) : 1;
+    return pairScratch;
+  }
+
+  function drawAxes() {
+    const axisLength = Math.max(1.4, camera.sceneRadius * 0.09);
+    // Six vertices of [pos.xyz, color.rgba]; origin vertices carry the axis
+    // color too, endpoints carry the axis offset.
+    axesVertices.fill(0);
+    axesVertices[3] = 1.0; axesVertices[4] = 0.43; axesVertices[5] = 0.43; axesVertices[6] = 0.56;
+    axesVertices[7] = axisLength;
+    axesVertices[10] = 1.0; axesVertices[11] = 0.43; axesVertices[12] = 0.43; axesVertices[13] = 0.56;
+    axesVertices[17] = 0.47; axesVertices[18] = 1.0; axesVertices[19] = 0.67; axesVertices[20] = 0.56;
+    axesVertices[22] = axisLength;
+    axesVertices[24] = 0.47; axesVertices[25] = 1.0; axesVertices[26] = 0.67; axesVertices[27] = 0.56;
+    axesVertices[31] = 0.43; axesVertices[32] = 0.67; axesVertices[33] = 1.0; axesVertices[34] = 0.56;
+    axesVertices[37] = axisLength;
+    axesVertices[38] = 0.43; axesVertices[39] = 0.67; axesVertices[40] = 1.0; axesVertices[41] = 0.56;
+
+    gl.useProgram(lineProgram);
+    gl.uniformMatrix4fv(lineUniforms.viewProj, false, viewProjMatrix);
+    gl.bindVertexArray(null);
+    gl.bindBuffer(gl.ARRAY_BUFFER, lineBuffer);
+    if (lineBufferCapacity < axesVertices.byteLength) {
+      gl.bufferData(gl.ARRAY_BUFFER, axesVertices.byteLength, gl.DYNAMIC_DRAW);
+      lineBufferCapacity = axesVertices.byteLength;
+    }
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, axesVertices);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 28, 0);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 28, 12);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.drawArrays(gl.LINES, 0, 6);
+    gl.disableVertexAttribArray(0);
+    gl.disableVertexAttribArray(1);
   }
 
   function render(nowMs) {
@@ -617,17 +823,17 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     resizeToDisplay();
     const width = canvas.width;
     const height = canvas.height;
-    const alpha = pair.alpha;
 
-    const basis = cameraBasis();
-    const projection = perspectiveMatrix(
+    updateBasis();
+    perspectiveInto(
+      projMatrix,
       Math.PI / 4,
       width / height,
       0.1,
       Math.max(10000, camera.sceneRadius * 200)
     );
-    const view = lookAtMatrix(basis.eye, camera.focus, [0, 0, 1]);
-    const viewProj = multiplyMat4(projection, view);
+    lookAtInto(viewMatrix, basis.eye, camera.focus, WORLD_UP);
+    multiplyInto(viewProjMatrix, projMatrix, viewMatrix);
     const focalLength = (Math.min(width, height) * 0.5) / Math.tan(Math.PI / 8);
 
     const useHdr = ensureHdrTarget();
@@ -637,22 +843,20 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     gl.useProgram(pointProgram);
-    gl.uniformMatrix4fv(uniforms.viewProj, false, viewProj);
-    gl.uniform3f(uniforms.forward, basis.forward[0], basis.forward[1], basis.forward[2]);
-    gl.uniform1f(uniforms.alpha, alpha);
+    gl.uniformMatrix4fv(uniforms.viewProj, false, viewProjMatrix);
+    gl.uniform3fv(uniforms.forward, basis.forward);
+    gl.uniform1f(uniforms.alpha, pair.alpha);
     gl.uniform1f(uniforms.pointScale, focalLength);
     gl.uniform1f(uniforms.sizeBoost, Math.min(2, window.devicePixelRatio || 1));
-    const prevQuant = pair.previous.quant;
-    const curQuant = pair.current.quant;
-    gl.uniform3fv(uniforms.posMin0, prevQuant.posMin);
-    gl.uniform3fv(uniforms.posScale0, prevQuant.posScale);
-    gl.uniform3fv(uniforms.velMin0, prevQuant.velMin);
-    gl.uniform3fv(uniforms.velScale0, prevQuant.velScale);
-    gl.uniform3fv(uniforms.posMin1, curQuant.posMin);
-    gl.uniform3fv(uniforms.posScale1, curQuant.posScale);
-    gl.uniform3fv(uniforms.velMin1, curQuant.velMin);
-    gl.uniform3fv(uniforms.velScale1, curQuant.velScale);
-    gl.uniform2f(uniforms.massLog, curQuant.massLogMin, curQuant.massLogScale);
+    gl.uniform3fv(uniforms.posMin0, pair.previous.posMin);
+    gl.uniform3fv(uniforms.posScale0, pair.previous.posScale);
+    gl.uniform3fv(uniforms.velMin0, pair.previous.velMin);
+    gl.uniform3fv(uniforms.velScale0, pair.previous.velScale);
+    gl.uniform3fv(uniforms.posMin1, pair.current.posMin);
+    gl.uniform3fv(uniforms.posScale1, pair.current.posScale);
+    gl.uniform3fv(uniforms.velMin1, pair.current.velMin);
+    gl.uniform3fv(uniforms.velScale1, pair.current.velScale);
+    gl.uniform2fv(uniforms.massLog, pair.current.massLog);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE);
     gl.bindVertexArray(vao);
@@ -671,130 +875,10 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     }
 
-    drawAxes(viewProj);
+    drawAxes();
   }
-
-  // --- WebSocket ---
-  const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-  const socket = new WebSocket(`${scheme}://${window.location.host}/ws/frames/${sessionId}`);
-  socket.binaryType = "arraybuffer";
-
-  function dispatchEvent(name) {
-    window.dispatchEvent(new Event(name));
-  }
-
-  socket.onmessage = (event) => {
-    if (state.disposed || !(event.data instanceof ArrayBuffer)) {
-      return;
-    }
-    const view = new DataView(event.data);
-    if (event.data.byteLength < HEADER_BYTES ||
-        view.getUint32(0, true) !== PACKET_MAGIC ||
-        view.getUint32(4, true) !== PACKET_VERSION) {
-      dispatchEvent("galaxy-viewer-error");
-      return;
-    }
-    const previewCount = view.getUint32(16, true);
-    const simTime = view.getFloat64(24, true);
-    if (
-      event.data.byteLength !==
-      HEADER_BYTES + QUANT_BLOCK_BYTES + previewCount * PARTICLE_STRIDE
-    ) {
-      dispatchEvent("galaxy-viewer-error");
-      return;
-    }
-    if (simTime <= state.simTimeMyr + 1e-9) {
-      return;
-    }
-
-    const quant = {
-      posMin: [
-        view.getFloat32(80, true),
-        view.getFloat32(84, true),
-        view.getFloat32(88, true),
-      ],
-      posScale: [
-        view.getFloat32(92, true),
-        view.getFloat32(96, true),
-        view.getFloat32(100, true),
-      ],
-      velMin: [
-        view.getFloat32(104, true),
-        view.getFloat32(108, true),
-        view.getFloat32(112, true),
-      ],
-      velScale: [
-        view.getFloat32(116, true),
-        view.getFloat32(120, true),
-        view.getFloat32(124, true),
-      ],
-      massLogMin: view.getFloat32(128, true),
-      massLogScale: view.getFloat32(132, true),
-    };
-    updateSceneBoundsFromQuant(quant);
-
-    const particleBytes = new Uint8Array(
-      event.data,
-      HEADER_BYTES + QUANT_BLOCK_BYTES
-    );
-
-    // Write into the next ring slot; the playback clock lags far enough
-    // behind that the overwritten slot is never part of the active pair.
-    // Stores are preallocated once and updated with bufferSubData so the
-    // driver never reallocates in the hot path.
-    ringHead = (ringHead + 1) % RING_SIZE;
-    const slot = ring[ringHead];
-    gl.bindBuffer(gl.ARRAY_BUFFER, slot.buffer);
-    if (slot.capacityBytes < particleBytes.byteLength) {
-      gl.bufferData(gl.ARRAY_BUFFER, particleBytes.byteLength, gl.DYNAMIC_DRAW);
-      slot.capacityBytes = particleBytes.byteLength;
-    }
-    gl.bufferSubData(gl.ARRAY_BUFFER, 0, particleBytes);
-    gl.bindBuffer(gl.ARRAY_BUFFER, null);
-    slot.simTime = simTime;
-    slot.count = previewCount;
-    slot.quant = quant;
-    ringFrames = Math.min(ringFrames + 1, RING_SIZE);
-    state.latestQuant = quant;
-
-    // Track the sim-time playback rate and frame spacing (EMAs) that drive
-    // the jitter-buffered clock in render().
-    const now = performance.now();
-    if (state.lastArrivalWallMs > 0 && state.simTimeMyr > -Infinity) {
-      const wallGap = Math.max(1, now - state.lastArrivalWallMs);
-      const simGap = simTime - state.simTimeMyr;
-      const instantaneousRate = simGap / wallGap;
-      state.playbackRate = state.playbackRate > 0
-        ? state.playbackRate * 0.75 + instantaneousRate * 0.25
-        : instantaneousRate;
-      state.frameIntervalMyr = state.frameIntervalMyr > 0
-        ? state.frameIntervalMyr * 0.75 + simGap * 0.25
-        : simGap;
-    }
-    state.lastArrivalWallMs = now;
-    state.simTimeMyr = simTime;
-
-    if (!state.sawFirstFrame) {
-      state.sawFirstFrame = true;
-      dispatchEvent("galaxy-viewer-frame");
-    }
-  };
-  socket.onclose = () => {
-    if (!state.disposed) {
-      dispatchEvent("galaxy-viewer-error");
-    }
-  };
-  socket.onerror = () => {
-    if (!state.disposed) {
-      dispatchEvent("galaxy-viewer-error");
-    }
-  };
 
   // --- controls (mirrors the other renderers) ---
-  function bufferScale() {
-    const rect = canvas.getBoundingClientRect();
-    return rect.width > 0 ? canvas.width / rect.width : 1;
-  }
 
   const handlers = {
     contextmenu: (event) => event.preventDefault(),
@@ -814,7 +898,7 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
       const dx = (event.clientX - camera.lastX) * scale;
       const dy = (event.clientY - camera.lastY) * scale;
       if (camera.dragMode === "pan") {
-        const basis = cameraBasis();
+        updateBasis();
         const panScale =
           (basis.distance * Math.tan(Math.PI / 8)) / (Math.min(canvas.width, canvas.height) * 0.5);
         for (let axis = 0; axis < 3; axis += 1) {
@@ -844,31 +928,29 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
       camera.distanceScale = clamp(camera.distanceScale * factor, 0.003, 20);
 
       // Zoom toward the cursor.
-      const rect = canvas.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0) {
+      if (state.cssWidth > 0 && state.cssHeight > 0) {
+        const rect = canvas.getBoundingClientRect();
         const scale = bufferScale();
         const cursorX = (event.clientX - rect.left) * scale;
         const cursorY = (event.clientY - rect.top) * scale;
-        const basis = cameraBasis();
+        updateBasis();
         const focal = (Math.min(canvas.width, canvas.height) * 0.5) / Math.tan(Math.PI / 8);
         const rightAmount = (cursorX - canvas.width * 0.5) / focal;
         const upAmount = -(cursorY - canvas.height * 0.5) / focal;
-        const direction = [
-          basis.forward[0] + basis.right[0] * rightAmount + basis.up[0] * upAmount,
-          basis.forward[1] + basis.right[1] * rightAmount + basis.up[1] * upAmount,
-          basis.forward[2] + basis.right[2] * rightAmount + basis.up[2] * upAmount,
-        ];
-        const length = Math.hypot(direction[0], direction[1], direction[2]) || 1;
-        const along =
-          (direction[0] * basis.forward[0] +
-            direction[1] * basis.forward[1] +
-            direction[2] * basis.forward[2]) /
-          length;
+        for (let axis = 0; axis < 3; axis += 1) {
+          cursorDirection[axis] =
+            basis.forward[axis] +
+            basis.right[axis] * rightAmount +
+            basis.up[axis] * upAmount;
+        }
+        const length =
+          Math.hypot(cursorDirection[0], cursorDirection[1], cursorDirection[2]) || 1;
+        const along = dot3(cursorDirection, basis.forward) / length;
         if (along > 1e-6) {
           const range = basis.distance / along;
           const pull = 1 - camera.distanceScale / previousScale;
           for (let axis = 0; axis < 3; axis += 1) {
-            const target = basis.eye[axis] + (direction[axis] / length) * range;
+            const target = basis.eye[axis] + (cursorDirection[axis] / length) * range;
             camera.focus[axis] += (target - camera.focus[axis]) * pull;
           }
         }
@@ -879,8 +961,8 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
       camera.pitch = 0.9;
       camera.distanceScale = 1.2;
       camera.autoFrame = true;
-      if (state.latestQuant) {
-        updateSceneBoundsFromQuant(state.latestQuant, true);
+      if (ringFrames > 0) {
+        updateSceneBoundsFromSlot(ring[ringHead], true);
       }
     },
   };
@@ -897,13 +979,20 @@ function createViewer(gl, canvas, baseCanvas, restoreCanvas, sessionId) {
       if (state.rafHandle !== null) {
         window.cancelAnimationFrame(state.rafHandle);
       }
-      socket.onmessage = null;
-      socket.onclose = null;
-      socket.onerror = null;
-      try {
-        socket.close();
-      } catch {
-        // already closed
+      resizeObserver?.disconnect();
+      if (worker) {
+        worker.postMessage({ kind: "disconnect" });
+        worker.terminate();
+      }
+      if (inlineSocket) {
+        inlineSocket.onmessage = null;
+        inlineSocket.onclose = null;
+        inlineSocket.onerror = null;
+        try {
+          inlineSocket.close();
+        } catch {
+          // already closed
+        }
       }
       for (const [name, handler] of Object.entries(handlers)) {
         canvas.removeEventListener(name, handler);

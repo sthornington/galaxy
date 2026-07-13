@@ -359,7 +359,7 @@ export function createUiApp({
             stopSessionPolling();
           }
         });
-    }, 250);
+    }, 500);
     return sessionPoll;
   }
 
