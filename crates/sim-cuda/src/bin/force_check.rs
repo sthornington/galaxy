@@ -45,6 +45,12 @@ fn main() -> Result<()> {
         galaxy.equilibrium_snapshot = None;
     }
 
+    // This harness pairs solver output with the reference by array index, so
+    // the backend's cell-order compaction must stay off.
+    unsafe {
+        std::env::set_var("SIM_CUDA_DISABLE_REORDER", "1");
+    }
+
     let mut initial_conditions = InitialConditions::generate(&preset.config, 7)?;
     for particle in &mut initial_conditions.particles {
         particle.velocity_kms = Vec3::ZERO;

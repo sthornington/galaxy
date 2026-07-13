@@ -256,9 +256,36 @@ export function createUiApp({
   let sessionPoll = null;
   let attachGeneration = 0;
 
+  const PREVIEW_BUDGETS = { webgl: 262_144, wasm: 32_768, json: 12_288 };
+
   function preferredPreviewBudget() {
     const params = new URLSearchParams(window.location.search);
-    return params.get("renderer") === "json" ? 12_288 : 32_768;
+    const renderer = params.get("renderer");
+    if (renderer === "json" || renderer === "wasm") {
+      return PREVIEW_BUDGETS[renderer];
+    }
+    return PREVIEW_BUDGETS.webgl;
+  }
+
+  // Sends a one-shot preview-budget renegotiation over the control socket,
+  // used when the attach falls back to a renderer that cannot sustain the
+  // WebGL-sized stream.
+  function sendPreviewBudget(sessionId, particleBudget) {
+    try {
+      const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+      const socket = new WebSocketImpl(
+        `${scheme}://${window.location.host}/ws/control/${sessionId}`
+      );
+      socket.onopen = () => {
+        socket.send(
+          JSON.stringify({ kind: "set_preview_budget", particle_budget: particleBudget })
+        );
+        socket.close();
+      };
+      socket.onerror = () => {};
+    } catch {
+      // Best effort; oversized frames still render, just slowly.
+    }
   }
 
   async function fetchJson(path, options = {}) {
@@ -788,20 +815,31 @@ export function createUiApp({
   }
 
   async function attachToSession(session) {
-    // A second Launch while the WASM boot below is still awaiting must win;
+    // A second Launch while the viewer boot below is still awaiting must win;
     // the stale attach would otherwise clobber the new session's socket.
     const generation = ++attachGeneration;
     updateSessionStats(session);
     closeFrameSocket();
-    const usingRustViewer = await tryBootRustViewer(session.id);
+    const tier = await tryBootRustViewer(session.id);
     if (generation !== attachGeneration) {
       return session;
     }
-    if (usingRustViewer) {
+    if (tier) {
       startSessionPolling(session.id);
-      nodes.viewerStatus.textContent =
-        "Streaming binary preview frames into the Rust/WASM viewer.";
+      if (tier === "webgl") {
+        nodes.viewerStatus.textContent =
+          "Streaming binary preview frames into the WebGL renderer.";
+      } else {
+        nodes.viewerStatus.textContent =
+          "Streaming binary preview frames into the Rust/WASM viewer.";
+        if (session.preview_particle_budget > PREVIEW_BUDGETS.wasm) {
+          sendPreviewBudget(session.id, PREVIEW_BUDGETS.wasm);
+        }
+      }
       return session;
+    }
+    if (session.preview_particle_budget > PREVIEW_BUDGETS.json) {
+      sendPreviewBudget(session.id, PREVIEW_BUDGETS.json);
     }
     openFrameSocket(session.id);
     return session;

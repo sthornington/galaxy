@@ -13,8 +13,9 @@
         <h1>Galaxy Evolution Control Room</h1>
         <p class="lede">
           Browser-connected control plane for the Rust + CUDA galactic evolution
-          engine. Frames stream over a binary WebSocket into the Rust/WASM
-          viewer, with a pure-JS renderer as fallback.
+          engine. Frames stream over a binary WebSocket straight into GPU
+          vertex buffers (WebGL2 point sprites, ~260k particles), with
+          Rust/WASM and pure-JS renderers as fallbacks.
         </p>
       </section>
 

@@ -69,6 +69,20 @@ bool short_range_target_baryons_only() {
   return enabled;
 }
 
+// Diagnostics that pair particles by array index (force_check) disable the
+// cell-order compaction, which otherwise permutes the particle array every
+// force build.
+bool particle_reorder_disabled() {
+  static const bool disabled = []() {
+    const char* raw_value = std::getenv("SIM_CUDA_DISABLE_REORDER");
+    if (raw_value == nullptr || raw_value[0] == '\0') {
+      return false;
+    }
+    return std::strcmp(raw_value, "0") != 0;
+  }();
+  return disabled;
+}
+
 double short_range_target_occupancy(const std::uint64_t particle_count) {
   static const double override = []() {
     const char* raw_value = std::getenv("SIM_CUDA_SHORT_RANGE_TARGET_OCCUPANCY");
@@ -197,14 +211,13 @@ struct DeviceState {
   float4* cell_moments_f4 = nullptr;
   float4* octant_moments_f4 = nullptr;
 
-  // Short-range sources gathered into sorted SoA order so the direct-sum inner
-  // loops stream coalesced memory instead of chasing an index indirection into
-  // the 88-byte particle records.
-  double* sorted_source_x = nullptr;
-  double* sorted_source_y = nullptr;
-  double* sorted_source_z = nullptr;
-  double* sorted_source_mass = nullptr;
-  double* sorted_source_softening = nullptr;
+  // Short-range sources gathered into sorted order as packed float4
+  // (position relative to the source's own cell center, mass) plus a separate
+  // softening array. Cell-relative fp32 keeps absolute position error around
+  // 1e-7 kpc, far below the smallest softening, at a quarter of the fp64 SoA
+  // bandwidth.
+  float4* sorted_source_posm = nullptr;
+  float* sorted_source_softening = nullptr;
 
   // Particles that are not short-range sources (SMBHs, massless, filtered),
   // processed after the cell-sorted targets so every particle gets kicked.
@@ -212,6 +225,18 @@ struct DeviceState {
   std::uint32_t non_source_count = 0;
 
   SimCudaParticle* particles = nullptr;
+  // Double buffer + inverse permutation used to compact particles into
+  // cell-sorted order each force build, keeping every kernel's access pattern
+  // coherent (PM deposit, drift, preview, and the kick's source loads).
+  SimCudaParticle* particles_scratch = nullptr;
+  int* inverse_index = nullptr;
+  // Two-tier time bins: bin 0 kicks every substep, bin 1 every second substep
+  // with a doubled dt. Assigned per base step from each particle's velocity
+  // and last kick acceleration; permuted alongside the particle array.
+  std::uint8_t* time_bins = nullptr;
+  std::uint8_t* time_bins_scratch = nullptr;
+  float* accel_mag = nullptr;
+  float* accel_mag_scratch = nullptr;
   int* galaxy_smbh_indices = nullptr;
   int* preview_visible_particle_indices = nullptr;
   int* short_source_particle_indices = nullptr;
@@ -389,10 +414,7 @@ void destroy_state(DeviceState* state) {
   cudaFree(state->pyramid_mass);
   cudaFree(state->cell_moments_f4);
   cudaFree(state->octant_moments_f4);
-  cudaFree(state->sorted_source_x);
-  cudaFree(state->sorted_source_y);
-  cudaFree(state->sorted_source_z);
-  cudaFree(state->sorted_source_mass);
+  cudaFree(state->sorted_source_posm);
   cudaFree(state->sorted_source_softening);
   cudaFree(state->non_source_indices);
   cudaFree(state->short_force_factor_lut);
@@ -414,6 +436,12 @@ void destroy_state(DeviceState* state) {
   cudaFree(state->density_k);
   cudaFree(state->density_grid);
   cudaFree(state->galaxy_smbh_indices);
+  cudaFree(state->accel_mag_scratch);
+  cudaFree(state->accel_mag);
+  cudaFree(state->time_bins_scratch);
+  cudaFree(state->time_bins);
+  cudaFree(state->inverse_index);
+  cudaFree(state->particles_scratch);
   cudaFree(state->particles);
   delete state;
 }
@@ -773,6 +801,31 @@ struct SpeedAccessor {
                 particle.velocity_kms[2] * particle.velocity_kms[2]);
   }
 };
+
+// Classifies each particle by whether it can take the doubled (slow) substep
+// without exceeding the allowed per-kick displacement; the 0.8 margin absorbs
+// velocity changes accrued mid-step before the next re-binning.
+__global__ void assign_time_bins(const SimCudaParticle* __restrict__ particles,
+                                 const float* __restrict__ accel_mag,
+                                 const std::uint64_t particle_count,
+                                 const double slow_dt_myr,
+                                 const double allowed_displacement_kpc,
+                                 std::uint8_t* __restrict__ time_bins) {
+  const std::uint64_t index =
+      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= particle_count) {
+    return;
+  }
+  const SimCudaParticle particle = particles[index];
+  const double speed_kms = sqrt(particle.velocity_kms[0] * particle.velocity_kms[0] +
+                                particle.velocity_kms[1] * particle.velocity_kms[1] +
+                                particle.velocity_kms[2] * particle.velocity_kms[2]);
+  const double accel_kpc_per_myr2 =
+      static_cast<double>(accel_mag[index]) * kKpcPerKmPerMyr * kKpcPerKmPerMyr;
+  const double displacement = speed_kms * slow_dt_myr * kKpcPerKmPerMyr +
+                              0.5 * accel_kpc_per_myr2 * slow_dt_myr * slow_dt_myr;
+  time_bins[index] = displacement <= 0.8 * allowed_displacement_kpc ? 1 : 0;
+}
 
 int update_simulation_domain_from_device(DeviceState* state,
                                          char* error_buffer,
@@ -1237,8 +1290,33 @@ std::uint32_t estimate_substeps_for_step(DeviceState* state,
         max_speed_kms * dt_myr * kKpcPerKmPerMyr +
         0.5 * max_accel_kpc_per_myr2 * dt_myr * dt_myr;
     const double raw_substeps = predicted_displacement / std::max(allowed_displacement, 1.0e-6);
-    const std::uint32_t substeps = static_cast<std::uint32_t>(
+    std::uint32_t substeps = static_cast<std::uint32_t>(
         std::clamp(std::ceil(raw_substeps), 1.0, static_cast<double>(std::max(1u, state->max_substeps))));
+
+    // The two-tier block-step scheme needs an even substep count so the slow
+    // bin's kicks land on substep boundaries.
+    if (substeps > 1) {
+      if ((substeps & 1u) != 0) {
+        substeps = substeps + 1 <= state->max_substeps ? substeps + 1
+                                                       : std::max(2u, substeps - 1);
+      }
+      const double slow_dt_myr = 2.0 * dt_myr / static_cast<double>(substeps);
+      const int threads_per_block = 256;
+      const int blocks =
+          static_cast<int>((state->particle_count + threads_per_block - 1) / threads_per_block);
+      assign_time_bins<<<blocks, threads_per_block, 0, state->compute_stream>>>(
+          state->particles,
+          state->accel_mag,
+          state->particle_count,
+          slow_dt_myr,
+          allowed_displacement,
+          state->time_bins);
+      const cudaError_t bin_status = cudaGetLastError();
+      if (bin_status != cudaSuccess) {
+        fill_cuda_error(error_buffer, error_buffer_len, "time bin kernel failed", bin_status);
+        return std::max(1u, state->max_substeps);
+      }
+    }
     return std::max(1u, substeps);
   } catch (const std::exception& error) {
     fill_error(error_buffer, error_buffer_len, error.what());
@@ -1744,27 +1822,110 @@ __global__ void pack_octant_moments_f4(const double* __restrict__ octant_mass,
   }
 }
 
-// Gathers the cell-sorted sources into SoA arrays so direct-sum loops stream
-// contiguous memory.
+// Gathers the cell-sorted sources into packed (cell-relative position, mass)
+// records so direct-sum loops stream one coalesced float4 per source.
 __global__ void gather_sorted_sources(const SimCudaParticle* __restrict__ particles,
                                       const int* __restrict__ sorted_particle_indices,
+                                      const int* __restrict__ sorted_cell_ids,
                                       const std::uint32_t source_count,
-                                      double* __restrict__ out_x,
-                                      double* __restrict__ out_y,
-                                      double* __restrict__ out_z,
-                                      double* __restrict__ out_mass,
-                                      double* __restrict__ out_softening) {
+                                      const int nx,
+                                      const int ny,
+                                      const int nz,
+                                      const double origin_x,
+                                      const double origin_y,
+                                      const double origin_z,
+                                      const double cell_x,
+                                      const double cell_y,
+                                      const double cell_z,
+                                      float4* __restrict__ out_posm,
+                                      float* __restrict__ out_softening) {
   const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
   if (slot >= source_count) {
     return;
   }
+  const int cell_id = sorted_cell_ids[slot];
+  if (cell_id >= nx * ny * nz) {
+    // Out-of-box overflow slot: never scanned by any geometric neighborhood.
+    out_posm[slot] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    out_softening[slot] = 0.0f;
+    return;
+  }
+  const int cell_plane = ny * nz;
+  const int ix = cell_id / cell_plane;
+  const int rem = cell_id - ix * cell_plane;
+  const int iy = rem / nz;
+  const int iz = rem - iy * nz;
+  const double center_x = origin_x + (static_cast<double>(ix) + 0.5) * cell_x;
+  const double center_y = origin_y + (static_cast<double>(iy) + 0.5) * cell_y;
+  const double center_z = origin_z + (static_cast<double>(iz) + 0.5) * cell_z;
+
   const int particle_index = sorted_particle_indices[slot];
   const SimCudaParticle particle = particles[particle_index];
-  out_x[slot] = particle.position_kpc[0];
-  out_y[slot] = particle.position_kpc[1];
-  out_z[slot] = particle.position_kpc[2];
-  out_mass[slot] = particle.mass_msun;
-  out_softening[slot] = particle.softening_kpc;
+  out_posm[slot] = make_float4(static_cast<float>(particle.position_kpc[0] - center_x),
+                               static_cast<float>(particle.position_kpc[1] - center_y),
+                               static_cast<float>(particle.position_kpc[2] - center_z),
+                               static_cast<float>(particle.mass_msun));
+  out_softening[slot] = static_cast<float>(particle.softening_kpc);
+}
+
+// The traversal order used by the kick: cell-sorted sources first, then the
+// small non-source tail. Compacting the particle array into this order keeps
+// warp-neighboring particles adjacent in memory.
+__device__ __forceinline__ int traversal_particle_index(
+    const int* __restrict__ sorted_particle_indices,
+    const std::uint32_t source_count,
+    const int* __restrict__ non_source_indices,
+    const std::uint64_t slot) {
+  return slot < source_count
+             ? sorted_particle_indices[slot]
+             : non_source_indices[slot - source_count];
+}
+
+__global__ void gather_particles_traversal_order(const SimCudaParticle* __restrict__ in,
+                                                 const std::uint8_t* __restrict__ bins_in,
+                                                 const float* __restrict__ accel_in,
+                                                 const int* __restrict__ sorted_particle_indices,
+                                                 const std::uint32_t source_count,
+                                                 const int* __restrict__ non_source_indices,
+                                                 const std::uint64_t particle_count,
+                                                 SimCudaParticle* __restrict__ out,
+                                                 std::uint8_t* __restrict__ bins_out,
+                                                 float* __restrict__ accel_out,
+                                                 int* __restrict__ inverse_index) {
+  const std::uint64_t slot =
+      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (slot >= particle_count) {
+    return;
+  }
+  const int old_index = traversal_particle_index(
+      sorted_particle_indices, source_count, non_source_indices, slot);
+  out[slot] = in[old_index];
+  bins_out[slot] = bins_in[old_index];
+  accel_out[slot] = accel_in[old_index];
+  inverse_index[old_index] = static_cast<int>(slot);
+}
+
+__global__ void remap_index_array(int* __restrict__ indices,
+                                  const std::uint32_t count,
+                                  const int* __restrict__ inverse_index) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) {
+    return;
+  }
+  const int old_index = indices[i];
+  if (old_index >= 0) {
+    indices[i] = inverse_index[old_index];
+  }
+}
+
+__global__ void fill_iota(int* __restrict__ out,
+                          const std::uint32_t count,
+                          const int offset) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) {
+    return;
+  }
+  out[i] = offset + static_cast<int>(i);
 }
 
 // Real-space free-space (isolated) Green's function on the mesh, using the
@@ -1945,11 +2106,8 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
                                       const std::uint32_t source_count,
                                       const int* __restrict__ short_cell_start,
                                       const int* __restrict__ short_cell_end,
-                                      const double* __restrict__ sorted_source_x,
-                                      const double* __restrict__ sorted_source_y,
-                                      const double* __restrict__ sorted_source_z,
-                                      const double* __restrict__ sorted_source_mass,
-                                      const double* __restrict__ sorted_source_softening,
+                                      const float4* __restrict__ sorted_source_posm,
+                                      const float* __restrict__ sorted_source_softening,
                                       const float4* __restrict__ octant_moments,
                                       const float* __restrict__ short_force_factor_lut,
                                       const std::uint32_t short_force_factor_lut_size,
@@ -1974,7 +2132,10 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
                                       const double grav_const,
                                       const int enable_smbh_post_newtonian,
                                       double* __restrict__ max_accel_sq,
-                                      const double dt_myr) {
+                                      const double dt_myr,
+                                      const double dt_slow_myr,
+                                      const std::uint8_t* __restrict__ time_bins,
+                                      float* __restrict__ accel_mag_out) {
   const std::uint64_t thread_slot =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (thread_slot >= particle_count) {
@@ -1994,6 +2155,13 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
       index = static_cast<std::uint64_t>(
           non_source_indices[thread_slot - source_count]);
     }
+  }
+
+  // Slow-bin particles integrate with a doubled dt on alternate substeps and
+  // skip the off substeps entirely (dt 0).
+  const double particle_dt_myr = time_bins[index] != 0 ? dt_slow_myr : dt_myr;
+  if (particle_dt_myr == 0.0) {
+    return;
   }
 
   SimCudaParticle& particle = particles[index];
@@ -2079,6 +2247,18 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
         neighborhood_occupancy <= direct_neighborhood_threshold;
     const int own_cell = short_cell_linear_index(fine_ix, fine_iy, fine_iz, short_ny, short_nz);
 
+    const float cutoff_sq_f = static_cast<float>(short_cutoff_sq);
+    const float grav_f = static_cast<float>(grav_const);
+    const float lut_scale_f = static_cast<float>(short_force_factor_lut_scale);
+    const float particle_softening_f = static_cast<float>(particle_softening);
+    float fax = 0.0f;
+    float fay = 0.0f;
+    float faz = 0.0f;
+
+    // Direct pairs in cell-relative single precision: the target coordinate is
+    // re-expressed against each scanned cell's center (exact fp64 subtraction,
+    // then cast), so pair deltas carry ~1e-7 kpc error against softenings of
+    // 0.02+ kpc while streaming one float4 per source.
     for (int cx = nbr_x0; cx <= nbr_x1; ++cx) {
       for (int cy = nbr_y0; cy <= nbr_y1; ++cy) {
         for (int cz = nbr_z0; cz <= nbr_z1; ++cz) {
@@ -2091,48 +2271,46 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
             continue;
           }
           const int end = short_cell_end[cell];
+          const float tx = static_cast<float>(
+              particle_pos_x - (short_origin_x + (static_cast<double>(cx) + 0.5) * short_cell_x));
+          const float ty = static_cast<float>(
+              particle_pos_y - (short_origin_y + (static_cast<double>(cy) + 0.5) * short_cell_y));
+          const float tz = static_cast<float>(
+              particle_pos_z - (short_origin_z + (static_cast<double>(cz) + 0.5) * short_cell_z));
           for (int slot = start; slot < end; ++slot) {
             if (slot == self_slot) {
               continue;
             }
-            const double dx = sorted_source_x[slot] - particle_pos_x;
-            const double dy = sorted_source_y[slot] - particle_pos_y;
-            const double dz = sorted_source_z[slot] - particle_pos_z;
-            const double r2 = dx * dx + dy * dy + dz * dz;
-            if (r2 <= 1.0e-12 || r2 > short_cutoff_sq) {
+            const float4 source = sorted_source_posm[slot];
+            const float dx = source.x - tx;
+            const float dy = source.y - ty;
+            const float dz = source.z - tz;
+            const float r2 = dx * dx + dy * dy + dz * dz;
+            if (r2 <= 1.0e-10f || r2 > cutoff_sq_f) {
               continue;
             }
 
-            const double short_softening =
-                fmax(particle_softening, sorted_source_softening[slot]);
-            const double correction_scale =
-                grav_const * sorted_source_mass[slot] *
-                softened_inv_r3(dx, dy, dz, short_softening) *
-                treepm_short_range_force_factor_lookup(short_force_factor_lut,
-                                                       short_force_factor_lut_size,
-                                                       short_force_factor_lut_scale,
-                                                       r2,
-                                                       short_pm_softening_kpc);
-            ax += correction_scale * dx;
-            ay += correction_scale * dy;
-            az += correction_scale * dz;
+            const float short_softening =
+                fmaxf(particle_softening_f, sorted_source_softening[slot]);
+            const float inv_r = rsqrtf(r2 + short_softening * short_softening);
+            const float correction_scale = grav_f * source.w * inv_r * inv_r * inv_r *
+                treepm_short_range_force_factor_lookup_f(short_force_factor_lut,
+                                                         short_force_factor_lut_size,
+                                                         lut_scale_f,
+                                                         r2);
+            fax += correction_scale * dx;
+            fay += correction_scale * dy;
+            faz += correction_scale * dz;
           }
         }
       }
     }
 
-    // Single-precision monopole paths: coordinates are relative to the short
-    // box origin, so float precision is ~1e-4 kpc against evaluation distances
-    // of at least one cell.
+    // Monopole paths use coordinates relative to the short box origin
+    // (~1e-4 kpc float error against evaluation distances of at least a cell).
     const float pxf = static_cast<float>(particle_pos_x - short_origin_x);
     const float pyf = static_cast<float>(particle_pos_y - short_origin_y);
     const float pzf = static_cast<float>(particle_pos_z - short_origin_z);
-    const float cutoff_sq_f = static_cast<float>(short_cutoff_sq);
-    const float grav_f = static_cast<float>(grav_const);
-    const float lut_scale_f = static_cast<float>(short_force_factor_lut_scale);
-    float fax = 0.0f;
-    float fay = 0.0f;
-    float faz = 0.0f;
 
     if (!sparse_neighborhood) {
       // Just enough softening to keep a near-coincident neighbor-octant COM
@@ -2294,12 +2472,14 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
     }
   }
 
+  const double accel_sq = ax * ax + ay * ay + az * az;
   if (max_accel_sq != nullptr) {
-    atomic_max_positive_double(max_accel_sq, ax * ax + ay * ay + az * az);
+    atomic_max_positive_double(max_accel_sq, accel_sq);
   }
-  particle.velocity_kms[0] = particle_vel_x + ax * dt_myr * kKpcPerKmPerMyr;
-  particle.velocity_kms[1] = particle_vel_y + ay * dt_myr * kKpcPerKmPerMyr;
-  particle.velocity_kms[2] = particle_vel_z + az * dt_myr * kKpcPerKmPerMyr;
+  accel_mag_out[index] = static_cast<float>(sqrt(accel_sq));
+  particle.velocity_kms[0] = particle_vel_x + ax * particle_dt_myr * kKpcPerKmPerMyr;
+  particle.velocity_kms[1] = particle_vel_y + ay * particle_dt_myr * kKpcPerKmPerMyr;
+  particle.velocity_kms[2] = particle_vel_z + az * particle_dt_myr * kKpcPerKmPerMyr;
 }
 
 __global__ void drift_particles(SimCudaParticle* particles,
@@ -2826,6 +3006,70 @@ int build_short_range_structure(DeviceState* state,
     return 1;
   }
 
+  if (!particle_reorder_disabled()) {
+    // Compact the particle array into traversal order. Everything computed so
+    // far (cell ids, moments, octants) is positional and unaffected; only the
+    // index arrays need to follow the permutation.
+    stage_start = std::chrono::steady_clock::now();
+    const int all_particle_blocks =
+        static_cast<int>((state->particle_count + threads_per_block - 1) / threads_per_block);
+    gather_particles_traversal_order<<<all_particle_blocks, threads_per_block, 0, state->compute_stream>>>(
+        state->particles,
+        state->time_bins,
+        state->accel_mag,
+        state->short_sorted_particle_indices,
+        state->short_source_particle_count,
+        state->non_source_indices,
+        state->particle_count,
+        state->particles_scratch,
+        state->time_bins_scratch,
+        state->accel_mag_scratch,
+        state->inverse_index);
+    cuda_status = cudaGetLastError();
+    if (cuda_status != cudaSuccess) {
+      fill_cuda_error(error_buffer, error_buffer_len, "particle reorder gather failed", cuda_status);
+      return 1;
+    }
+    std::swap(state->particles, state->particles_scratch);
+    std::swap(state->time_bins, state->time_bins_scratch);
+    std::swap(state->accel_mag, state->accel_mag_scratch);
+
+    if (state->galaxy_count > 0) {
+      const int smbh_blocks =
+          static_cast<int>((state->galaxy_count + threads_per_block - 1) / threads_per_block);
+      remap_index_array<<<smbh_blocks, threads_per_block, 0, state->compute_stream>>>(
+          state->galaxy_smbh_indices, state->galaxy_count, state->inverse_index);
+    }
+    if (state->preview_visible_particle_count > 0) {
+      const int visible_blocks = static_cast<int>(
+          (state->preview_visible_particle_count + threads_per_block - 1) / threads_per_block);
+      remap_index_array<<<visible_blocks, threads_per_block, 0, state->compute_stream>>>(
+          state->preview_visible_particle_indices,
+          state->preview_visible_particle_count,
+          state->inverse_index);
+    }
+    fill_iota<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
+        state->short_sorted_particle_indices, state->short_source_particle_count, 0);
+    fill_iota<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
+        state->short_source_particle_indices, state->short_source_particle_count, 0);
+    if (state->non_source_count > 0) {
+      const int non_source_blocks =
+          static_cast<int>((state->non_source_count + threads_per_block - 1) / threads_per_block);
+      fill_iota<<<non_source_blocks, threads_per_block, 0, state->compute_stream>>>(
+          state->non_source_indices,
+          state->non_source_count,
+          static_cast<int>(state->short_source_particle_count));
+    }
+    cuda_status = cudaGetLastError();
+    if (cuda_status != cudaSuccess) {
+      fill_cuda_error(error_buffer, error_buffer_len, "particle reorder remap failed", cuda_status);
+      return 1;
+    }
+    if (finish_stage("short_range.reorder", stage_start) != 0) {
+      return 1;
+    }
+  }
+
   stage_start = std::chrono::steady_clock::now();
   build_short_range_cell_ranges<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
       state->short_sorted_cell_ids,
@@ -2948,11 +3192,18 @@ int build_short_range_structure(DeviceState* state,
     gather_sorted_sources<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
         state->particles,
         state->short_sorted_particle_indices,
+        state->short_sorted_cell_ids,
         state->short_source_particle_count,
-        state->sorted_source_x,
-        state->sorted_source_y,
-        state->sorted_source_z,
-        state->sorted_source_mass,
+        state->short_nx,
+        state->short_ny,
+        state->short_nz,
+        state->short_domain_origin[0],
+        state->short_domain_origin[1],
+        state->short_domain_origin[2],
+        state->short_cell_size[0],
+        state->short_cell_size[1],
+        state->short_cell_size[2],
+        state->sorted_source_posm,
         state->sorted_source_softening);
     cuda_status = cudaGetLastError();
     if (cuda_status != cudaSuccess) {
@@ -3028,7 +3279,8 @@ int build_force_state(DeviceState* state,
 int apply_force_kick_from_state(DeviceState* state,
                                 const int particle_blocks,
                                 const int threads_per_block,
-                                const double dt_myr,
+                                const double dt_fast_myr,
+                                const double dt_slow_myr,
                                 char* error_buffer,
                                 const std::size_t error_buffer_len) {
   cudaError_t cuda_status =
@@ -3075,10 +3327,7 @@ int apply_force_kick_from_state(DeviceState* state,
       source_count,
       state->short_cell_start,
       state->short_cell_end,
-      state->sorted_source_x,
-      state->sorted_source_y,
-      state->sorted_source_z,
-      state->sorted_source_mass,
+      state->sorted_source_posm,
       state->sorted_source_softening,
       state->octant_moments_f4,
       state->short_force_factor_lut,
@@ -3104,7 +3353,10 @@ int apply_force_kick_from_state(DeviceState* state,
       state->grav_const,
       state->enable_smbh_post_newtonian ? 1 : 0,
       state->max_accel_sq,
-      dt_myr);
+      dt_fast_myr,
+      dt_slow_myr,
+      state->time_bins,
+      state->accel_mag);
   cuda_status = cudaGetLastError();
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer, error_buffer_len, "global particle kick kernel failed", cuda_status);
@@ -3150,6 +3402,11 @@ int run_steps(DeviceState* state,
         estimate_substeps_for_step(state, dt_myr, error_buffer, error_buffer_len);
     const double substep_dt_myr = dt_myr / static_cast<double>(std::max(1u, substeps));
     const double half_substep_dt_myr = 0.5 * substep_dt_myr;
+    // The slow bin's leapfrog runs at twice the substep: its opening half-kick
+    // is a full substep_dt, interior kicks are 2*substep_dt on even substep
+    // boundaries (dt 0 in between skips the work), and the closing half-kick
+    // is substep_dt. With a single substep the bins collapse to one tier.
+    const bool use_bins = substeps >= 2;
 
     // Kick-drift-kick with merged interior kicks: the closing half-kick of one
     // substep and the opening half-kick of the next share the same force
@@ -3169,6 +3426,7 @@ int run_steps(DeviceState* state,
                                     particle_blocks,
                                     threads_per_block,
                                     half_substep_dt_myr,
+                                    use_bins ? substep_dt_myr : half_substep_dt_myr,
                                     error_buffer,
                                     error_buffer_len) != 0) {
       return 1;
@@ -3201,11 +3459,19 @@ int run_steps(DeviceState* state,
 
       const bool last_substep = substep + 1 == substeps;
       const double kick_dt_myr = last_substep ? half_substep_dt_myr : substep_dt_myr;
+      double slow_kick_dt_myr = kick_dt_myr;
+      if (use_bins) {
+        const bool slow_boundary = (substep + 1) % 2 == 0;
+        slow_kick_dt_myr = !slow_boundary ? 0.0
+            : last_substep ? substep_dt_myr
+                           : 2.0 * substep_dt_myr;
+      }
       stage_start = std::chrono::steady_clock::now();
       if (apply_force_kick_from_state(state,
                                       particle_blocks,
                                       threads_per_block,
                                       kick_dt_myr,
+                                      slow_kick_dt_myr,
                                       error_buffer,
                                       error_buffer_len) != 0) {
         return 1;
@@ -3315,6 +3581,38 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
     return 1;
   }
 
+  cuda_status =
+      cudaMalloc(reinterpret_cast<void**>(&state->particles_scratch), particle_bytes);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for particle scratch failed", cuda_status);
+    destroy_state(state);
+    return 1;
+  }
+  cuda_status = cudaMalloc(reinterpret_cast<void**>(&state->inverse_index),
+                           sizeof(int) * params->particle_count);
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "cudaMalloc for inverse index failed", cuda_status);
+    destroy_state(state);
+    return 1;
+  }
+
+  if (cudaMalloc(reinterpret_cast<void**>(&state->time_bins), params->particle_count) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&state->time_bins_scratch), params->particle_count) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&state->accel_mag),
+                 sizeof(float) * params->particle_count) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&state->accel_mag_scratch),
+                 sizeof(float) * params->particle_count) != cudaSuccess) {
+    fill_error(error_buffer, error_buffer_len, "cudaMalloc for time bins failed");
+    destroy_state(state);
+    return 1;
+  }
+  if (cudaMemset(state->time_bins, 0, params->particle_count) != cudaSuccess ||
+      cudaMemset(state->accel_mag, 0, sizeof(float) * params->particle_count) != cudaSuccess) {
+    fill_error(error_buffer, error_buffer_len, "cudaMemset for time bins failed");
+    destroy_state(state);
+    return 1;
+  }
+
   std::vector<int> galaxy_smbh_indices(params->galaxy_count, -1);
   for (std::uint64_t i = 0; i < params->particle_count; ++i) {
     if (particles[i].component == 3u && particles[i].galaxy_index < params->galaxy_count) {
@@ -3397,16 +3695,10 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
     }
 
     const std::size_t source_count = state->short_source_particle_count;
-    if (cudaMalloc(reinterpret_cast<void**>(&state->sorted_source_x),
-                   sizeof(double) * source_count) != cudaSuccess ||
-        cudaMalloc(reinterpret_cast<void**>(&state->sorted_source_y),
-                   sizeof(double) * source_count) != cudaSuccess ||
-        cudaMalloc(reinterpret_cast<void**>(&state->sorted_source_z),
-                   sizeof(double) * source_count) != cudaSuccess ||
-        cudaMalloc(reinterpret_cast<void**>(&state->sorted_source_mass),
-                   sizeof(double) * source_count) != cudaSuccess ||
+    if (cudaMalloc(reinterpret_cast<void**>(&state->sorted_source_posm),
+                   sizeof(float4) * source_count) != cudaSuccess ||
         cudaMalloc(reinterpret_cast<void**>(&state->sorted_source_softening),
-                   sizeof(double) * source_count) != cudaSuccess) {
+                   sizeof(float) * source_count) != cudaSuccess) {
       fill_error(error_buffer, error_buffer_len, "cudaMalloc for sorted source SoA failed");
       destroy_state(state);
       return 1;

@@ -11,8 +11,11 @@ NVIDIA GB10 / DGX Spark.
   Rust FFI wrapper.
 - `crates/sim-server`: `axum` control plane that serves the browser client,
   manages sessions, and streams preview frames.
-- `crates/sim-viewer`: Rust/WASM browser client intended to render streamed
-  frames with WebGPU.
+- `crates/sim-viewer`: Rust/WASM Canvas2D fallback renderer. The primary
+  renderer is `crates/sim-server/static/webgl-viewer.mjs`, which streams the
+  binary preview packets straight into WebGL2 vertex buffers and splats
+  ~260k additive HDR point sprites per frame; a pure-JS Canvas2D renderer is
+  the final fallback (`?renderer=webgl|wasm|json` pins a tier).
 
 ## Current status
 
@@ -25,9 +28,13 @@ The CUDA backend is a full TreePM solver:
   grid plus a coarsened mass/COM pyramid, giving exact tiling out to the
   erfc-matched cutoff. Dense neighborhoods use exact pair sums for the local
   cell and octant monopoles for neighbors.
-- **Integration**: kick-drift-kick leapfrog with merged interior kicks and
-  CFL-adaptive substepping; SMBHs are direct point sources with optional 1PN
-  corrections.
+- **Integration**: kick-drift-kick leapfrog with merged interior kicks,
+  CFL-adaptive substepping, and two-tier per-particle time bins (slow
+  particles kick every other substep with a doubled dt); SMBHs are direct
+  point sources with optional 1PN corrections.
+- **Throughput**: particles are compacted into cell-sorted order every force
+  build and pair sums run in cell-relative fp32, giving ~180 ms per base step
+  for the full 2.24M-particle merger on the GB10 (~13 ms at 224k).
 - **Diagnostics**: kinetic and mesh-sampled potential energy per step; the
   isolated `major-merger-debug` galaxy conserves total energy to ~0.1% over
   tens of Myr and holds its disk structure.

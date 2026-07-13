@@ -314,7 +314,7 @@ test("headless UI renders presets and falls back to JSON websocket streaming", a
   assert.deepEqual(JSON.parse(fetchCalls[2].options.body), {
     preset_id: "minor-merger",
     seed: 42,
-    preview_particle_budget: 32768,
+    preview_particle_budget: 262144,
   });
   assert.equal(document.getElementById("session-id").textContent, "session-1");
   assert.equal(FakeWebSocket.instances.length, 1);
@@ -362,7 +362,7 @@ test("headless UI prefers the Rust viewer path when it is available", async () =
   assert.deepEqual(JSON.parse(fetchCalls[2].options.body), {
     preset_id: "minor-merger",
     seed: 42,
-    preview_particle_budget: 32768,
+    preview_particle_budget: 262144,
   });
   assert.equal(intervals.size, 1);
   assert.equal(
