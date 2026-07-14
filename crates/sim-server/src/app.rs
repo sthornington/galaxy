@@ -40,6 +40,13 @@ impl AppState {
     }
 }
 
+async fn client_log(body: String) -> axum::http::StatusCode {
+    let mut trimmed = body;
+    trimmed.truncate(2000);
+    warn!(target: "client", "browser report: {trimmed}");
+    axum::http::StatusCode::NO_CONTENT
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     let static_dir = state.static_dir.clone();
     Router::new()
@@ -54,7 +61,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/session/{id}/snapshot", post(snapshot_session))
         .route("/ws/frames/{id}", get(ws_frames))
         .route("/ws/control/{id}", get(ws_control))
+        .route("/api/client-log", post(client_log))
         .fallback_service(ServeDir::new(static_dir).append_index_html_on_directories(true))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-cache"),
+        ))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)

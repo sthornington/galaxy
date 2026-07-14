@@ -22,6 +22,8 @@ export function createUiApp({
     stop: document.getElementById("stop-btn"),
     snapshot: document.getElementById("snapshot-btn"),
     step: document.getElementById("step-btn"),
+    budgetSlider: document.getElementById("budget-slider"),
+    budgetLabel: document.getElementById("budget-label"),
   };
   const context = nodes.canvas.getContext("2d");
   const camera = {
@@ -256,7 +258,40 @@ export function createUiApp({
   let sessionPoll = null;
   let attachGeneration = 0;
 
-  const PREVIEW_BUDGETS = { webgl: 2_097_152, wasm: 32_768, json: 12_288 };
+  const PREVIEW_BUDGETS = { webgl: 4_194_304, wasm: 32_768, json: 12_288 };
+  const BUDGET_STORAGE_KEY = "galaxy-preview-budget";
+
+  // The slider works in log2 space (2^15 .. 2^22); the top stop means "all
+  // particles" (the server clamps the budget to the visible count).
+  function sliderToBudget(sliderValue) {
+    return Math.round(2 ** Number(sliderValue));
+  }
+
+  function storedWebglBudget() {
+    try {
+      const raw = Number(window.localStorage?.getItem(BUDGET_STORAGE_KEY));
+      if (Number.isFinite(raw) && raw >= 2 ** 15 && raw <= 2 ** 22) {
+        return raw;
+      }
+    } catch {
+      // storage unavailable (private mode); fall through to the default
+    }
+    return PREVIEW_BUDGETS.webgl;
+  }
+
+  function formatBudget(budget) {
+    return budget >= PREVIEW_BUDGETS.webgl ? "all" : budget.toLocaleString();
+  }
+
+  function syncBudgetSlider(budget) {
+    if (!nodes.budgetSlider) {
+      return;
+    }
+    nodes.budgetSlider.value = String(Math.log2(budget));
+    if (nodes.budgetLabel) {
+      nodes.budgetLabel.textContent = formatBudget(budget);
+    }
+  }
 
   function preferredPreviewBudget() {
     const params = new URLSearchParams(window.location.search);
@@ -829,7 +864,9 @@ export function createUiApp({
       // Converge the session's preview budget to the active tier's budget in
       // BOTH directions: a session demoted to 32k by one slow/failed attach
       // must be promoted back to the full sample when WebGL attaches again.
-      const desiredBudget = PREVIEW_BUDGETS[tier] ?? PREVIEW_BUDGETS.wasm;
+      const desiredBudget =
+        tier === "webgl" ? storedWebglBudget() : (PREVIEW_BUDGETS[tier] ?? PREVIEW_BUDGETS.wasm);
+      syncBudgetSlider(desiredBudget);
       if (session.preview_particle_budget !== desiredBudget) {
         sendPreviewBudget(session.id, desiredBudget);
       }
@@ -846,6 +883,33 @@ export function createUiApp({
     openFrameSocket(session.id);
     return session;
   }
+
+  let budgetSendTimer = null;
+  function onBudgetSliderInput() {
+    const budget = sliderToBudget(nodes.budgetSlider.value);
+    if (nodes.budgetLabel) {
+      nodes.budgetLabel.textContent = formatBudget(budget);
+    }
+    try {
+      window.localStorage?.setItem(BUDGET_STORAGE_KEY, String(budget));
+    } catch {
+      // private mode; the setting just won't persist
+    }
+    if (!activeSessionId) {
+      return;
+    }
+    // Debounce: dragging emits a burst of input events, the sim only needs
+    // the final value (each change re-captures a preview frame).
+    if (budgetSendTimer !== null) {
+      clearIntervalImpl(budgetSendTimer);
+    }
+    budgetSendTimer = setIntervalImpl(() => {
+      clearIntervalImpl(budgetSendTimer);
+      budgetSendTimer = null;
+      sendPreviewBudget(activeSessionId, budget);
+    }, 250);
+  }
+  nodes.budgetSlider?.addEventListener?.("input", onBudgetSliderInput);
 
   async function stopActiveSession() {
     if (!activeSessionId) {
@@ -873,7 +937,10 @@ export function createUiApp({
       body: JSON.stringify({
         preset_id: presetId,
         seed: 42,
-        preview_particle_budget: preferredPreviewBudget(),
+        preview_particle_budget:
+          preferredPreviewBudget() === PREVIEW_BUDGETS.webgl
+            ? storedWebglBudget()
+            : preferredPreviewBudget(),
       }),
     });
     return attachToSession(session);

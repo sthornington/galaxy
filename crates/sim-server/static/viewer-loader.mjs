@@ -1,4 +1,23 @@
-const VIEWER_BUNDLE_VERSION = "20260713-11";
+const VIEWER_BUNDLE_VERSION = "20260714-14";
+
+// Client-side viewer failures are invisible from the server; report tier
+// outcomes so `grep client sim-server.log` shows exactly what each browser
+// did (and why a tier fell back).
+function reportTier(payload) {
+  try {
+    void fetch("/api/client-log", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        v: VIEWER_BUNDLE_VERSION,
+        ua: navigator.userAgent,
+        ...payload,
+      }),
+    }).catch(() => {});
+  } catch {
+    // reporting must never break the viewer
+  }
+}
 
 // A freshly created session may take a moment before its first frame is
 // published; give the GPU-backed paths a generous window before demoting to
@@ -46,11 +65,23 @@ export async function tryBootRustViewer(sessionId) {
       const firstFrame = waitForFirstFrame();
       module.boot("preview-canvas", sessionId);
       if (await firstFrame) {
+        reportTier({ tier: "webgl", ok: true });
         return "webgl";
       }
       module.shutdown();
+      reportTier({
+        tier: "webgl",
+        ok: false,
+        error: "no first frame (timeout or galaxy-viewer-error)",
+      });
     } catch (error) {
       console.error("WebGL viewer boot failed", error);
+      reportTier({
+        tier: "webgl",
+        ok: false,
+        error: String((error && error.message) || error),
+        stack: String((error && error.stack) || "").slice(0, 600),
+      });
     }
     if (renderer === "webgl") {
       return false;
@@ -70,6 +101,7 @@ export async function tryBootRustViewer(sessionId) {
       const firstFrame = waitForFirstFrame();
       module.boot("preview-canvas", sessionId);
       const ok = await firstFrame;
+      reportTier({ tier: "wasm", ok });
       if (!ok && typeof module.shutdown === "function") {
         module.shutdown();
       }
