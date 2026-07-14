@@ -290,8 +290,6 @@ __global__ void sample_preview(const SimCudaParticle* particles,
                                const int* anchor_indices,
                                const std::uint32_t anchor_count,
                                const std::uint32_t sampled_count,
-                               const std::uint32_t sample_offset,
-                               const std::uint64_t stride,
                                SimCudaPreviewParticle* out_particles);
 
 const char* cufft_error_string(const cufftResult status) {
@@ -593,13 +591,6 @@ int schedule_preview_capture(DeviceState* state,
   const std::uint32_t sample_budget = max_particles - anchor_count;
   const std::uint32_t sampled_count = std::min<std::uint32_t>(sample_budget, visible_count);
   const std::uint32_t count = anchor_count + sampled_count;
-  const std::uint64_t stride = sampled_count == 0
-                                   ? 1
-                                   : std::max<std::uint64_t>(
-                                         1,
-                                         static_cast<std::uint64_t>(visible_count) /
-                                             static_cast<std::uint64_t>(sampled_count));
-  const std::uint32_t sample_offset = 0;
   if (ensure_preview_capacity(state, count, error_buffer, error_buffer_len) != 0) {
     return 1;
   }
@@ -613,8 +604,6 @@ int schedule_preview_capture(DeviceState* state,
       state->galaxy_smbh_indices,
       anchor_count,
       sampled_count,
-      sample_offset,
-      stride,
       state->preview_particles);
   cudaError_t cuda_status = cudaGetLastError();
   if (cuda_status != cudaSuccess) {
@@ -2503,8 +2492,6 @@ __global__ void sample_preview(const SimCudaParticle* particles,
                                const int* anchor_indices,
                                const std::uint32_t anchor_count,
                                const std::uint32_t sampled_count,
-                               const std::uint32_t sample_offset,
-                               const std::uint64_t stride,
                                SimCudaPreviewParticle* out_particles) {
   const std::uint32_t preview_count = anchor_count + sampled_count;
   const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2516,10 +2503,13 @@ __global__ void sample_preview(const SimCudaParticle* particles,
   if (index < anchor_count) {
     source_index = static_cast<std::uint64_t>(anchor_indices[index] < 0 ? 0 : anchor_indices[index]);
   } else {
+    // Evenly spread the sample across the whole visible list; an integer
+    // stride would leave the tail (an entire galaxy, in creation order)
+    // unsampled whenever visible/sampled rounds down.
     const std::uint64_t sample_slot =
-        min((static_cast<std::uint64_t>(sample_offset) +
-             static_cast<std::uint64_t>(index - anchor_count) * stride) %
-                static_cast<std::uint64_t>(visible_particle_count),
+        min(static_cast<std::uint64_t>(index - anchor_count) *
+                static_cast<std::uint64_t>(visible_particle_count) /
+                static_cast<std::uint64_t>(sampled_count),
             static_cast<std::uint64_t>(visible_particle_count - 1));
     source_index = static_cast<std::uint64_t>(visible_particle_indices[sample_slot]);
   }

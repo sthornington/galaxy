@@ -256,7 +256,7 @@ export function createUiApp({
   let sessionPoll = null;
   let attachGeneration = 0;
 
-  const PREVIEW_BUDGETS = { webgl: 262_144, wasm: 32_768, json: 12_288 };
+  const PREVIEW_BUDGETS = { webgl: 2_097_152, wasm: 32_768, json: 12_288 };
 
   function preferredPreviewBudget() {
     const params = new URLSearchParams(window.location.search);

@@ -1,4 +1,4 @@
-const VIEWER_BUNDLE_VERSION = "20260713-10";
+const VIEWER_BUNDLE_VERSION = "20260713-11";
 
 // A freshly created session may take a moment before its first frame is
 // published; give the GPU-backed paths a generous window before demoting to

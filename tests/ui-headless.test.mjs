@@ -243,7 +243,7 @@ function createHarness({ useRustViewer = false, existingSessions = [] } = {}) {
         state: "paused",
         sim_time_myr: 0,
         particle_count: 208,
-        preview_particle_budget: 262144,
+        preview_particle_budget: 2097152,
         diagnostics: { preview_count: 0 },
       });
     }
@@ -320,7 +320,7 @@ test("headless UI renders presets and falls back to JSON websocket streaming", a
   assert.deepEqual(JSON.parse(fetchCalls[2].options.body), {
     preset_id: "minor-merger",
     seed: 42,
-    preview_particle_budget: 262144,
+    preview_particle_budget: 2097152,
   });
   assert.equal(document.getElementById("session-id").textContent, "session-1");
   assert.equal(FakeWebSocket.instances.length, 2);
@@ -387,7 +387,7 @@ test("headless UI prefers the Rust viewer path when it is available", async () =
   assert.deepEqual(JSON.parse(fetchCalls[2].options.body), {
     preset_id: "minor-merger",
     seed: 42,
-    preview_particle_budget: 262144,
+    preview_particle_budget: 2097152,
   });
   assert.equal(intervals.size, 1);
   assert.equal(

@@ -20,6 +20,7 @@ pub fn built_in_presets() -> Vec<MergerPreset> {
         major_merger_debug(),
         major_merger(),
         major_merger_distant(),
+        grand_merger(),
         polar_flyby(),
         minor_merger(),
     ]
@@ -294,6 +295,48 @@ fn major_merger_distant() -> MergerPreset {
         id: "major-merger-distant",
         title: "Distant Major Merger",
         summary: "The equal-mass encounter started 120 kpc apart: spiral arms wind up in both disks long before the collision.",
+        config,
+    }
+}
+
+/// The showcase run: the distant equal-mass encounter rebuilt at 5.5M
+/// particles with the luminous fraction cranked (2.46M star particles).
+/// Halo-to-disk particle mass ratio stays ~20x, low enough that collisional
+/// disk heating is negligible over the merger timescale.
+fn grand_merger() -> MergerPreset {
+    let mut config = major_merger().config;
+    config.name = "grand-merger".to_string();
+    config.output_directory = "output/grand-merger".to_string();
+    // A finer PM mesh shrinks the force-split radius, moving work from the
+    // (per-particle, superlinear) short-range tree onto the FFT, which is
+    // nearly free at this size. Tuned empirically: 986 ms/step at 192^3.
+    config.gravity.mesh_resolution = [256, 256, 256];
+    // Star particles dominate both the picture and the short-range cost, so
+    // spend the budget there; the halo is sampled coarser (heavier particles,
+    // extra softening to keep disk heating negligible) since it only needs to
+    // supply a smooth potential.
+    config.gravity.halo_softening_kpc = 0.12;
+    {
+        let primary = &mut config.galaxies[0];
+        primary.halo_particle_count = 850_000;
+        primary.disk_particle_count = 1_100_000;
+        primary.bulge_particle_count = 220_000;
+    }
+    {
+        let secondary = &mut config.galaxies[1];
+        secondary.halo_particle_count = 750_000;
+        secondary.disk_particle_count = 950_000;
+        secondary.bulge_particle_count = 190_000;
+    }
+    config.initial_separation_kpc = 60.0;
+    let (primary, secondary) = config.galaxies.split_at_mut(1);
+    config.initial_relative_velocity_kms =
+        set_direct_infall_pair_orbit(&mut primary[0], &mut secondary[0], 60.0, 0.35, 0.35);
+
+    MergerPreset {
+        id: "grand-merger",
+        title: "Grand Merger (5.5M particles)",
+        summary: "The distant equal-mass collision at full resolution: 2.5 million star particles develop spiral arms, collide, and relax into a remnant. IC generation takes a few minutes.",
         config,
     }
 }

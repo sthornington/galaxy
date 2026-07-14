@@ -91,13 +91,23 @@ void main() {
   float renderLuminosity = pow(luminosity, 0.58);
   float massBias = clamp((logMass - 4.2) / 1.6, 0.0, 1.0);
 
+  // Stable per-particle hash (preview slots map to fixed physical particles),
+  // used to spread each population across a blackbody-ish temperature range.
+  float h = fract(sin(float(gl_VertexID) * 12.9898) * 43758.5453);
+  float h2 = fract(h * 61.803398875);
   vec3 base;
   if (a_component == 2u) {
-    base = mix(vec3(1.0, 0.82, 0.68), vec3(1.0, 0.93, 0.82), 0.35 + 0.2 * massBias);
+    // Bulge: old stars — K/M giants, warm gold through deep orange.
+    base = mix(vec3(1.0, 0.70, 0.42), vec3(1.0, 0.88, 0.70),
+               clamp(0.2 + 0.55 * h + 0.15 * massBias, 0.0, 1.0));
   } else {
-    base = mix(vec3(1.0, 0.92, 0.8), vec3(0.79, 0.88, 1.0), 0.45 + 0.35 * massBias);
+    // Disk: mixed population — warm G dwarfs through hot blue-white OB
+    // stars, biased bluer for the more massive (brighter) samples.
+    float temperature = clamp(0.12 + 0.6 * h + 0.38 * massBias, 0.0, 1.0);
+    base = mix(vec3(1.0, 0.82, 0.58), vec3(0.60, 0.74, 1.0), temperature);
+    base = mix(base, vec3(1.0, 0.97, 0.93), 0.22);
   }
-  vec3 color = dopplerShift(base, dot(velocity, u_forward));
+  vec3 color = dopplerShift(base, dot(velocity, u_forward)) * (0.82 + 0.36 * h2);
 
   float perspective = clamp((u_pointScale / clip.w) * 0.18, 0.02, 3.5);
   if (u_style > 0.5) {
@@ -159,17 +169,61 @@ void main() {
 const TONEMAP_FRAGMENT = `#version 300 es
 precision mediump float;
 uniform sampler2D u_hdr;
+uniform sampler2D u_bloom;
+uniform float u_bloomStrength;
 uniform float u_exposure;
 in vec2 v_uv;
 out vec4 fragColor;
 
 void main() {
-  vec3 hdr = texture(u_hdr, v_uv).rgb;
+  vec3 hdr = texture(u_hdr, v_uv).rgb + texture(u_bloom, v_uv).rgb * u_bloomStrength;
   vec3 mapped = vec3(1.0) - exp(-hdr * u_exposure);
   // Slight lift so faint structure reads on dark displays.
   mapped = pow(mapped, vec3(0.9));
   vec3 background = vec3(0.008, 0.031, 0.063); // #020810
   fragColor = vec4(max(mapped, background), 1.0);
+}
+`;
+
+// Bright-pass + 4x downsample into the bloom chain. Threshold works on
+// pre-tonemap HDR energy with a soft quadratic knee so bloom fades in.
+const BLOOM_DOWN_FRAGMENT = `#version 300 es
+precision mediump float;
+uniform sampler2D u_hdr;
+uniform vec2 u_texel; // source texel size
+in vec2 v_uv;
+out vec4 fragColor;
+
+void main() {
+  vec3 c = 0.25 * (texture(u_hdr, v_uv + u_texel * vec2(-1.0, -1.0)).rgb +
+                   texture(u_hdr, v_uv + u_texel * vec2(1.0, -1.0)).rgb +
+                   texture(u_hdr, v_uv + u_texel * vec2(-1.0, 1.0)).rgb +
+                   texture(u_hdr, v_uv + u_texel * vec2(1.0, 1.0)).rgb);
+  float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  const float threshold = 0.45;
+  const float knee = 0.35;
+  float soft = clamp(lum - threshold + knee, 0.0, 2.0 * knee);
+  soft = soft * soft / (4.0 * knee);
+  float contribution = max(soft, lum - threshold) / max(lum, 1.0e-4);
+  fragColor = vec4(c * contribution, 1.0);
+}
+`;
+
+// Separable gaussian (5 linear-filtered taps ~ 9-tap kernel).
+const BLOOM_BLUR_FRAGMENT = `#version 300 es
+precision mediump float;
+uniform sampler2D u_source;
+uniform vec2 u_direction; // texel-scaled blur axis
+in vec2 v_uv;
+out vec4 fragColor;
+
+void main() {
+  vec3 sum = texture(u_source, v_uv).rgb * 0.2270270270;
+  sum += texture(u_source, v_uv + u_direction * 1.3846153846).rgb * 0.3162162162;
+  sum += texture(u_source, v_uv - u_direction * 1.3846153846).rgb * 0.3162162162;
+  sum += texture(u_source, v_uv + u_direction * 3.2307692308).rgb * 0.0702702703;
+  sum += texture(u_source, v_uv - u_direction * 3.2307692308).rgb * 0.0702702703;
+  fragColor = vec4(sum, 1.0);
 }
 `;
 
@@ -347,6 +401,12 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
   const tonemapProgram = hdrExtension
     ? compileProgram(gl, TONEMAP_VERTEX, TONEMAP_FRAGMENT)
     : null;
+  const bloomDownProgram = hdrExtension
+    ? compileProgram(gl, TONEMAP_VERTEX, BLOOM_DOWN_FRAGMENT)
+    : null;
+  const bloomBlurProgram = hdrExtension
+    ? compileProgram(gl, TONEMAP_VERTEX, BLOOM_BLUR_FRAGMENT)
+    : null;
   const lineProgram = compileProgram(gl, LINE_VERTEX, LINE_FRAGMENT);
 
   const uniforms = {
@@ -369,7 +429,21 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
   const tonemapUniforms = tonemapProgram
     ? {
         hdr: gl.getUniformLocation(tonemapProgram, "u_hdr"),
+        bloom: gl.getUniformLocation(tonemapProgram, "u_bloom"),
+        bloomStrength: gl.getUniformLocation(tonemapProgram, "u_bloomStrength"),
         exposure: gl.getUniformLocation(tonemapProgram, "u_exposure"),
+      }
+    : null;
+  const bloomDownUniforms = bloomDownProgram
+    ? {
+        hdr: gl.getUniformLocation(bloomDownProgram, "u_hdr"),
+        texel: gl.getUniformLocation(bloomDownProgram, "u_texel"),
+      }
+    : null;
+  const bloomBlurUniforms = bloomBlurProgram
+    ? {
+        source: gl.getUniformLocation(bloomBlurProgram, "u_source"),
+        direction: gl.getUniformLocation(bloomBlurProgram, "u_direction"),
       }
     : null;
   const lineUniforms = { viewProj: gl.getUniformLocation(lineProgram, "u_viewProj") };
@@ -427,6 +501,28 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
   let hdrTexture = null;
   let hdrWidth = 0;
   let hdrHeight = 0;
+  // Quarter-resolution bloom ping-pong chain.
+  let bloomTexA = null;
+  let bloomTexB = null;
+  let bloomFboA = null;
+  let bloomFboB = null;
+  let bloomWidth = 0;
+  let bloomHeight = 0;
+
+  function makeBloomTarget(width, height) {
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, width, height);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const framebuffer = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { texture, framebuffer };
+  }
 
   function ensureHdrTarget() {
     if (!hdrExtension) {
@@ -453,6 +549,22 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, hdrTexture, 0);
     const complete = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (complete) {
+      if (bloomTexA) {
+        gl.deleteTexture(bloomTexA);
+        gl.deleteTexture(bloomTexB);
+        gl.deleteFramebuffer(bloomFboA);
+        gl.deleteFramebuffer(bloomFboB);
+      }
+      bloomWidth = Math.max(32, hdrWidth >> 2);
+      bloomHeight = Math.max(18, hdrHeight >> 2);
+      const targetA = makeBloomTarget(bloomWidth, bloomHeight);
+      const targetB = makeBloomTarget(bloomWidth, bloomHeight);
+      bloomTexA = targetA.texture;
+      bloomFboA = targetA.framebuffer;
+      bloomTexB = targetB.texture;
+      bloomFboB = targetB.framebuffer;
+    }
     return complete;
   }
 
@@ -952,13 +1064,42 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     gl.bindVertexArray(null);
 
     if (useHdr) {
+      gl.disable(gl.BLEND);
+
+      // Bloom: bright-pass downsample to quarter res, then a separable blur.
+      gl.bindFramebuffer(gl.FRAMEBUFFER, bloomFboA);
+      gl.viewport(0, 0, bloomWidth, bloomHeight);
+      gl.useProgram(bloomDownProgram);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, hdrTexture);
+      gl.uniform1i(bloomDownUniforms.hdr, 0);
+      gl.uniform2f(bloomDownUniforms.texel, 1 / hdrWidth, 1 / hdrHeight);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      gl.useProgram(bloomBlurProgram);
+      gl.uniform1i(bloomBlurUniforms.source, 0);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, bloomFboB);
+      gl.bindTexture(gl.TEXTURE_2D, bloomTexA);
+      gl.uniform2f(bloomBlurUniforms.direction, 1 / bloomWidth, 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, bloomFboA);
+      gl.bindTexture(gl.TEXTURE_2D, bloomTexB);
+      gl.uniform2f(bloomBlurUniforms.direction, 0, 1 / bloomHeight);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, width, height);
-      gl.disable(gl.BLEND);
       gl.useProgram(tonemapProgram);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, hdrTexture);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, bloomTexA);
+      gl.activeTexture(gl.TEXTURE0);
       gl.uniform1i(tonemapUniforms.hdr, 0);
+      gl.uniform1i(tonemapUniforms.bloom, 1);
+      // Dots carry less raw HDR energy per pixel, so give them a slightly
+      // stronger halo to read as stars rather than pixels.
+      gl.uniform1f(tonemapUniforms.bloomStrength, dotStyle ? 1.1 : 0.85);
       gl.uniform1f(tonemapUniforms.exposure, 1.15);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     }
