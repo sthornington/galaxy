@@ -209,19 +209,11 @@ fn fs(in: FSOut) -> @location(0) vec4f {
 export const BLOOM_DOWN_SHADER = /* wgsl */ `
 ${FULLSCREEN_VS}
 @group(0) @binding(0) var hdrTex: texture_2d<f32>;
-@group(0) @binding(1) var avgTex: texture_2d<f32>;
-@group(0) @binding(2) var samp: sampler;
-@group(0) @binding(3) var<uniform> exposureBoost: f32;
-
-fn sceneExposure(boost: f32) -> f32 {
-  let avg = textureSampleLevel(avgTex, samp, vec2f(0.5), 0.0).rgb;
-  let avgLum = dot(avg, vec3f(0.2126, 0.7152, 0.0722));
-  return clamp(0.02 / max(avgLum, 1.0e-5), 0.25, 6.0) * boost;
-}
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var<uniform> exposure: f32;
 
 @fragment
 fn fs(in: FSOut) -> @location(0) vec4f {
-  let exposure = sceneExposure(exposureBoost);
   let c = textureSampleLevel(hdrTex, samp, in.uv, 0.0).rgb * exposure;
   let lum = dot(c, vec3f(0.2126, 0.7152, 0.0722));
   let threshold = 0.85;
@@ -255,19 +247,14 @@ ${SHADER_COMMON}
 ${FULLSCREEN_VS}
 @group(0) @binding(0) var hdrTex: texture_2d<f32>;
 @group(0) @binding(1) var bloomTex: texture_2d<f32>;
-@group(0) @binding(2) var avgTex: texture_2d<f32>;
-@group(0) @binding(3) var samp: sampler;
-@group(0) @binding(4) var<uniform> u: Uniforms;
-
-fn sceneExposure(boost: f32) -> f32 {
-  let avg = textureSampleLevel(avgTex, samp, vec2f(0.5), 0.0).rgb;
-  let avgLum = dot(avg, vec3f(0.2126, 0.7152, 0.0722));
-  return clamp(0.02 / max(avgLum, 1.0e-5), 0.25, 6.0) * boost;
-}
+@group(0) @binding(2) var samp: sampler;
+@group(0) @binding(3) var<uniform> u: Uniforms;
 
 @fragment
 fn fs(in: FSOut) -> @location(0) vec4f {
-  let exposure = sceneExposure(u.exposureBoost);
+  // u.exposureBoost carries the fully computed exposure (count-normalized on
+  // the CPU — stable under camera motion; see the WebGL tier for rationale).
+  let exposure = u.exposureBoost;
   let bloomStrength = select(0.85, 1.1, u.style > 0.5);
   let x = textureSampleLevel(hdrTex, samp, in.uv, 0.0).rgb * exposure +
           textureSampleLevel(bloomTex, samp, in.uv, 0.0).rgb * bloomStrength;
@@ -439,12 +426,49 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     qualityCooldown: 0,
   };
 
+  // Style precedence: explicit ?style= URL parameter, then the persisted UI
+  // setting, then soft glow. The UI toggle dispatches galaxy-render-style,
+  // applied live without reloading.
+  function resolveDotStyle(params) {
+    const fromUrl = params.get("style");
+    if (fromUrl === "dots") {
+      return true;
+    }
+    if (fromUrl === "glow") {
+      return false;
+    }
+    try {
+      return window.localStorage?.getItem("galaxy-render-style") === "dots";
+    } catch {
+      return false;
+    }
+  }
+
+  function onStyleChange() {
+    let style = "glow";
+    try {
+      style = window.localStorage?.getItem("galaxy-render-style") === "dots" ? "dots" : "glow";
+    } catch {
+      // private mode
+    }
+    dotStyle = style === "dots";
+    if (dotStyle) {
+      // Dots have near-zero fill cost and downscaling would blur them away.
+      state.renderScale = 1.0;
+      state.renderScaleLocked = true;
+    } else {
+      state.renderScale = 0.75;
+      state.renderScaleLocked = false;
+    }
+  }
+  window.addEventListener("galaxy-render-style", onStyleChange);
+
   let dotStyle = false;
   let exposureBoost = 1.0;
   let headroomOverride = null;
   {
     const params = new URLSearchParams(window.location.search);
-    dotStyle = params.get("style") === "dots";
+    dotStyle = resolveDotStyle(params);
     const quality = Number.parseFloat(params.get("quality") ?? "");
     if (Number.isFinite(quality) && quality > 0.2 && quality <= 1.0) {
       state.renderScale = quality;
@@ -665,7 +689,6 @@ function createViewer(canvas, restoreCanvas, sessionId) {
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    device.queue.writeBuffer(gpu.exposureBoostBuffer, 0, new Float32Array([exposureBoost, 0, 0, 0]));
     gpu.blurDirHBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     gpu.blurDirVBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     gpu.lineVertexBuffer = device.createBuffer({
@@ -704,33 +727,6 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     });
     gpu.hdrView = gpu.hdrTexture.createView();
 
-    // Downsample chain to 1x1 for the frame-average exposure key.
-    gpu.reduceTextures = [];
-    gpu.reduceBindGroups = [];
-    let w = targetWidth;
-    let h = targetHeight;
-    let srcView = gpu.hdrView;
-    while (w > 1 || h > 1) {
-      w = Math.max(1, w >> 1);
-      h = Math.max(1, h >> 1);
-      const tex = device.createTexture({ size: [w, h], format: "rgba16float", usage });
-      gpu.reduceTextures.push(tex);
-      gpu.reduceBindGroups.push({
-        bindGroup: device.createBindGroup({
-          layout: gpu.blitPipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: srcView },
-            { binding: 1, resource: gpu.sampler },
-          ],
-        }),
-        view: tex.createView(),
-        width: w,
-        height: h,
-      });
-      srcView = tex.createView();
-    }
-    const avgView = srcView;
-
     const bloomWidth = Math.max(32, targetWidth >> 2);
     const bloomHeight = Math.max(18, targetHeight >> 2);
     gpu.bloomTexA = device.createTexture({ size: [bloomWidth, bloomHeight], format: "rgba16float", usage });
@@ -746,9 +742,8 @@ function createViewer(canvas, restoreCanvas, sessionId) {
       layout: gpu.bloomDownPipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: gpu.hdrView },
-        { binding: 1, resource: avgView },
-        { binding: 2, resource: gpu.sampler },
-        { binding: 3, resource: { buffer: gpu.exposureBoostBuffer } },
+        { binding: 1, resource: gpu.sampler },
+        { binding: 2, resource: { buffer: gpu.exposureBoostBuffer } },
       ],
     });
     gpu.blurBindGroupAtoB = device.createBindGroup({
@@ -772,9 +767,8 @@ function createViewer(canvas, restoreCanvas, sessionId) {
       entries: [
         { binding: 0, resource: gpu.hdrView },
         { binding: 1, resource: gpu.bloomViewA },
-        { binding: 2, resource: avgView },
-        { binding: 3, resource: gpu.sampler },
-        { binding: 4, resource: { buffer: gpu.uniformBuffer } },
+        { binding: 2, resource: gpu.sampler },
+        { binding: 3, resource: { buffer: gpu.uniformBuffer } },
       ],
     });
   }
@@ -819,50 +813,63 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     crossInto(basis.up, basis.right, basis.forward);
   }
 
-  const frameHistogram = new Uint32Array(3 * 64);
-  function updateSceneBoundsFromSlot(slot, force = false, particleBytes = null) {
+  // Robust auto-framing: raw quantization ranges are min/max, which a plume
+  // of ejected stars inflates to hundreds of kpc, so bin a strided sample per
+  // axis (1024 bins keeps sub-kpc precision even then) and aim the camera at
+  // the median star position — the galaxy — with the 3rd..97th percentile
+  // extent setting the zoom. The sample is retained so double-click can
+  // re-frame against current data at any time.
+  const frameHistogram = new Uint32Array(3 * 1024);
+  const framingSample = new Uint16Array(40000 * 3);
+  let framingSampleCount = 0;
+
+  function captureFramingSample(slot, particleBytes) {
+    const stride = Math.max(1, Math.ceil(slot.count / 40000));
+    let n = 0;
+    for (let i = 0; i < slot.count && n < 40000; i += stride) {
+      const base = i * PARTICLE_STRIDE;
+      framingSample[n * 3] = particleBytes[base] | (particleBytes[base + 1] << 8);
+      framingSample[n * 3 + 1] = particleBytes[base + 2] | (particleBytes[base + 3] << 8);
+      framingSample[n * 3 + 2] = particleBytes[base + 4] | (particleBytes[base + 5] << 8);
+      n += 1;
+    }
+    framingSampleCount = n;
+  }
+
+  function updateSceneBoundsFromSlot(slot, force = false) {
     if (!camera.autoFrame && !force) {
       return;
     }
-    let framed = false;
-    if (particleBytes && slot.count > 0) {
+    if (framingSampleCount > 0) {
       frameHistogram.fill(0);
-      const stride = Math.max(1, Math.floor(slot.count / 40000));
-      let samples = 0;
-      for (let i = 0; i < slot.count; i += stride) {
-        const base = i * PARTICLE_STRIDE;
-        for (let axis = 0; axis < 3; axis += 1) {
-          const q = particleBytes[base + axis * 2] | (particleBytes[base + axis * 2 + 1] << 8);
-          frameHistogram[axis * 64 + (q >> 10)] += 1;
-        }
-        samples += 1;
+      for (let i = 0; i < framingSampleCount; i += 1) {
+        frameHistogram[(framingSample[i * 3] >> 6)] += 1;
+        frameHistogram[1024 + (framingSample[i * 3 + 1] >> 6)] += 1;
+        frameHistogram[2048 + (framingSample[i * 3 + 2] >> 6)] += 1;
       }
-      const lowCut = samples * 0.03;
-      const highCut = samples * 0.97;
+      const percentileBin = (axis, fraction) => {
+        const cut = framingSampleCount * fraction;
+        let acc = 0;
+        for (let bin = 0; bin < 1024; bin += 1) {
+          acc += frameHistogram[axis * 1024 + bin];
+          if (acc >= cut) {
+            return bin;
+          }
+        }
+        return 1023;
+      };
       let maxExtent = 0;
       for (let axis = 0; axis < 3; axis += 1) {
-        let acc = 0;
-        let lowBin = 0;
-        let highBin = 63;
-        for (let bin = 0; bin < 64; bin += 1) {
-          acc += frameHistogram[axis * 64 + bin];
-          if (acc < lowCut) {
-            lowBin = bin;
-          }
-          if (acc <= highCut) {
-            highBin = bin;
-          }
-        }
-        const toWorld = (bin) => slot.posMin[axis] + ((bin + 0.5) / 64) * slot.posScale[axis];
-        const low = toWorld(lowBin);
-        const high = toWorld(Math.max(highBin, lowBin + 1));
-        camera.focus[axis] = (low + high) * 0.5;
-        maxExtent = Math.max(maxExtent, high - low);
+        const toWorld = (bin) =>
+          slot.posMin[axis] + ((bin + 0.5) / 1024) * slot.posScale[axis];
+        camera.focus[axis] = toWorld(percentileBin(axis, 0.5));
+        maxExtent = Math.max(
+          maxExtent,
+          toWorld(percentileBin(axis, 0.97)) - toWorld(percentileBin(axis, 0.03))
+        );
       }
       camera.sceneRadius = Math.max(1, maxExtent * 0.74);
-      framed = true;
-    }
-    if (!framed) {
+    } else {
       camera.focus[0] = slot.posMin[0] + slot.posScale[0] * 0.5;
       camera.focus[1] = slot.posMin[1] + slot.posScale[1] * 0.5;
       camera.focus[2] = slot.posMin[2] + slot.posScale[2] * 0.5;
@@ -949,7 +956,8 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     }
     state.lastArrivalWallMs = slot.wallMs;
 
-    updateSceneBoundsFromSlot(slot, false, particleBytes);
+    captureFramingSample(slot, particleBytes);
+    updateSceneBoundsFromSlot(slot);
     state.simTimeMyr = simTime;
 
     if (!state.sawFirstFrame) {
@@ -1157,10 +1165,16 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     uniformF32[56] = Math.max(1, gpu.hdrWidth / Math.max(1, state.cssWidth));
     uniformF32[57] = gpu.hdrWidth;
     uniformF32[58] = gpu.hdrHeight;
-    uniformF32[59] = exposureBoost;
+    uniformF32[59] =
+      exposureBoost * Math.min(5, Math.max(0.12, 460000 / Math.max(1, pair.current.count)));
     uniformF32[60] = state.hdrActive ? (headroomOverride ?? 3.0) : 1.0;
     uniformU32[61] = pair.current.count;
     gpu.device.queue.writeBuffer(gpu.uniformBuffer, 0, uniformArray);
+    gpu.device.queue.writeBuffer(
+      gpu.exposureBoostBuffer,
+      0,
+      new Float32Array([uniformF32[59], 0, 0, 0])
+    );
   }
 
   function writeAxes() {
@@ -1228,18 +1242,7 @@ function createViewer(canvas, restoreCanvas, sessionId) {
       pass.end();
     }
 
-    // 2. Reduce to 1x1 for the exposure key.
-    for (const step of gpu.reduceBindGroups) {
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{ view: step.view, loadOp: "clear", storeOp: "store" }],
-      });
-      pass.setPipeline(gpu.blitPipeline);
-      pass.setBindGroup(0, step.bindGroup);
-      pass.draw(3);
-      pass.end();
-    }
-
-    // 3. Bloom: bright pass at quarter res, then separable blur.
+    // 2. Bloom: bright pass at quarter res, then separable blur.
     {
       const pass = encoder.beginRenderPass({
         colorAttachments: [{ view: gpu.bloomViewA, loadOp: "clear", storeOp: "store" }],
@@ -1381,6 +1384,7 @@ function createViewer(canvas, restoreCanvas, sessionId) {
       window.removeEventListener("mouseup", handlers.mouseup);
       canvas.removeEventListener("wheel", handlers.wheel);
       canvas.removeEventListener("dblclick", handlers.dblclick);
+      window.removeEventListener("galaxy-render-style", onStyleChange);
       resizeObserver?.disconnect();
       destroyTargets();
       for (const slot of ring) {

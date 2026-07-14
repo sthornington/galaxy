@@ -24,6 +24,7 @@ export function createUiApp({
     step: document.getElementById("step-btn"),
     budgetSlider: document.getElementById("budget-slider"),
     budgetLabel: document.getElementById("budget-label"),
+    styleSelect: document.getElementById("style-select"),
   };
   const context = nodes.canvas.getContext("2d");
   const camera = {
@@ -888,6 +889,29 @@ export function createUiApp({
     }
     openFrameSocket(session.id);
     return session;
+  }
+
+  // Render style is a persisted UI setting applied live by the viewers via a
+  // window event — it used to be a URL parameter that silently reset to soft
+  // glow on every navigation.
+  if (nodes.styleSelect) {
+    try {
+      const stored = window.localStorage?.getItem("galaxy-render-style");
+      if (stored === "dots" || stored === "glow") {
+        nodes.styleSelect.value = stored;
+      }
+    } catch {
+      // private mode; default stands
+    }
+    nodes.styleSelect.addEventListener?.("change", () => {
+      const style = nodes.styleSelect.value === "dots" ? "dots" : "glow";
+      try {
+        window.localStorage?.setItem("galaxy-render-style", style);
+      } catch {
+        // private mode; the setting just won't persist
+      }
+      window.dispatchEvent?.(new Event("galaxy-render-style"));
+    });
   }
 
   let budgetSendTimer = null;

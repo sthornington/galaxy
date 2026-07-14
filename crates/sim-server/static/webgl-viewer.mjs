@@ -171,22 +171,16 @@ precision mediump float;
 uniform sampler2D u_hdr;
 uniform sampler2D u_bloom;
 uniform float u_bloomStrength;
-uniform float u_exposureBoost; // user ?exposure= multiplier
-uniform float u_maxLod;        // top mip of the HDR chain (1x1 average)
+// Exposure is computed CPU-side from the drawn particle count — screen
+// brightness scales linearly with sample count, and count (unlike the
+// frame-average luminance) does not change when the camera moves, so the
+// image never re-exposes while orbiting or zooming.
+uniform float u_exposure;
 in vec2 v_uv;
 out vec4 fragColor;
 
-// Auto-exposure: key the frame off its average luminance so total on-screen
-// energy stays constant as particle counts scale; the clamp keeps empty or
-// pathological frames from exploding the gain.
-float sceneExposure(sampler2D hdr, float maxLod, float boost) {
-  vec3 avg = textureLod(hdr, vec2(0.5), maxLod).rgb;
-  float avgLum = dot(avg, vec3(0.2126, 0.7152, 0.0722));
-  return clamp(0.02 / max(avgLum, 1.0e-5), 0.25, 6.0) * boost;
-}
-
 void main() {
-  float exposure = sceneExposure(u_hdr, u_maxLod, u_exposureBoost);
+  float exposure = u_exposure;
   vec3 x = texture(u_hdr, v_uv).rgb * exposure +
            texture(u_bloom, v_uv).rgb * u_bloomStrength;
   // Log-luminance compression: galaxy cores span ~3 decades of brightness,
@@ -211,22 +205,17 @@ void main() {
 const BLOOM_DOWN_FRAGMENT = `#version 300 es
 precision mediump float;
 uniform sampler2D u_hdr;
-uniform float u_exposureBoost;
-uniform float u_maxLod;
+uniform float u_exposure;
+uniform vec2 u_texel; // source texel size
 in vec2 v_uv;
 out vec4 fragColor;
 
-float sceneExposure(sampler2D hdr, float maxLod, float boost) {
-  vec3 avg = textureLod(hdr, vec2(0.5), maxLod).rgb;
-  float avgLum = dot(avg, vec3(0.2126, 0.7152, 0.0722));
-  return clamp(0.02 / max(avgLum, 1.0e-5), 0.25, 6.0) * boost;
-}
-
 void main() {
-  // The mip chain is regenerated every frame; level 2 is already a clean
-  // 4x box downsample of the accumulation buffer.
-  float exposure = sceneExposure(u_hdr, u_maxLod, u_exposureBoost);
-  vec3 c = textureLod(u_hdr, v_uv, 2.0).rgb * exposure;
+  float exposure = u_exposure;
+  vec3 c = 0.25 * (textureLod(u_hdr, v_uv + u_texel * vec2(-1.0, -1.0), 0.0).rgb +
+                   textureLod(u_hdr, v_uv + u_texel * vec2(1.0, -1.0), 0.0).rgb +
+                   textureLod(u_hdr, v_uv + u_texel * vec2(-1.0, 1.0), 0.0).rgb +
+                   textureLod(u_hdr, v_uv + u_texel * vec2(1.0, 1.0), 0.0).rgb) * exposure;
   float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
   const float threshold = 0.85;
   const float knee = 0.45;
@@ -459,15 +448,14 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
         hdr: gl.getUniformLocation(tonemapProgram, "u_hdr"),
         bloom: gl.getUniformLocation(tonemapProgram, "u_bloom"),
         bloomStrength: gl.getUniformLocation(tonemapProgram, "u_bloomStrength"),
-        exposureBoost: gl.getUniformLocation(tonemapProgram, "u_exposureBoost"),
-        maxLod: gl.getUniformLocation(tonemapProgram, "u_maxLod"),
+        exposure: gl.getUniformLocation(tonemapProgram, "u_exposure"),
       }
     : null;
   const bloomDownUniforms = bloomDownProgram
     ? {
         hdr: gl.getUniformLocation(bloomDownProgram, "u_hdr"),
-        exposureBoost: gl.getUniformLocation(bloomDownProgram, "u_exposureBoost"),
-        maxLod: gl.getUniformLocation(bloomDownProgram, "u_maxLod"),
+        exposure: gl.getUniformLocation(bloomDownProgram, "u_exposure"),
+        texel: gl.getUniformLocation(bloomDownProgram, "u_texel"),
       }
     : null;
   const bloomBlurUniforms = bloomBlurProgram
@@ -531,7 +519,6 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
   let hdrTexture = null;
   let hdrWidth = 0;
   let hdrHeight = 0;
-  let hdrMaxLod = 0;
   // Quarter-resolution bloom ping-pong chain.
   let bloomTexA = null;
   let bloomTexB = null;
@@ -572,11 +559,8 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     hdrHeight = targetHeight;
     hdrTexture = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, hdrTexture);
-    // Full mip chain: regenerated each frame, its 1x1 top level is the frame
-    // average that drives auto-exposure (and level 2 pre-filters the bloom).
-    hdrMaxLod = Math.floor(Math.log2(Math.max(hdrWidth, hdrHeight)));
-    gl.texStorage2D(gl.TEXTURE_2D, hdrMaxLod + 1, gl.RGBA16F, hdrWidth, hdrHeight);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, hdrWidth, hdrHeight);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
@@ -644,11 +628,48 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     qualityCooldown: 0,
   };
 
+  // Style precedence: explicit ?style= URL parameter, then the persisted UI
+  // setting, then soft glow. The UI toggle dispatches galaxy-render-style,
+  // applied live without reloading.
+  function resolveDotStyle(params) {
+    const fromUrl = params.get("style");
+    if (fromUrl === "dots") {
+      return true;
+    }
+    if (fromUrl === "glow") {
+      return false;
+    }
+    try {
+      return window.localStorage?.getItem("galaxy-render-style") === "dots";
+    } catch {
+      return false;
+    }
+  }
+
+  function onStyleChange() {
+    let style = "glow";
+    try {
+      style = window.localStorage?.getItem("galaxy-render-style") === "dots" ? "dots" : "glow";
+    } catch {
+      // private mode
+    }
+    dotStyle = style === "dots";
+    if (dotStyle) {
+      // Dots have near-zero fill cost and downscaling would blur them away.
+      state.renderScale = 1.0;
+      state.renderScaleLocked = true;
+    } else {
+      state.renderScale = 0.75;
+      state.renderScaleLocked = false;
+    }
+  }
+  window.addEventListener("galaxy-render-style", onStyleChange);
+
   let dotStyle = false;
   let exposureBoost = 1.0;
   {
     const params = new URLSearchParams(window.location.search);
-    dotStyle = params.get("style") === "dots";
+    dotStyle = resolveDotStyle(params);
     const exposure = Number.parseFloat(params.get("exposure") ?? "");
     if (Number.isFinite(exposure) && exposure > 0.1 && exposure <= 8.0) {
       exposureBoost = exposure;
@@ -705,55 +726,63 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     crossInto(basis.up, basis.right, basis.forward);
   }
 
-  // Robust auto-framing: the quantization ranges are raw min/max, which a
-  // handful of ejected stars inflate enormously — framing on them leaves the
-  // actual galaxy tiny and off-center. Histogram a strided sample per axis
-  // and frame the 3rd..97th percentile extent instead.
-  const frameHistogram = new Uint32Array(3 * 64);
-  function updateSceneBoundsFromSlot(slot, force = false, particleBytes = null) {
+  // Robust auto-framing: raw quantization ranges are min/max, which a plume
+  // of ejected stars inflates to hundreds of kpc, so bin a strided sample per
+  // axis (1024 bins keeps sub-kpc precision even then) and aim the camera at
+  // the median star position — the galaxy — with the 3rd..97th percentile
+  // extent setting the zoom. The sample is retained so double-click can
+  // re-frame against current data at any time.
+  const frameHistogram = new Uint32Array(3 * 1024);
+  const framingSample = new Uint16Array(40000 * 3);
+  let framingSampleCount = 0;
+
+  function captureFramingSample(slot, particleBytes) {
+    const stride = Math.max(1, Math.ceil(slot.count / 40000));
+    let n = 0;
+    for (let i = 0; i < slot.count && n < 40000; i += stride) {
+      const base = i * PARTICLE_STRIDE;
+      framingSample[n * 3] = particleBytes[base] | (particleBytes[base + 1] << 8);
+      framingSample[n * 3 + 1] = particleBytes[base + 2] | (particleBytes[base + 3] << 8);
+      framingSample[n * 3 + 2] = particleBytes[base + 4] | (particleBytes[base + 5] << 8);
+      n += 1;
+    }
+    framingSampleCount = n;
+  }
+
+  function updateSceneBoundsFromSlot(slot, force = false) {
     if (!camera.autoFrame && !force) {
       return;
     }
-    let framed = false;
-    if (particleBytes && slot.count > 0) {
+    if (framingSampleCount > 0) {
       frameHistogram.fill(0);
-      const stride = Math.max(1, Math.floor(slot.count / 40000));
-      let samples = 0;
-      for (let i = 0; i < slot.count; i += stride) {
-        const base = i * PARTICLE_STRIDE;
-        for (let axis = 0; axis < 3; axis += 1) {
-          const q = particleBytes[base + axis * 2] | (particleBytes[base + axis * 2 + 1] << 8);
-          frameHistogram[axis * 64 + (q >> 10)] += 1;
-        }
-        samples += 1;
+      for (let i = 0; i < framingSampleCount; i += 1) {
+        frameHistogram[(framingSample[i * 3] >> 6)] += 1;
+        frameHistogram[1024 + (framingSample[i * 3 + 1] >> 6)] += 1;
+        frameHistogram[2048 + (framingSample[i * 3 + 2] >> 6)] += 1;
       }
-      const lowCut = samples * 0.03;
-      const highCut = samples * 0.97;
+      const percentileBin = (axis, fraction) => {
+        const cut = framingSampleCount * fraction;
+        let acc = 0;
+        for (let bin = 0; bin < 1024; bin += 1) {
+          acc += frameHistogram[axis * 1024 + bin];
+          if (acc >= cut) {
+            return bin;
+          }
+        }
+        return 1023;
+      };
       let maxExtent = 0;
       for (let axis = 0; axis < 3; axis += 1) {
-        let acc = 0;
-        let lowBin = 0;
-        let highBin = 63;
-        for (let bin = 0; bin < 64; bin += 1) {
-          acc += frameHistogram[axis * 64 + bin];
-          if (acc < lowCut) {
-            lowBin = bin;
-          }
-          if (acc <= highCut) {
-            highBin = bin;
-          }
-        }
         const toWorld = (bin) =>
-          slot.posMin[axis] + ((bin + 0.5) / 64) * slot.posScale[axis];
-        const low = toWorld(lowBin);
-        const high = toWorld(Math.max(highBin, lowBin + 1));
-        camera.focus[axis] = (low + high) * 0.5;
-        maxExtent = Math.max(maxExtent, high - low);
+          slot.posMin[axis] + ((bin + 0.5) / 1024) * slot.posScale[axis];
+        camera.focus[axis] = toWorld(percentileBin(axis, 0.5));
+        maxExtent = Math.max(
+          maxExtent,
+          toWorld(percentileBin(axis, 0.97)) - toWorld(percentileBin(axis, 0.03))
+        );
       }
       camera.sceneRadius = Math.max(1, maxExtent * 0.74);
-      framed = true;
-    }
-    if (!framed) {
+    } else {
       camera.focus[0] = slot.posMin[0] + slot.posScale[0] * 0.5;
       camera.focus[1] = slot.posMin[1] + slot.posScale[1] * 0.5;
       camera.focus[2] = slot.posMin[2] + slot.posScale[2] * 0.5;
@@ -841,7 +870,8 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     }
     state.lastArrivalWallMs = slot.wallMs;
 
-    updateSceneBoundsFromSlot(slot, false, particleBytes);
+    captureFramingSample(slot, particleBytes);
+    updateSceneBoundsFromSlot(slot);
     state.simTimeMyr = simTime;
 
     if (!state.sawFirstFrame) {
@@ -1150,21 +1180,22 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
 
     if (useHdr) {
       gl.disable(gl.BLEND);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-      // Reduce the accumulation buffer to its mip chain: the top level is the
-      // frame-average luminance driving auto-exposure in the passes below.
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, hdrTexture);
-      gl.generateMipmap(gl.TEXTURE_2D);
+      // Screen brightness scales linearly with the drawn sample count, so
+      // exposure normalizes by it: stable under camera motion, calibrated
+      // across preview budgets (the slider), tunable via ?exposure=.
+      const exposure =
+        exposureBoost * Math.min(5, Math.max(0.12, 460000 / Math.max(1, pair.current.count)));
 
-      // Bloom: bright-pass from the prefiltered chain, then a separable blur.
+      // Bloom: bright-pass downsample to quarter res, then a separable blur.
       gl.bindFramebuffer(gl.FRAMEBUFFER, bloomFboA);
       gl.viewport(0, 0, bloomWidth, bloomHeight);
       gl.useProgram(bloomDownProgram);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, hdrTexture);
       gl.uniform1i(bloomDownUniforms.hdr, 0);
-      gl.uniform1f(bloomDownUniforms.exposureBoost, exposureBoost);
-      gl.uniform1f(bloomDownUniforms.maxLod, hdrMaxLod);
+      gl.uniform1f(bloomDownUniforms.exposure, exposure);
+      gl.uniform2f(bloomDownUniforms.texel, 1 / hdrWidth, 1 / hdrHeight);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
 
       gl.useProgram(bloomBlurProgram);
@@ -1191,8 +1222,7 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
       // Dots carry less raw HDR energy per pixel, so give them a slightly
       // stronger halo to read as stars rather than pixels.
       gl.uniform1f(tonemapUniforms.bloomStrength, dotStyle ? 1.1 : 0.85);
-      gl.uniform1f(tonemapUniforms.exposureBoost, exposureBoost);
-      gl.uniform1f(tonemapUniforms.maxLod, hdrMaxLod);
+      gl.uniform1f(tonemapUniforms.exposure, exposure);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     }
 
@@ -1300,6 +1330,7 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
       if (state.rafHandle !== null) {
         window.cancelAnimationFrame(state.rafHandle);
       }
+      window.removeEventListener("galaxy-render-style", onStyleChange);
       resizeObserver?.disconnect();
       if (worker) {
         worker.postMessage({ kind: "disconnect" });
