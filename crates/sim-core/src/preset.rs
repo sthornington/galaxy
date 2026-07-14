@@ -351,6 +351,7 @@ fn grand_merger() -> MergerPreset {
 fn smbh_playground() -> MergerPreset {
     let bare_smbh = |label: &str,
                      mass_msun: f64,
+                     softening_kpc: f64,
                      position_kpc: [f64; 3],
                      velocity_kms: [f64; 3]| GalaxyConfig {
         label: label.to_string(),
@@ -371,12 +372,13 @@ fn smbh_playground() -> MergerPreset {
         bulge_scale_radius_kpc: 0.5,
         bulge_particle_count: 0,
         // CFL keys on the fastest particle: stars bound at the SMBH softening
-        // radius set v_max for the whole system, so softening below ~20 pc
-        // drives every step to the substep cap. 25 pc is still 2-5x below
-        // the marauders' influence radii.
+        // radius set v_max for the whole system, so each marauder's softening
+        // scales with its mass to keep the peak bound-star speed ~450 km/s.
+        // All softenings stay several times below the influence radii, so the
+        // wake carving is unaffected.
         smbh: SmbhConfig {
             mass_msun,
-            softening_kpc: 0.025,
+            softening_kpc,
             substeps: 16,
         },
         position_kpc,
@@ -397,41 +399,52 @@ fn smbh_playground() -> MergerPreset {
         host.position_kpc = [0.0, 0.0, 0.0];
         host.velocity_kms = [0.0, 0.0, 0.0];
         host.disk_tilt_deg = [0.0, 0.0, 0.0];
-        // Dense stellar sampling so the wakes read clearly; coarser halo with
-        // matched softening (same trade as grand-merger).
-        host.disk_particle_count = 1_200_000;
-        host.bulge_particle_count = 240_000;
-        host.halo_particle_count = 850_000;
+        // Dense-enough stellar sampling for clear wakes while keeping the
+        // pace watchable; coarser halo with matched softening (same trade as
+        // grand-merger).
+        host.disk_particle_count = 800_000;
+        host.bulge_particle_count = 160_000;
+        host.halo_particle_count = 600_000;
         host.smbh.mass_msun = 5.0e7;
         host.smbh.softening_kpc = 0.02;
     }
-    // Rotation speeds ~200-230 km/s at these radii for this galaxy; modest
-    // deviations just make the orbits eccentric, which is the point.
+    // Plunging orbits: velocities are mostly radial-inward (well below the
+    // ~210 km/s circular speed) with just enough tangential motion to swing
+    // through close pericenter passes instead of threading the exact center.
+    // All three dive through the inner disk within their first ~80 Myr.
     config.galaxies.push(bare_smbh(
         "Marauder A",
-        2.5e8,
-        [4.5, 0.0, 1.0],
-        [0.0, 205.0, 35.0],
+        2.0e9,
+        0.09,
+        [5.0, 0.0, 1.5],
+        [-140.0, 80.0, -25.0],
     ));
     config.galaxies.push(bare_smbh(
         "Marauder B",
-        3.5e8,
-        [0.0, 7.0, 3.0],
-        [-185.0, 0.0, -55.0],
+        3.0e9,
+        0.13,
+        [0.0, 8.0, 3.0],
+        [60.0, -170.0, -50.0],
     ));
     config.galaxies.push(bare_smbh(
         "Marauder C",
-        5.0e8,
-        [-9.5, 0.0, 0.5],
-        [0.0, -215.0, 0.0],
+        5.0e9,
+        0.21,
+        [-10.5, 0.0, 0.8],
+        [180.0, -70.0, 0.0],
     ));
     config.initial_separation_kpc = 0.0;
     config.initial_relative_velocity_kms = 0.0;
+    // The late-stage multi-SMBH brawl slingshots a handful of stars past
+    // 1000 km/s; without a cap they drag the whole system onto an ever-finer
+    // time grid. Capping at 6 bounds the wall cost — the error lands only on
+    // those few ejected stars, not the disk.
+    config.integration.max_substeps = 6;
 
     MergerPreset {
         id: "smbh-playground",
         title: "SMBH Marauders",
-        summary: "Three massive black holes (marked in cyan) on crossing orbits through a dense spiral disk — watch dynamical-friction wakes carve the stars as they spiral inward.",
+        summary: "Three giant black holes (2-5 billion Msun, marked in cyan) plunging toward the center of a dense spiral disk — catastrophic wakes, shredded arms, and a violent multi-SMBH endgame in the core.",
         config,
     }
 }
