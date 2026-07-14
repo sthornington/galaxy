@@ -258,7 +258,7 @@ export function createUiApp({
   let sessionPoll = null;
   let attachGeneration = 0;
 
-  const PREVIEW_BUDGETS = { webgl: 4_194_304, wasm: 32_768, json: 12_288 };
+  const PREVIEW_BUDGETS = { webgpu: 4_194_304, webgl: 4_194_304, wasm: 32_768, json: 12_288 };
   const BUDGET_STORAGE_KEY = "galaxy-preview-budget";
 
   // The slider works in log2 space (2^15 .. 2^22); the top stop means "all
@@ -865,13 +865,19 @@ export function createUiApp({
       // BOTH directions: a session demoted to 32k by one slow/failed attach
       // must be promoted back to the full sample when WebGL attaches again.
       const desiredBudget =
-        tier === "webgl" ? storedWebglBudget() : (PREVIEW_BUDGETS[tier] ?? PREVIEW_BUDGETS.wasm);
+        tier === "webgl" || tier === "webgpu"
+          ? storedWebglBudget()
+          : (PREVIEW_BUDGETS[tier] ?? PREVIEW_BUDGETS.wasm);
       syncBudgetSlider(desiredBudget);
       if (session.preview_particle_budget !== desiredBudget) {
         sendPreviewBudget(session.id, desiredBudget);
       }
       const tierLabel =
-        tier === "webgl" ? "WebGL renderer" : "Rust/WASM viewer";
+        tier === "webgpu"
+          ? "WebGPU renderer (HDR)"
+          : tier === "webgl"
+            ? "WebGL renderer"
+            : "Rust/WASM viewer";
       nodes.viewerStatus.textContent =
         `Streaming binary preview frames into the ${tierLabel} ` +
         `(${desiredBudget.toLocaleString()} sampled particles).`;

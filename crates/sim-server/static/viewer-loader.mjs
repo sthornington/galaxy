@@ -1,4 +1,4 @@
-const VIEWER_BUNDLE_VERSION = "20260714-14";
+const VIEWER_BUNDLE_VERSION = "20260714-15";
 
 // Client-side viewer failures are invisible from the server; report tier
 // outcomes so `grep client sim-server.log` shows exactly what each browser
@@ -57,6 +57,41 @@ export async function tryBootRustViewer(sessionId) {
   const renderer = params.get("renderer");
   if (renderer === "json") {
     return false;
+  }
+
+  // WebGPU tier: true HDR (extended dynamic range) output. Tried first when
+  // pinned, or by default on HDR-capable displays with WebGPU available;
+  // any failure falls through to the proven WebGL tier below.
+  const wantWebgpu =
+    renderer === "webgpu" ||
+    (renderer === null &&
+      typeof navigator !== "undefined" &&
+      !!navigator.gpu &&
+      window.matchMedia?.("(dynamic-range: high)")?.matches === true);
+  if (wantWebgpu) {
+    try {
+      const module = await import(`/webgpu-viewer.mjs?v=${VIEWER_BUNDLE_VERSION}`);
+      const firstFrame = waitForFirstFrame();
+      module.boot("preview-canvas", sessionId);
+      if (await firstFrame) {
+        reportTier({ tier: "webgpu", ok: true });
+        return "webgpu";
+      }
+      module.shutdown();
+      reportTier({
+        tier: "webgpu",
+        ok: false,
+        error: "no first frame (timeout or galaxy-viewer-error)",
+      });
+    } catch (error) {
+      console.error("WebGPU viewer boot failed", error);
+      reportTier({
+        tier: "webgpu",
+        ok: false,
+        error: String((error && error.message) || error),
+        stack: String((error && error.stack) || "").slice(0, 600),
+      });
+    }
   }
 
   if (renderer !== "wasm") {
