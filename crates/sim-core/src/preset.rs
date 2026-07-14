@@ -21,6 +21,7 @@ pub fn built_in_presets() -> Vec<MergerPreset> {
         major_merger(),
         major_merger_distant(),
         grand_merger(),
+        smbh_playground(),
         polar_flyby(),
         minor_merger(),
     ]
@@ -337,6 +338,95 @@ fn grand_merger() -> MergerPreset {
         id: "grand-merger",
         title: "Grand Merger (5.5M particles)",
         summary: "The distant equal-mass collision at full resolution: 2.5 million star particles develop spiral arms, collide, and relax into a remnant. IC generation takes a few minutes.",
+        config,
+    }
+}
+
+/// A dense spiral disk with three massive "marauder" SMBHs on inclined
+/// crossing orbits. Each marauder is a bare-SMBH galaxy (all component
+/// counts zero); at 2.5-5e8 Msun their dynamical influence radii are
+/// 50-120 pc — well above the force softening — so they visibly carve
+/// dynamical-friction wakes and gaps through the stellar disk before
+/// sinking toward the center and interacting with each other.
+fn smbh_playground() -> MergerPreset {
+    let bare_smbh = |label: &str,
+                     mass_msun: f64,
+                     position_kpc: [f64; 3],
+                     velocity_kms: [f64; 3]| GalaxyConfig {
+        label: label.to_string(),
+        equilibrium_snapshot: None,
+        initial_profile: GalaxyInitialProfile::UniformSphere {
+            radius_kpc: 0.1,
+            velocity_dispersion_kms: 0.0,
+            edge_rotation_speed_kms: 0.0,
+        },
+        halo_mass_msun: 0.0,
+        halo_scale_radius_kpc: 1.0,
+        halo_particle_count: 0,
+        disk_mass_msun: 0.0,
+        disk_scale_radius_kpc: 1.0,
+        disk_scale_height_kpc: 0.1,
+        disk_particle_count: 0,
+        bulge_mass_msun: 0.0,
+        bulge_scale_radius_kpc: 0.5,
+        bulge_particle_count: 0,
+        smbh: SmbhConfig {
+            mass_msun,
+            softening_kpc: 0.008,
+            substeps: 16,
+        },
+        position_kpc,
+        velocity_kms,
+        disk_tilt_deg: [0.0, 0.0, 0.0],
+        color_rgba: [0.4, 0.95, 1.0, 1.0],
+    };
+
+    let mut config = major_merger().config;
+    config.name = "smbh-playground".to_string();
+    config.output_directory = "output/smbh-playground".to_string();
+    config.gravity.mesh_resolution = [256, 256, 256];
+    config.gravity.halo_softening_kpc = 0.12;
+    config.galaxies.truncate(1);
+    {
+        let host = &mut config.galaxies[0];
+        host.label = "Host".to_string();
+        host.position_kpc = [0.0, 0.0, 0.0];
+        host.velocity_kms = [0.0, 0.0, 0.0];
+        host.disk_tilt_deg = [0.0, 0.0, 0.0];
+        // Dense stellar sampling so the wakes read clearly; coarser halo with
+        // matched softening (same trade as grand-merger).
+        host.disk_particle_count = 1_200_000;
+        host.bulge_particle_count = 240_000;
+        host.halo_particle_count = 850_000;
+        host.smbh.mass_msun = 5.0e7;
+    }
+    // Rotation speeds ~200-230 km/s at these radii for this galaxy; modest
+    // deviations just make the orbits eccentric, which is the point.
+    config.galaxies.push(bare_smbh(
+        "Marauder A",
+        2.5e8,
+        [4.5, 0.0, 1.0],
+        [0.0, 205.0, 35.0],
+    ));
+    config.galaxies.push(bare_smbh(
+        "Marauder B",
+        3.5e8,
+        [0.0, 7.0, 3.0],
+        [-185.0, 0.0, -55.0],
+    ));
+    config.galaxies.push(bare_smbh(
+        "Marauder C",
+        5.0e8,
+        [-9.5, 0.0, 0.5],
+        [0.0, -215.0, 0.0],
+    ));
+    config.initial_separation_kpc = 0.0;
+    config.initial_relative_velocity_kms = 0.0;
+
+    MergerPreset {
+        id: "smbh-playground",
+        title: "SMBH Marauders",
+        summary: "Three massive black holes (marked in cyan) on crossing orbits through a dense spiral disk — watch dynamical-friction wakes carve the stars as they spiral inward.",
         config,
     }
 }

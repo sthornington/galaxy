@@ -51,6 +51,7 @@ struct VSOut {
   @builtin(position) pos: vec4f,
   @location(0) uv: vec2f,
   @location(1) color: vec3f,
+  @location(2) marker: f32,
 }
 
 fn decodePos(r: vec4u, minV: vec3f, scaleV: vec3f) -> vec3f {
@@ -89,6 +90,7 @@ fn degenerate() -> VSOut {
   out.pos = vec4f(0.0, 0.0, 2.0, 1.0);
   out.uv = vec2f(0.0);
   out.color = vec3f(0.0);
+  out.marker = 0.0;
   return out;
 }
 
@@ -101,8 +103,8 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
   }
   let rc = curRecords[particle];
   let component = (rc.w >> 16u) & 0xFFu;
-  // Dark matter (0) and SMBH markers (3) are not splatted.
-  if (component == 0u || component == 3u) {
+  // Dark matter is never drawn.
+  if (component == 0u) {
     return degenerate();
   }
   let rp = prevRecords[particle];
@@ -138,7 +140,13 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
   let perspective = clamp((u.pointScale / clip.w) * 0.18, 0.02, 3.5);
   var size: f32;
   var splatColor: vec3f;
-  if (u.style > 0.5) {
+  var marker = 0.0;
+  if (component == 3u) {
+    // SMBH beacon: fixed-size cyan ring + core, unaffected by style.
+    marker = 1.0;
+    size = clamp(18.0 * u.sizeBoost, 12.0, 40.0);
+    splatColor = vec3f(0.45, 1.15, 1.55) * 7.0;
+  } else if (u.style > 0.5) {
     size = clamp((1.7 + 1.3 * renderLuminosity) * pow(perspective, 0.35) * u.sizeBoost,
                  1.5, 6.0);
     splatColor = color * (0.05 + 0.11 * renderLuminosity);
@@ -160,6 +168,7 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
   out.pos = vec4f(clip.xy + offsetNdc * clip.w, clip.zw);
   out.uv = cornerUv;
   out.color = splatColor;
+  out.marker = marker;
   return out;
 }
 
@@ -168,6 +177,11 @@ fn fs(in: VSOut) -> @location(0) vec4f {
   let r2 = dot(in.uv, in.uv);
   if (r2 > 1.0) {
     discard;
+  }
+  if (in.marker > 0.5) {
+    let ring = smoothstep(0.40, 0.55, r2) * (1.0 - smoothstep(0.75, 1.0, r2));
+    let core = 0.55 * exp(-r2 * 42.0);
+    return vec4f(in.color * (ring + core), 1.0);
   }
   if (u.style > 0.5) {
     return vec4f(in.color * smoothstep(1.0, 0.7, r2), 1.0);

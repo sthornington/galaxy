@@ -1,4 +1,4 @@
-const VIEWER_BUNDLE_VERSION = "20260714-17";
+const VIEWER_BUNDLE_VERSION = "20260714-18";
 
 // Client-side viewer failures are invisible from the server; report tier
 // outcomes so `grep client sim-server.log` shows exactly what each browser

@@ -50,6 +50,7 @@ layout(location = 4) in float a_mass;     // normalized u16 (log2-encoded)
 layout(location = 5) in uint a_component;
 
 out vec3 v_color;
+out float v_marker;
 
 vec3 dopplerShift(vec3 color, float radialVelocity) {
   float shift = clamp(radialVelocity / 700.0, -0.28, 0.28);
@@ -65,8 +66,9 @@ vec3 dopplerShift(vec3 color, float radialVelocity) {
 }
 
 void main() {
-  // Dark matter (0) and SMBH markers (3) are not splatted.
-  if (a_component == 0u || a_component == 3u) {
+  v_marker = 0.0;
+  // Dark matter is never drawn.
+  if (a_component == 0u) {
     gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
     gl_PointSize = 0.0;
     return;
@@ -83,6 +85,15 @@ void main() {
   if (clip.w <= 0.1) {
     gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
     gl_PointSize = 0.0;
+    return;
+  }
+
+  // SMBHs render as fixed-size beacon markers (cyan ring + core), unaffected
+  // by style, luminosity, or doppler.
+  if (a_component == 3u) {
+    v_marker = 1.0;
+    gl_PointSize = clamp(18.0 * u_sizeBoost, 12.0, 40.0);
+    v_color = vec3(0.45, 1.15, 1.55) * 7.0;
     return;
   }
 
@@ -135,6 +146,7 @@ precision mediump float;
 
 uniform mediump float u_style;
 in vec3 v_color;
+in float v_marker;
 out vec4 fragColor;
 
 void main() {
@@ -142,6 +154,12 @@ void main() {
   float r2 = dot(offset, offset);
   if (r2 > 1.0) {
     discard;
+  }
+  if (v_marker > 0.5) {
+    float ring = smoothstep(0.40, 0.55, r2) * (1.0 - smoothstep(0.75, 1.0, r2));
+    float core = 0.55 * exp(-r2 * 42.0);
+    fragColor = vec4(v_color * (ring + core), 1.0);
+    return;
   }
   if (u_style > 0.5) {
     // Crisp dot: solid disc with a barely softened rim.
