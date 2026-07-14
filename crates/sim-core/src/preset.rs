@@ -370,9 +370,13 @@ fn smbh_playground() -> MergerPreset {
         bulge_mass_msun: 0.0,
         bulge_scale_radius_kpc: 0.5,
         bulge_particle_count: 0,
+        // CFL keys on the fastest particle: stars bound at the SMBH softening
+        // radius set v_max for the whole system, so softening below ~20 pc
+        // drives every step to the substep cap. 25 pc is still 2-5x below
+        // the marauders' influence radii.
         smbh: SmbhConfig {
             mass_msun,
-            softening_kpc: 0.008,
+            softening_kpc: 0.025,
             substeps: 16,
         },
         position_kpc,
@@ -399,6 +403,7 @@ fn smbh_playground() -> MergerPreset {
         host.bulge_particle_count = 240_000;
         host.halo_particle_count = 850_000;
         host.smbh.mass_msun = 5.0e7;
+        host.smbh.softening_kpc = 0.02;
     }
     // Rotation speeds ~200-230 km/s at these radii for this galaxy; modest
     // deviations just make the orbits eccentric, which is the point.

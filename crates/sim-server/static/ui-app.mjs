@@ -14,6 +14,7 @@ export function createUiApp({
     simTime: document.getElementById("sim-time"),
     particleCount: document.getElementById("particle-count"),
     previewCount: document.getElementById("preview-count"),
+    simRate: document.getElementById("sim-rate"),
     viewerStatus: document.getElementById("viewer-status"),
     canvas: document.getElementById("preview-canvas"),
     refresh: document.getElementById("refresh-presets"),
@@ -341,6 +342,7 @@ export function createUiApp({
     nodes.sessionId.textContent = session.id;
     nodes.sessionState.textContent = session.state;
     nodes.simTime.textContent = `${session.sim_time_myr.toFixed(2)} Myr`;
+    updateSimRate(session);
     nodes.particleCount.textContent = session.particle_count.toLocaleString();
     nodes.previewCount.textContent =
       session.diagnostics.preview_count.toLocaleString();
@@ -848,6 +850,33 @@ export function createUiApp({
       nodes.simTime.textContent = `${frame.sim_time_myr.toFixed(2)} Myr`;
     };
     return socket;
+  }
+
+  // Live simulation pace (Myr of sim time per wall-clock second), smoothed
+  // over the 500ms session polls so the pace of a run is never a mystery.
+  let rateSample = null;
+  let rateEma = 0;
+  function updateSimRate(session) {
+    if (!nodes.simRate) {
+      return;
+    }
+    const wall = Date.now();
+    if (session.state !== "running") {
+      nodes.simRate.textContent = session.state;
+      rateSample = { simTime: session.sim_time_myr, wall };
+      return;
+    }
+    if (rateSample && session.sim_time_myr >= rateSample.simTime) {
+      const wallGapSeconds = (wall - rateSample.wall) / 1000;
+      if (wallGapSeconds >= 1.0) {
+        const rate = (session.sim_time_myr - rateSample.simTime) / wallGapSeconds;
+        rateEma = rateEma > 0 ? rateEma * 0.7 + rate * 0.3 : rate;
+        rateSample = { simTime: session.sim_time_myr, wall };
+        nodes.simRate.textContent = `${rateEma.toFixed(2)} Myr/s`;
+      }
+    } else {
+      rateSample = { simTime: session.sim_time_myr, wall };
+    }
   }
 
   async function attachToSession(session) {
