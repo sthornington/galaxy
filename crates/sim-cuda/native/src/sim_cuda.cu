@@ -83,6 +83,33 @@ bool particle_reorder_disabled() {
   return disabled;
 }
 
+bool kick_fusion_disabled() {
+  static const bool disabled = []() {
+    const char* raw_value = std::getenv("SIM_CUDA_DISABLE_KICK_FUSION");
+    if (raw_value == nullptr || raw_value[0] == '\0') {
+      return false;
+    }
+    return std::strcmp(raw_value, "0") != 0;
+  }();
+  return disabled;
+}
+
+int pm_substep_interval() {
+  static const int interval = []() {
+    const char* raw_value = std::getenv("SIM_CUDA_PM_SUBSTEP_INTERVAL");
+    if (raw_value == nullptr || raw_value[0] == '\0') {
+      return 2;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(raw_value, &end, 10);
+    if (end == raw_value || parsed < 1 || parsed > 8) {
+      return 2;
+    }
+    return static_cast<int>(parsed);
+  }();
+  return interval;
+}
+
 double short_range_target_occupancy(const std::uint64_t particle_count) {
   static const double override = []() {
     const char* raw_value = std::getenv("SIM_CUDA_SHORT_RANGE_TARGET_OCCUPANCY");
@@ -161,6 +188,20 @@ struct DeviceState {
   bool short_range_target_baryons_only = false;
   bool force_state_valid = false;
   double last_max_accel_sq = 0.0;
+  // Cross-advance KDK fusion: the closing half-kick of an advance is deferred
+  // and fused with the next advance's opening half-kick (they share the same
+  // force state), eliminating one full force evaluation per advance.
+  // Velocities between advances are therefore staggered by half a substep,
+  // which preview/diagnostics tolerate.
+  bool half_kick_pending = false;
+  double pending_fast_dt_myr = 0.0;
+  double pending_slow_dt_myr = 0.0;
+  // PM mesh reuse: the long-range field changes slowly, so it is rebuilt
+  // every SIM_CUDA_PM_SUBSTEP_INTERVAL substeps (default 2) unless the
+  // domain geometry moved.
+  int mesh_age = 1000000;
+  int pe_age = 1000000;
+  double last_potential_energy = 0.0;
 
   int nx = 0;
   int ny = 0;
@@ -3228,8 +3269,21 @@ int build_force_state(DeviceState* state,
   };
 
   auto stage_start = std::chrono::steady_clock::now();
+  const double previous_domain_origin[3] = {
+      state->domain_origin[0], state->domain_origin[1], state->domain_origin[2]};
+  const double previous_cell_size[3] = {
+      state->cell_size[0], state->cell_size[1], state->cell_size[2]};
   if (update_simulation_domain_from_device(state, error_buffer, error_buffer_len) != 0) {
     return 1;
+  }
+  bool domain_moved = state->cell_size[0] != previous_cell_size[0] ||
+                      state->cell_size[1] != previous_cell_size[1] ||
+                      state->cell_size[2] != previous_cell_size[2];
+  for (int axis = 0; axis < 3 && !domain_moved; ++axis) {
+    if (std::abs(state->domain_origin[axis] - previous_domain_origin[axis]) >
+        0.5 * state->cell_size[axis]) {
+      domain_moved = true;
+    }
   }
   if (finish_stage("update_simulation_domain_from_device", stage_start) != 0) {
     return 1;
@@ -3243,12 +3297,27 @@ int build_force_state(DeviceState* state,
     return 1;
   }
 
-  stage_start = std::chrono::steady_clock::now();
-  if (build_force_mesh(state, error_buffer, error_buffer_len) != 0) {
-    return 1;
+  // The long-range PM field evolves on multi-substep timescales, so reuse it
+  // between rebuilds. Any domain-geometry change forces a rebuild because the
+  // kick samples the grid through the (updated) origin and cell size.
+  state->mesh_age += 1;
+  const bool rebuild_mesh = domain_moved || state->mesh_age >= pm_substep_interval();
+  if (!rebuild_mesh) {
+    // Keep sampling geometry consistent with the retained grid contents; the
+    // next rebuild recomputes the domain from the device afresh.
+    for (int axis = 0; axis < 3; ++axis) {
+      state->domain_origin[axis] = previous_domain_origin[axis];
+    }
   }
-  if (finish_stage("build_force_mesh", stage_start) != 0) {
-    return 1;
+  if (rebuild_mesh) {
+    stage_start = std::chrono::steady_clock::now();
+    if (build_force_mesh(state, error_buffer, error_buffer_len) != 0) {
+      return 1;
+    }
+    state->mesh_age = 0;
+    if (finish_stage("build_force_mesh", stage_start) != 0) {
+      return 1;
+    }
   }
 
   stage_start = std::chrono::steady_clock::now();
@@ -3411,12 +3480,24 @@ int run_steps(DeviceState* state,
     if (finish_profile_stage("run_steps.build_force_state_open", stage_start) != 0) {
       return 1;
     }
+    // Fuse the previous advance's deferred closing half-kick into this
+    // opening kick: no drift separates them, so the force state is identical
+    // and the two launches collapse into one. (Time bins may have been
+    // reassigned in between; the resulting half-substep discrepancy applies
+    // only to the few particles that switched bins.)
+    double open_fast_dt_myr = half_substep_dt_myr;
+    double open_slow_dt_myr = use_bins ? substep_dt_myr : half_substep_dt_myr;
+    if (state->half_kick_pending) {
+      open_fast_dt_myr += state->pending_fast_dt_myr;
+      open_slow_dt_myr += state->pending_slow_dt_myr;
+      state->half_kick_pending = false;
+    }
     stage_start = std::chrono::steady_clock::now();
     if (apply_force_kick_from_state(state,
                                     particle_blocks,
                                     threads_per_block,
-                                    half_substep_dt_myr,
-                                    use_bins ? substep_dt_myr : half_substep_dt_myr,
+                                    open_fast_dt_myr,
+                                    open_slow_dt_myr,
                                     error_buffer,
                                     error_buffer_len) != 0) {
       return 1;
@@ -3456,6 +3537,16 @@ int run_steps(DeviceState* state,
             : last_substep ? substep_dt_myr
                            : 2.0 * substep_dt_myr;
       }
+      if (last_substep && !kick_fusion_disabled()) {
+        // Defer the closing half-kick: it fuses with the next advance's
+        // opening kick against this exact force state (which stays valid —
+        // nothing drifts between advances). Velocities visible to preview and
+        // diagnostics are staggered by half a substep, which they tolerate.
+        state->pending_fast_dt_myr = kick_dt_myr;
+        state->pending_slow_dt_myr = slow_kick_dt_myr;
+        state->half_kick_pending = true;
+        continue;
+      }
       stage_start = std::chrono::steady_clock::now();
       if (apply_force_kick_from_state(state,
                                       particle_blocks,
@@ -3474,11 +3565,20 @@ int run_steps(DeviceState* state,
 
   state->sim_time_myr += advanced_myr;
   fill_basic_diagnostics(*state, advanced_myr, diagnostics);
-  double potential_energy = 0.0;
-  if (compute_potential_energy(state, &potential_energy, error_buffer, error_buffer_len) != 0) {
-    return 1;
+  // The potential energy estimate only feeds the diagnostics panel; refresh
+  // it every few advances instead of paying an extra FFT per step.
+  state->pe_age += 1;
+  if (state->pe_age >= 4 || state->last_potential_energy == 0.0) {
+    double potential_energy = 0.0;
+    if (compute_potential_energy(state, &potential_energy, error_buffer, error_buffer_len) != 0) {
+      return 1;
+    }
+    if (potential_energy != 0.0) {
+      state->last_potential_energy = potential_energy;
+    }
+    state->pe_age = 0;
   }
-  diagnostics->estimated_potential_energy = potential_energy;
+  diagnostics->estimated_potential_energy = state->last_potential_energy;
   return 0;
 }
 

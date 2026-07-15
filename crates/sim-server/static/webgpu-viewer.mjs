@@ -37,7 +37,7 @@ struct Uniforms {
   forward: vec3f, alpha: f32,
   massLog: vec2f, style: f32, pointScale: f32,
   sizeBoost: f32, resX: f32, resY: f32, exposureBoost: f32,
-  headroom: f32, count: u32, _i: f32, _j: f32,
+  headroom: f32, count: u32, spanMyr: f32, _j: f32,
 }
 `;
 
@@ -109,10 +109,22 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
   }
   let rp = prevRecords[particle];
 
-  let position = mix(decodePos(rp, u.posMin0, u.posScale0),
-                     decodePos(rc, u.posMin1, u.posScale1), u.alpha);
-  let velocity = mix(decodeVel(rp, u.velMin0, u.velScale0),
-                     decodeVel(rc, u.velMin1, u.velScale1), u.alpha);
+  let p0 = decodePos(rp, u.posMin0, u.posScale0);
+  let p1 = decodePos(rc, u.posMin1, u.posScale1);
+  let v0 = decodeVel(rp, u.velMin0, u.velScale0);
+  let v1 = decodeVel(rc, u.velMin1, u.velScale1);
+  // Cubic Hermite with streamed velocities as tangents: C1-continuous motion
+  // across frame boundaries (plain lerp lurches at the frame cadence).
+  let a2 = u.alpha * u.alpha;
+  let a3 = a2 * u.alpha;
+  let spanKpcPerKms = u.spanMyr * 0.0010227;
+  let m0 = v0 * spanKpcPerKms;
+  let m1 = v1 * spanKpcPerKms;
+  let position = (2.0 * a3 - 3.0 * a2 + 1.0) * p0 +
+                 (a3 - 2.0 * a2 + u.alpha) * m0 +
+                 (-2.0 * a3 + 3.0 * a2) * p1 +
+                 (a3 - a2) * m1;
+  let velocity = mix(v0, v1, u.alpha);
   let clip = u.viewProj * vec4f(position, 1.0);
   if (clip.w <= 0.1) {
     return degenerate();
@@ -1183,6 +1195,7 @@ function createViewer(canvas, restoreCanvas, sessionId) {
       exposureBoost * Math.min(5, Math.max(0.12, 460000 / Math.max(1, pair.current.count)));
     uniformF32[60] = state.hdrActive ? (headroomOverride ?? 3.0) : 1.0;
     uniformU32[61] = pair.current.count;
+    uniformF32[62] = Math.max(0, pair.current.simTime - pair.previous.simTime);
     gpu.device.queue.writeBuffer(gpu.uniformBuffer, 0, uniformArray);
     gpu.device.queue.writeBuffer(
       gpu.exposureBoostBuffer,

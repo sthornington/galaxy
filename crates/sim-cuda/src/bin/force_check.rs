@@ -49,6 +49,10 @@ fn main() -> Result<()> {
     // the backend's cell-order compaction must stay off.
     unsafe {
         std::env::set_var("SIM_CUDA_DISABLE_REORDER", "1");
+        // Forces are inferred from a single step's velocity change, which
+        // requires synchronized (non-staggered) closing kicks.
+        std::env::set_var("SIM_CUDA_DISABLE_KICK_FUSION", "1");
+        std::env::set_var("SIM_CUDA_PM_SUBSTEP_INTERVAL", "1");
     }
 
     let mut initial_conditions = InitialConditions::generate(&preset.config, 7)?;

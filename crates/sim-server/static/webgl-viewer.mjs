@@ -40,6 +40,7 @@ uniform vec3 u_posScale1;
 uniform vec3 u_velMin1;
 uniform vec3 u_velScale1;
 uniform vec2 u_massLog; // (log2 min, log2 scale) of the current frame
+uniform float u_spanMyr; // sim-time gap between the interpolation endpoints
 uniform mediump float u_style;  // 0 = soft glow sprites, 1 = small crisp dots
 
 layout(location = 0) in vec3 a_prevPos;   // normalized u16
@@ -74,12 +75,23 @@ void main() {
     return;
   }
 
-  vec3 position = mix(u_posMin0 + a_prevPos * u_posScale0,
-                      u_posMin1 + a_pos * u_posScale1,
-                      u_alpha);
-  vec3 velocity = mix(u_velMin0 + a_prevVel * u_velScale0,
-                      u_velMin1 + a_vel * u_velScale1,
-                      u_alpha);
+  vec3 p0 = u_posMin0 + a_prevPos * u_posScale0;
+  vec3 p1 = u_posMin1 + a_pos * u_posScale1;
+  vec3 v0 = u_velMin0 + a_prevVel * u_velScale0;
+  vec3 v1 = u_velMin1 + a_vel * u_velScale1;
+  // Cubic Hermite interpolation using the streamed velocities as tangents:
+  // C1-continuous motion across frame boundaries, where plain lerp lurches
+  // at the frame cadence on fast movers (SMBH cores, slingshot stars).
+  float a2 = u_alpha * u_alpha;
+  float a3 = a2 * u_alpha;
+  float spanKpcPerKms = u_spanMyr * 0.0010227;
+  vec3 m0 = v0 * spanKpcPerKms;
+  vec3 m1 = v1 * spanKpcPerKms;
+  vec3 position = (2.0 * a3 - 3.0 * a2 + 1.0) * p0 +
+                  (a3 - 2.0 * a2 + u_alpha) * m0 +
+                  (-2.0 * a3 + 3.0 * a2) * p1 +
+                  (a3 - a2) * m1;
+  vec3 velocity = mix(v0, v1, u_alpha);
   vec4 clip = u_viewProj * vec4(position, 1.0);
   gl_Position = clip;
   if (clip.w <= 0.1) {
@@ -459,6 +471,7 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     velMin1: gl.getUniformLocation(pointProgram, "u_velMin1"),
     velScale1: gl.getUniformLocation(pointProgram, "u_velScale1"),
     massLog: gl.getUniformLocation(pointProgram, "u_massLog"),
+    spanMyr: gl.getUniformLocation(pointProgram, "u_spanMyr"),
     style: gl.getUniformLocation(pointProgram, "u_style"),
   };
   const tonemapUniforms = tonemapProgram
@@ -1189,6 +1202,10 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     gl.uniform3fv(uniforms.velMin1, pair.current.velMin);
     gl.uniform3fv(uniforms.velScale1, pair.current.velScale);
     gl.uniform2fv(uniforms.massLog, pair.current.massLog);
+    gl.uniform1f(
+      uniforms.spanMyr,
+      Math.max(0, pair.current.simTime - pair.previous.simTime)
+    );
     gl.uniform1f(uniforms.style, dotStyle ? 1.0 : 0.0);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE);

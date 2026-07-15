@@ -437,9 +437,13 @@ fn smbh_playground() -> MergerPreset {
     config.initial_relative_velocity_kms = 0.0;
     // The late-stage multi-SMBH brawl slingshots a handful of stars past
     // 1000 km/s; without a cap they drag the whole system onto an ever-finer
-    // time grid. Capping at 6 bounds the wall cost — the error lands only on
+    // time grid. Capping bounds the wall cost — the error lands only on
     // those few ejected stars, not the disk.
-    config.integration.max_substeps = 6;
+    config.integration.max_substeps = 4;
+    // Halved base step: same physics cost per Myr (CFL substeps just
+    // redistribute) but twice the preview frame cadence, halving the
+    // interpolation gap for the fast-moving core.
+    config.integration.base_timestep_myr = 0.1;
 
     MergerPreset {
         id: "smbh-playground",
