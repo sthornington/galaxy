@@ -892,7 +892,12 @@ int update_simulation_domain_from_device(DeviceState* state,
       // Re-centering/rescaling the FFT mesh every half-kick changes the live force law and
       // injects numerical heating into otherwise stable disks.
       const double global_center = state->domain_origin[axis] + 0.5 * state->box_length[axis];
-      const double next_global_length = std::max(state->box_length[axis], required_padded_length);
+      // Grow with 3% overshoot: a slowly expanding halo otherwise outgrows the
+      // box by epsilon every substep, forcing a Green's-function re-FFT and a
+      // PM mesh rebuild each time (and defeating the mesh-reuse interval).
+      const double next_global_length = required_padded_length > state->box_length[axis]
+          ? required_padded_length * 1.03
+          : state->box_length[axis];
       state->box_length[axis] = next_global_length;
       state->domain_origin[axis] = global_center - 0.5 * next_global_length;
 
@@ -1409,6 +1414,15 @@ __device__ __forceinline__ float treepm_short_range_force_factor_lookup_f(
   const std::uint32_t index1 = min(index0 + 1u, lut_size - 1);
   const float frac = scaled - static_cast<float>(index0);
   return lut[index0] + (lut[index1] - lut[index0]) * frac;
+}
+
+// erfc(x) + (2/sqrt(pi)) * x * exp(-x^2): the Gaussian-split short-range
+// force factor evaluated directly in fp32. On this latency-bound kernel the
+// ALUs sit mostly idle, so ~30 flops beat a dependent global LUT load.
+__device__ __forceinline__ float treepm_short_range_force_factor_analytic_f(
+    const float r2, const float half_inv_split) {
+  const float x = sqrtf(r2) * half_inv_split;
+  return erfcf(x) + 1.1283791671f * x * __expf(-x * x);
 }
 
 __device__ __forceinline__ void add_point_mass_acceleration(double& ax,
@@ -2117,7 +2131,8 @@ __global__ void compute_force_from_potential(const cufftReal* potential_grid,
       static_cast<float>(cell_z);
 }
 
-__global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
+__global__ void __launch_bounds__(256, 4) kick_particles_global(
+                                      SimCudaParticle* __restrict__ particles,
                                       const std::uint64_t particle_count,
                                       const cufftReal* __restrict__ force_x,
                                       const cufftReal* __restrict__ force_y,
@@ -2279,7 +2294,9 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
 
     const float cutoff_sq_f = static_cast<float>(short_cutoff_sq);
     const float grav_f = static_cast<float>(grav_const);
-    const float lut_scale_f = static_cast<float>(short_force_factor_lut_scale);
+    const float half_inv_split_f = short_pm_softening_kpc > 0.0
+        ? static_cast<float>(0.5 / short_pm_softening_kpc)
+        : 0.0f;
     const float particle_softening_f = static_cast<float>(particle_softening);
     float fax = 0.0f;
     float fay = 0.0f;
@@ -2307,27 +2324,23 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
               particle_pos_y - (short_origin_y + (static_cast<double>(cy) + 0.5) * short_cell_y));
           const float tz = static_cast<float>(
               particle_pos_z - (short_origin_z + (static_cast<double>(cz) + 0.5) * short_cell_z));
+          // Predicated rather than branched: the unconditional math keeps the
+          // loop software-pipelined instead of stalling on divergent skips.
           for (int slot = start; slot < end; ++slot) {
-            if (slot == self_slot) {
-              continue;
-            }
             const float4 source = sorted_source_posm[slot];
             const float dx = source.x - tx;
             const float dy = source.y - ty;
             const float dz = source.z - tz;
             const float r2 = dx * dx + dy * dy + dz * dz;
-            if (r2 <= 1.0e-10f || r2 > cutoff_sq_f) {
-              continue;
-            }
-
+            const bool interacts =
+                slot != self_slot && r2 > 1.0e-10f && r2 <= cutoff_sq_f;
             const float short_softening =
                 fmaxf(particle_softening_f, sorted_source_softening[slot]);
             const float inv_r = rsqrtf(r2 + short_softening * short_softening);
-            const float correction_scale = grav_f * source.w * inv_r * inv_r * inv_r *
-                treepm_short_range_force_factor_lookup_f(short_force_factor_lut,
-                                                         short_force_factor_lut_size,
-                                                         lut_scale_f,
-                                                         r2);
+            const float correction_scale = interacts
+                ? grav_f * source.w * inv_r * inv_r * inv_r *
+                      treepm_short_range_force_factor_analytic_f(r2, half_inv_split_f)
+                : 0.0f;
             fax += correction_scale * dx;
             fay += correction_scale * dy;
             faz += correction_scale * dz;
@@ -2359,23 +2372,17 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
             const std::size_t cell_base = static_cast<std::size_t>(cell) * 8u;
             for (int octant = 0; octant < 8; ++octant) {
               const float4 moment = octant_moments[cell_base + static_cast<std::size_t>(octant)];
-              if (!(moment.w > 0.0f)) {
-                continue;
-              }
               const float dx = moment.x - pxf;
               const float dy = moment.y - pyf;
               const float dz = moment.z - pzf;
               const float r2 = dx * dx + dy * dy + dz * dz;
-              if (r2 <= 1.0e-8f || r2 > cutoff_sq_f) {
-                continue;
-              }
-
+              const bool interacts =
+                  moment.w > 0.0f && r2 > 1.0e-8f && r2 <= cutoff_sq_f;
               const float inv_r = rsqrtf(r2 + octant_eps_sq);
-              const float scale = grav_f * moment.w * inv_r * inv_r * inv_r *
-                  treepm_short_range_force_factor_lookup_f(short_force_factor_lut,
-                                                           short_force_factor_lut_size,
-                                                           lut_scale_f,
-                                                           r2);
+              const float scale = interacts
+                  ? grav_f * moment.w * inv_r * inv_r * inv_r *
+                        treepm_short_range_force_factor_analytic_f(r2, half_inv_split_f)
+                  : 0.0f;
               fax += scale * dx;
               fay += scale * dy;
               faz += scale * dz;
@@ -2443,23 +2450,16 @@ __global__ void kick_particles_global(SimCudaParticle* __restrict__ particles,
 
             const float4 moment =
                 level_moments[short_cell_linear_index(cx, cy, cz, level_ny, level_nz)];
-            if (!(moment.w > 0.0f)) {
-              continue;
-            }
             const float dx = moment.x - pxf;
             const float dy = moment.y - pyf;
             const float dz = moment.z - pzf;
             const float r2 = dx * dx + dy * dy + dz * dz;
-            if (r2 <= 1.0e-8f) {
-              continue;
-            }
-
+            const bool interacts = moment.w > 0.0f && r2 > 1.0e-8f;
             const float inv_r = rsqrtf(r2 + node_eps_sq);
-            const float scale = grav_f * moment.w * inv_r * inv_r * inv_r *
-                treepm_short_range_force_factor_lookup_f(short_force_factor_lut,
-                                                         short_force_factor_lut_size,
-                                                         lut_scale_f,
-                                                         r2);
+            const float scale = interacts
+                ? grav_f * moment.w * inv_r * inv_r * inv_r *
+                      treepm_short_range_force_factor_analytic_f(r2, half_inv_split_f)
+                : 0.0f;
             fax += scale * dx;
             fay += scale * dy;
             faz += scale * dz;
