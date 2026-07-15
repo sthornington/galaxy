@@ -437,6 +437,8 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     context: null,
     hdrActive: false,
     sawFirstFrame: false,
+    firstFramePending: false,
+    renderFailed: false,
     rafHandle: null,
     simTimeMyr: -Infinity,
     playbackSimTime: null,
@@ -630,7 +632,7 @@ function createViewer(canvas, restoreCanvas, sessionId) {
       }
     });
     device.onuncapturederror = (event) => {
-      reportClient({ event: "uncaptured-error", message: String(event.error?.message).slice(0, 300) });
+      failRenderer("uncaptured-error", event.error);
     };
 
     const context = canvas.getContext("webgpu");
@@ -941,6 +943,15 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     window.dispatchEvent(new Event(name));
   }
 
+  function failRenderer(event, error) {
+    if (state.disposed || state.renderFailed) {
+      return;
+    }
+    state.renderFailed = true;
+    reportClient({ event, message: String(error?.message ?? error).slice(0, 400) });
+    dispatchEvent("galaxy-viewer-error");
+  }
+
   // --- frame ingestion ---
 
   function storeFrame(simTime, count, rangeView, rangeOffset, particleBytes) {
@@ -985,11 +996,6 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     captureFramingSample(slot, particleBytes);
     updateSceneBoundsFromSlot(slot);
     state.simTimeMyr = simTime;
-
-    if (!state.sawFirstFrame) {
-      state.sawFirstFrame = true;
-      dispatchEvent("galaxy-viewer-frame");
-    }
   }
 
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
@@ -1220,7 +1226,7 @@ function createViewer(canvas, restoreCanvas, sessionId) {
   }
 
   function render(nowMs) {
-    if (state.disposed) {
+    if (state.disposed || state.renderFailed) {
       return;
     }
     state.rafHandle = window.requestAnimationFrame(render);
@@ -1251,74 +1257,117 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     writeUniforms(pair, focalLength);
     writeAxes();
 
-    const encoder = gpu.device.createCommandEncoder();
-
-    // 1. Accumulate splats into the HDR target.
-    {
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view: gpu.hdrView,
-          clearValue: { r: 0, g: 0, b: 0, a: 1 },
-          loadOp: "clear",
-          storeOp: "store",
-        }],
-      });
-      pass.setPipeline(gpu.accumulatePipeline);
-      pass.setBindGroup(0, accumulateBindGroup(pair.previous, pair.current));
-      pass.draw(pair.current.count * 6);
-      pass.end();
+    const verifyFirstFrame = !state.sawFirstFrame && !state.firstFramePending;
+    if (verifyFirstFrame) {
+      gpu.device.pushErrorScope("validation");
+      gpu.device.pushErrorScope("out-of-memory");
+      state.firstFramePending = true;
     }
 
-    // 2. Bloom: bright pass at quarter res, then separable blur.
-    {
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{ view: gpu.bloomViewA, loadOp: "clear", storeOp: "store" }],
-      });
-      pass.setPipeline(gpu.bloomDownPipeline);
-      pass.setBindGroup(0, gpu.bloomDownBindGroup);
-      pass.draw(3);
-      pass.end();
-    }
-    {
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{ view: gpu.bloomViewB, loadOp: "clear", storeOp: "store" }],
-      });
-      pass.setPipeline(gpu.bloomBlurPipeline);
-      pass.setBindGroup(0, gpu.blurBindGroupAtoB);
-      pass.draw(3);
-      pass.end();
-    }
-    {
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{ view: gpu.bloomViewA, loadOp: "clear", storeOp: "store" }],
-      });
-      pass.setPipeline(gpu.bloomBlurPipeline);
-      pass.setBindGroup(0, gpu.blurBindGroupBtoA);
-      pass.draw(3);
-      pass.end();
+    let encoder;
+    try {
+      encoder = gpu.device.createCommandEncoder();
+
+      // 1. Accumulate splats into the HDR target.
+      {
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{
+            view: gpu.hdrView,
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          }],
+        });
+        pass.setPipeline(gpu.accumulatePipeline);
+        pass.setBindGroup(0, accumulateBindGroup(pair.previous, pair.current));
+        pass.draw(pair.current.count * 6);
+        pass.end();
+      }
+
+      // 2. Bloom: bright pass at quarter res, then separable blur.
+      {
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{ view: gpu.bloomViewA, loadOp: "clear", storeOp: "store" }],
+        });
+        pass.setPipeline(gpu.bloomDownPipeline);
+        pass.setBindGroup(0, gpu.bloomDownBindGroup);
+        pass.draw(3);
+        pass.end();
+      }
+      {
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{ view: gpu.bloomViewB, loadOp: "clear", storeOp: "store" }],
+        });
+        pass.setPipeline(gpu.bloomBlurPipeline);
+        pass.setBindGroup(0, gpu.blurBindGroupAtoB);
+        pass.draw(3);
+        pass.end();
+      }
+      {
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{ view: gpu.bloomViewA, loadOp: "clear", storeOp: "store" }],
+        });
+        pass.setPipeline(gpu.bloomBlurPipeline);
+        pass.setBindGroup(0, gpu.blurBindGroupBtoA);
+        pass.draw(3);
+        pass.end();
+      }
+
+      // 4. Tonemap to the (extended-range) swapchain + axis marker.
+      {
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{
+            view: state.context.getCurrentTexture().createView(),
+            clearValue: { r: 0.008, g: 0.031, b: 0.063, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          }],
+        });
+        pass.setPipeline(gpu.tonemapPipeline);
+        pass.setBindGroup(0, gpu.tonemapBindGroup);
+        pass.draw(3);
+        pass.setPipeline(gpu.linePipeline);
+        pass.setBindGroup(0, gpu.lineBindGroup);
+        pass.setVertexBuffer(0, gpu.lineVertexBuffer);
+        pass.draw(6);
+        pass.end();
+      }
+
+      gpu.device.queue.submit([encoder.finish()]);
+    } catch (error) {
+      if (verifyFirstFrame) {
+        void Promise.all([
+          gpu.device.popErrorScope(),
+          gpu.device.popErrorScope(),
+        ]).catch(() => {});
+        state.firstFramePending = false;
+      }
+      failRenderer("render-threw", error);
+      return;
     }
 
-    // 4. Tonemap to the (extended-range) swapchain + axis marker.
-    {
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view: state.context.getCurrentTexture().createView(),
-          clearValue: { r: 0.008, g: 0.031, b: 0.063, a: 1 },
-          loadOp: "clear",
-          storeOp: "store",
-        }],
-      });
-      pass.setPipeline(gpu.tonemapPipeline);
-      pass.setBindGroup(0, gpu.tonemapBindGroup);
-      pass.draw(3);
-      pass.setPipeline(gpu.linePipeline);
-      pass.setBindGroup(0, gpu.lineBindGroup);
-      pass.setVertexBuffer(0, gpu.lineVertexBuffer);
-      pass.draw(6);
-      pass.end();
+    if (verifyFirstFrame) {
+      const outOfMemory = gpu.device.popErrorScope();
+      const validation = gpu.device.popErrorScope();
+      Promise.all([outOfMemory, validation])
+        .then((errors) => {
+          const error = errors.find(Boolean);
+          if (error) {
+            failRenderer("first-frame-invalid", error);
+            return;
+          }
+          return gpu.device.queue.onSubmittedWorkDone().then(() => {
+            if (!state.disposed && !state.renderFailed && !state.sawFirstFrame) {
+              state.sawFirstFrame = true;
+              dispatchEvent("galaxy-viewer-frame");
+            }
+          });
+        })
+        .catch((error) => failRenderer("first-frame-failed", error))
+        .finally(() => {
+          state.firstFramePending = false;
+        });
     }
-
-    gpu.device.queue.submit([encoder.finish()]);
   }
 
   // --- controls (mirrors the other renderers) ---

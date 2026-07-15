@@ -493,19 +493,29 @@ fn decode_error(bytes: &[c_char]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard};
+
     use sim_core::{
-        Diagnostics, GalaxyConfig, GalaxyInitialProfile, InitialConditions,
-        ObserverEffectsConfig, Particle, ParticleComponent, PreviewConfig, RelativityConfig,
-        SimulationConfig, SmbhConfig, SnapshotConfig, TimeIntegrationConfig, Vec3,
-        built_in_presets,
+        Diagnostics, GalaxyConfig, GalaxyInitialProfile, InitialConditions, ObserverEffectsConfig,
+        Particle, ParticleComponent, PreviewConfig, RelativityConfig, SimulationConfig, SmbhConfig,
+        SnapshotConfig, TimeIntegrationConfig, Vec3, built_in_presets,
     };
     use uuid::Uuid;
 
     use super::GpuBackend;
 
+    static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_gpu() -> MutexGuard<'static, ()> {
+        GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     #[ignore = "requires NVIDIA GPU"]
     fn gpu_backend_steps_emits_preview_and_downloads_particles() {
+        let _gpu_guard = lock_gpu();
         let config = small_test_config();
         let initial_conditions = InitialConditions::generate(&config, 7).unwrap();
         let before_positions: Vec<Vec3> = initial_conditions
@@ -543,7 +553,42 @@ mod tests {
 
     #[test]
     #[ignore = "requires NVIDIA GPU"]
+    fn advance_batching_does_not_change_phase_space() {
+        let _gpu_guard = lock_gpu();
+        let config = small_test_config();
+        let initial_conditions = InitialConditions::generate(&config, 17).unwrap();
+        let mut batched = GpuBackend::new(&config, &initial_conditions).unwrap();
+        let mut repeated = GpuBackend::new(&config, &initial_conditions).unwrap();
+
+        batched.advance(4).unwrap();
+        for _ in 0..4 {
+            repeated.advance(1).unwrap();
+        }
+
+        let batched_particles = batched.download_particles().unwrap();
+        let repeated_particles = repeated.download_particles().unwrap();
+        assert_eq!(batched_particles.len(), repeated_particles.len());
+        let mut max_position_delta: f64 = 0.0;
+        let mut max_velocity_delta: f64 = 0.0;
+        for (batched_particle, repeated_particle) in
+            batched_particles.iter().zip(repeated_particles.iter())
+        {
+            max_position_delta = max_position_delta
+                .max((batched_particle.position_kpc - repeated_particle.position_kpc).length());
+            max_velocity_delta = max_velocity_delta
+                .max((batched_particle.velocity_kms - repeated_particle.velocity_kms).length());
+        }
+
+        assert!(
+            max_position_delta <= 1.0e-7 && max_velocity_delta <= 1.0e-4,
+            "advance batching changed phase space: max_position_delta={max_position_delta:.3e} kpc, max_velocity_delta={max_velocity_delta:.3e} km/s"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA GPU"]
     fn isolated_primary_galaxy_stays_compact_over_short_horizon() {
+        let _gpu_guard = lock_gpu();
         let mut config = small_test_config();
         config.galaxies.truncate(1);
         config.name = "isolated-primary-stability".to_string();
@@ -568,6 +613,7 @@ mod tests {
     #[test]
     #[ignore = "requires NVIDIA GPU"]
     fn isolated_primary_galaxy_retains_core_and_spin() {
+        let _gpu_guard = lock_gpu();
         let mut config = small_test_config();
         config.galaxies.truncate(1);
         config.name = "isolated-primary-core-spin".to_string();
@@ -599,6 +645,7 @@ mod tests {
     #[test]
     #[ignore = "requires NVIDIA GPU"]
     fn self_gravity_moves_particles_without_analytic_galaxy_masses() {
+        let _gpu_guard = lock_gpu();
         let config = self_gravity_only_config();
         let initial_conditions = InitialConditions {
             seed: 11,
@@ -673,6 +720,7 @@ mod tests {
     #[test]
     #[ignore = "requires NVIDIA GPU"]
     fn major_merger_debug_stays_structurally_bound_over_first_2_myr() {
+        let _gpu_guard = lock_gpu();
         let mut config = built_in_presets()
             .into_iter()
             .find(|preset| preset.id == "major-merger-debug")
@@ -716,6 +764,7 @@ mod tests {
     #[test]
     #[ignore = "requires NVIDIA GPU"]
     fn rotating_uniform_sphere_still_contracts() {
+        let _gpu_guard = lock_gpu();
         let config = built_in_presets()
             .into_iter()
             .find(|preset| preset.id == "uniform-sphere-collapse")

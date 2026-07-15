@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -26,17 +27,16 @@ namespace {
 constexpr double kKpcPerKmPerMyr = 0.001022712165045695;
 constexpr double kSpeedOfLightKms = 299792.458;
 constexpr double kPi = 3.14159265358979323846;
-constexpr double kSqrtPi = 1.77245385090551602729;
 // The global PM mesh solves with a free-space (isolated) Green's function, so
 // the box only needs to comfortably exceed twice the particle extent per axis
 // for the circular convolution to be exact for every in-extent pair.
 constexpr double kGlobalDomainPadding = 2.15;
+constexpr double kGlobalDomainGuardFraction = 0.03;
 constexpr double kShortRangeDomainPadding = 1.15;
 constexpr double kMinGlobalBoxLengthKpc = 64.0;
 constexpr double kMinShortRangeBoxLengthKpc = 8.0;
 constexpr double kMinShortRangeCellSizeKpc = 0.35;
 constexpr double kMaxShortRangeCellSizeKpc = 3.0;
-constexpr std::uint32_t kShortRangeForceFactorLutSize = 4096;
 constexpr std::size_t kMaxShortRangeCells = 4u * 1024u * 1024u;
 constexpr int kMaxShortRangeAxisCells = 1024;
 constexpr int kShortRangeDirectNeighborhoodThresholdLowN = 768;
@@ -83,17 +83,6 @@ bool particle_reorder_disabled() {
   return disabled;
 }
 
-bool kick_fusion_disabled() {
-  static const bool disabled = []() {
-    const char* raw_value = std::getenv("SIM_CUDA_DISABLE_KICK_FUSION");
-    if (raw_value == nullptr || raw_value[0] == '\0') {
-      return false;
-    }
-    return std::strcmp(raw_value, "0") != 0;
-  }();
-  return disabled;
-}
-
 int pm_substep_interval() {
   static const int interval = []() {
     const char* raw_value = std::getenv("SIM_CUDA_PM_SUBSTEP_INTERVAL");
@@ -108,6 +97,23 @@ int pm_substep_interval() {
     return static_cast<int>(parsed);
   }();
   return interval;
+}
+
+int kick_group_size() {
+  static const int group_size = []() {
+    const char* raw_value = std::getenv("SIM_CUDA_KICK_GROUP_SIZE");
+    if (raw_value == nullptr || raw_value[0] == '\0') {
+      return 1;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(raw_value, &end, 10);
+    if (end == raw_value || (end != nullptr && *end != '\0') ||
+        (parsed != 1 && parsed != 2 && parsed != 4)) {
+      return 1;
+    }
+    return static_cast<int>(parsed);
+  }();
+  return group_size;
 }
 
 double short_range_target_occupancy(const std::uint64_t particle_count) {
@@ -149,9 +155,6 @@ bool profile_force_stages() {
   return enabled;
 }
 
-__host__ __device__ __forceinline__ double treepm_short_range_force_factor(
-    const double r, const double split_radius_kpc);
-
 void flush_profile_stage(const char* label,
                          const std::chrono::steady_clock::time_point start,
                          const std::chrono::steady_clock::time_point end) {
@@ -188,14 +191,6 @@ struct DeviceState {
   bool short_range_target_baryons_only = false;
   bool force_state_valid = false;
   double last_max_accel_sq = 0.0;
-  // Cross-advance KDK fusion: the closing half-kick of an advance is deferred
-  // and fused with the next advance's opening half-kick (they share the same
-  // force state), eliminating one full force evaluation per advance.
-  // Velocities between advances are therefore staggered by half a substep,
-  // which preview/diagnostics tolerate.
-  bool half_kick_pending = false;
-  double pending_fast_dt_myr = 0.0;
-  double pending_slow_dt_myr = 0.0;
   // PM mesh reuse: the long-range field changes slowly, so it is rebuilt
   // every SIM_CUDA_PM_SUBSTEP_INTERVAL substeps (default 2) unless the
   // domain geometry moved.
@@ -227,9 +222,6 @@ struct DeviceState {
   double short_cell_size[3] = {1.0, 1.0, 1.0};
   double short_cutoff_kpc = 0.0;
   double short_pm_softening_kpc = 0.0;
-  double short_force_factor_lut_scale = 0.0;
-  double lut_cached_cutoff_kpc = -1.0;
-  double lut_cached_split_kpc = -1.0;
 
   // Coarsened pyramid over the fine short-range cells (levels 1..level_count-1;
   // level 0 aliases short_cell_mass/short_cell_com_*).
@@ -285,6 +277,7 @@ struct DeviceState {
   int* short_sorted_particle_indices = nullptr;
   int* short_cell_start = nullptr;
   int* short_cell_end = nullptr;
+  int* short_neighborhood_occupancy = nullptr;
   double* short_cell_mass = nullptr;
   double* short_cell_com_x = nullptr;
   double* short_cell_com_y = nullptr;
@@ -293,12 +286,10 @@ struct DeviceState {
   double* short_cell_octant_com_x = nullptr;
   double* short_cell_octant_com_y = nullptr;
   double* short_cell_octant_com_z = nullptr;
-  float* short_force_factor_lut = nullptr;
   double* max_accel_sq = nullptr;
   std::uint32_t short_source_particle_count = 0;
   std::uint32_t preview_visible_particle_count = 0;
   std::vector<int> galaxy_smbh_indices_host;
-  std::vector<float> short_force_factor_lut_host;
 
   cufftReal* density_grid = nullptr;
   cufftComplex* density_k = nullptr;
@@ -456,8 +447,8 @@ void destroy_state(DeviceState* state) {
   cudaFree(state->sorted_source_posm);
   cudaFree(state->sorted_source_softening);
   cudaFree(state->non_source_indices);
-  cudaFree(state->short_force_factor_lut);
   cudaFree(state->max_accel_sq);
+  cudaFree(state->short_neighborhood_occupancy);
   cudaFree(state->short_cell_end);
   cudaFree(state->short_cell_start);
   cudaFree(state->short_sorted_particle_indices);
@@ -898,8 +889,13 @@ int update_simulation_domain_from_device(DeviceState* state,
       const double next_global_length = required_padded_length > state->box_length[axis]
           ? required_padded_length * 1.03
           : state->box_length[axis];
+      const double retained_origin = global_center - 0.5 * next_global_length;
+      const double guard = kGlobalDomainGuardFraction * next_global_length;
+      const bool leaves_guard_band = min_value < retained_origin + guard ||
+                                     max_value > retained_origin + next_global_length - guard;
+      const double next_global_center = leaves_guard_band ? center : global_center;
       state->box_length[axis] = next_global_length;
-      state->domain_origin[axis] = global_center - 0.5 * next_global_length;
+      state->domain_origin[axis] = next_global_center - 0.5 * next_global_length;
 
       // The short-range grid can follow the active region, but only grow, not shrink,
       // so the short-range PM subtraction softening does not oscillate frame-to-frame.
@@ -927,12 +923,14 @@ int ensure_short_range_cell_storage(DeviceState* state,
   }
   if (required_cell_count <= state->short_cell_capacity &&
       state->short_cell_start != nullptr &&
-      state->short_cell_end != nullptr) {
+      state->short_cell_end != nullptr &&
+      state->short_neighborhood_occupancy != nullptr) {
     return 0;
   }
 
   cudaFree(state->short_cell_start);
   cudaFree(state->short_cell_end);
+  cudaFree(state->short_neighborhood_occupancy);
   cudaFree(state->short_cell_mass);
   cudaFree(state->short_cell_com_x);
   cudaFree(state->short_cell_com_y);
@@ -945,6 +943,7 @@ int ensure_short_range_cell_storage(DeviceState* state,
   state->octant_moments_f4 = nullptr;
   state->short_cell_start = nullptr;
   state->short_cell_end = nullptr;
+  state->short_neighborhood_occupancy = nullptr;
   state->short_cell_mass = nullptr;
   state->short_cell_com_x = nullptr;
   state->short_cell_com_y = nullptr;
@@ -975,6 +974,19 @@ int ensure_short_range_cell_storage(DeviceState* state,
       std::snprintf(error_buffer,
                     error_buffer_len,
                     "cudaMalloc for short-range cell ends failed (%zu cells): %s",
+                    required_cell_count,
+                    cudaGetErrorString(cuda_status));
+    }
+    return 1;
+  }
+
+  cuda_status = cudaMalloc(reinterpret_cast<void**>(&state->short_neighborhood_occupancy),
+                           sizeof(int) * required_cell_count);
+  if (cuda_status != cudaSuccess) {
+    if (error_buffer != nullptr && error_buffer_len > 0) {
+      std::snprintf(error_buffer,
+                    error_buffer_len,
+                    "cudaMalloc for short-range neighborhood occupancies failed (%zu cells): %s",
                     required_cell_count,
                     cudaGetErrorString(cuda_status));
     }
@@ -1232,51 +1244,6 @@ int update_short_range_grid(DeviceState* state,
     state->moments_f4_capacity = moments_needed;
   }
 
-  if (state->short_force_factor_lut == nullptr) {
-    const cudaError_t cuda_status =
-        cudaMalloc(reinterpret_cast<void**>(&state->short_force_factor_lut),
-                   sizeof(float) * kShortRangeForceFactorLutSize);
-    if (cuda_status != cudaSuccess) {
-      fill_cuda_error(
-          error_buffer, error_buffer_len, "cudaMalloc for short-range factor LUT failed", cuda_status);
-      return 1;
-    }
-    state->short_force_factor_lut_host.resize(kShortRangeForceFactorLutSize);
-    state->lut_cached_cutoff_kpc = -1.0;
-  }
-
-  const double short_cutoff_sq = state->short_cutoff_kpc * state->short_cutoff_kpc;
-  state->short_force_factor_lut_scale =
-      short_cutoff_sq > 0.0
-          ? static_cast<double>(kShortRangeForceFactorLutSize - 1) / short_cutoff_sq
-          : 0.0;
-
-  // The LUT depends only on the cutoff and split radius; the domain ratchet
-  // makes those change rarely, so skip the rebuild+upload when unchanged.
-  if (state->lut_cached_cutoff_kpc != state->short_cutoff_kpc ||
-      state->lut_cached_split_kpc != state->short_pm_softening_kpc) {
-    for (std::uint32_t i = 0; i < kShortRangeForceFactorLutSize; ++i) {
-      const double t = static_cast<double>(i) /
-                       static_cast<double>(std::max<std::uint32_t>(1, kShortRangeForceFactorLutSize - 1));
-      const double r = sqrt(t * short_cutoff_sq);
-      state->short_force_factor_lut_host[i] = static_cast<float>(
-          treepm_short_range_force_factor(r, state->short_pm_softening_kpc));
-    }
-
-    const cudaError_t lut_copy_status =
-        cudaMemcpyAsync(state->short_force_factor_lut,
-                        state->short_force_factor_lut_host.data(),
-                        sizeof(float) * kShortRangeForceFactorLutSize,
-                        cudaMemcpyHostToDevice,
-                        state->compute_stream);
-    if (lut_copy_status != cudaSuccess) {
-      fill_cuda_error(
-          error_buffer, error_buffer_len, "short-range factor LUT upload failed", lut_copy_status);
-      return 1;
-    }
-    state->lut_cached_cutoff_kpc = state->short_cutoff_kpc;
-    state->lut_cached_split_kpc = state->short_pm_softening_kpc;
-  }
   return 0;
 }
 
@@ -1373,47 +1340,6 @@ __device__ __forceinline__ double softened_inv_r3(const double dx,
   const double r2 = dx * dx + dy * dy + dz * dz + softening * softening;
   const double inv_r = rsqrt(r2);
   return inv_r * inv_r * inv_r;
-}
-
-__host__ __device__ __forceinline__ double treepm_short_range_force_factor(
-    const double r, const double split_radius_kpc) {
-  if (!(split_radius_kpc > 0.0) || !(r > 0.0)) {
-    return 1.0;
-  }
-  const double x = 0.5 * r / split_radius_kpc;
-  return erfc(x) + (r / (kSqrtPi * split_radius_kpc)) * exp(-(x * x));
-}
-
-__device__ __forceinline__ double treepm_short_range_force_factor_lookup(
-    const float* lut,
-    const std::uint32_t lut_size,
-    const double lut_scale,
-    const double r2,
-    const double split_radius_kpc) {
-  if (lut == nullptr || lut_size < 2 || !(lut_scale > 0.0)) {
-    return treepm_short_range_force_factor(sqrt(r2), split_radius_kpc);
-  }
-
-  const double scaled = fmin(r2 * lut_scale, static_cast<double>(lut_size - 1));
-  const std::uint32_t index0 = static_cast<std::uint32_t>(scaled);
-  const std::uint32_t index1 = min(index0 + 1u, lut_size - 1);
-  const double frac = scaled - static_cast<double>(index0);
-  const double value0 = static_cast<double>(lut[index0]);
-  const double value1 = static_cast<double>(lut[index1]);
-  return value0 + (value1 - value0) * frac;
-}
-
-// Single-precision variant for the packed monopole paths.
-__device__ __forceinline__ float treepm_short_range_force_factor_lookup_f(
-    const float* lut,
-    const std::uint32_t lut_size,
-    const float lut_scale,
-    const float r2) {
-  const float scaled = fminf(r2 * lut_scale, static_cast<float>(lut_size - 1));
-  const std::uint32_t index0 = static_cast<std::uint32_t>(scaled);
-  const std::uint32_t index1 = min(index0 + 1u, lut_size - 1);
-  const float frac = scaled - static_cast<float>(index0);
-  return lut[index0] + (lut[index1] - lut[index0]) * frac;
 }
 
 // erfc(x) + (2/sqrt(pi)) * x * exp(-x^2): the Gaussian-split short-range
@@ -1707,6 +1633,7 @@ __global__ void compute_short_range_cells(const SimCudaParticle* particles,
 
 __global__ void build_short_range_cell_ranges(const int* sorted_cell_ids,
                                               const std::uint64_t particle_count,
+                                              const int cell_count,
                                               int* cell_start,
                                               int* cell_end) {
   const std::uint64_t index =
@@ -1716,12 +1643,48 @@ __global__ void build_short_range_cell_ranges(const int* sorted_cell_ids,
   }
 
   const int cell_id = sorted_cell_ids[index];
+  if (cell_id < 0 || cell_id >= cell_count) {
+    return;
+  }
   if (index == 0 || sorted_cell_ids[index - 1] != cell_id) {
     cell_start[cell_id] = static_cast<int>(index);
   }
   if (index + 1 == particle_count || sorted_cell_ids[index + 1] != cell_id) {
     cell_end[cell_id] = static_cast<int>(index + 1);
   }
+}
+
+__global__ void compute_short_neighborhood_occupancy(const int* __restrict__ cell_start,
+                                                     const int* __restrict__ cell_end,
+                                                     const int nx,
+                                                     const int ny,
+                                                     const int nz,
+                                                     int* __restrict__ occupancy) {
+  const std::size_t cell_index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t cell_count =
+      static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
+  if (cell_index >= cell_count) {
+    return;
+  }
+
+  const int iz = static_cast<int>(cell_index % static_cast<std::size_t>(nz));
+  const std::size_t xy = cell_index / static_cast<std::size_t>(nz);
+  const int iy = static_cast<int>(xy % static_cast<std::size_t>(ny));
+  const int ix = static_cast<int>(xy / static_cast<std::size_t>(ny));
+  int total = 0;
+  for (int cx = max(0, ix - 1); cx <= min(nx - 1, ix + 1); ++cx) {
+    for (int cy = max(0, iy - 1); cy <= min(ny - 1, iy + 1); ++cy) {
+      for (int cz = max(0, iz - 1); cz <= min(nz - 1, iz + 1); ++cz) {
+        const int neighbor = short_cell_linear_index(cx, cy, cz, ny, nz);
+        const int start = cell_start[neighbor];
+        if (start >= 0) {
+          total += cell_end[neighbor] - start;
+        }
+      }
+    }
+  }
+  occupancy[cell_index] = total;
 }
 
 __global__ void normalize_short_range_cell_moments(const std::size_t cell_count,
@@ -2131,6 +2094,7 @@ __global__ void compute_force_from_potential(const cufftReal* potential_grid,
       static_cast<float>(cell_z);
 }
 
+template <int GroupSize>
 __global__ void __launch_bounds__(256, 4) kick_particles_global(
                                       SimCudaParticle* __restrict__ particles,
                                       const std::uint64_t particle_count,
@@ -2151,12 +2115,10 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
                                       const std::uint32_t source_count,
                                       const int* __restrict__ short_cell_start,
                                       const int* __restrict__ short_cell_end,
+                                      const int* __restrict__ short_neighborhood_occupancy,
                                       const float4* __restrict__ sorted_source_posm,
                                       const float* __restrict__ sorted_source_softening,
                                       const float4* __restrict__ octant_moments,
-                                      const float* __restrict__ short_force_factor_lut,
-                                      const std::uint32_t short_force_factor_lut_size,
-                                      const double short_force_factor_lut_scale,
                                       const PyramidDeviceView pyramid,
                                       const int short_nx,
                                       const int short_ny,
@@ -2181,11 +2143,14 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
                                       const double dt_slow_myr,
                                       const std::uint8_t* __restrict__ time_bins,
                                       float* __restrict__ accel_mag_out) {
-  const std::uint64_t thread_slot =
+  static_assert(GroupSize == 1 || GroupSize == 2 || GroupSize == 4);
+  const std::uint64_t linear_thread =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::uint64_t thread_slot = linear_thread / GroupSize;
   if (thread_slot >= particle_count) {
     return;
   }
+  const int group_lane = static_cast<int>(threadIdx.x) % GroupSize;
 
   // Threads walk targets in cell-sorted order so a warp shares its
   // interaction-list cells (and therefore its moment loads); the leftover
@@ -2223,24 +2188,26 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
   double ax = 0.0;
   double ay = 0.0;
   double az = 0.0;
-  sample_grid_trilinear_vector(force_x,
-                               force_y,
-                               force_z,
-                               nx,
-                               ny,
-                               nz,
-                               origin_x,
-                               origin_y,
-                               origin_z,
-                               cell_x,
-                               cell_y,
-                               cell_z,
-                               particle_pos_x,
-                               particle_pos_y,
-                               particle_pos_z,
-                               ax,
-                               ay,
-                               az);
+  if (group_lane == 0) {
+    sample_grid_trilinear_vector(force_x,
+                                 force_y,
+                                 force_z,
+                                 nx,
+                                 ny,
+                                 nz,
+                                 origin_x,
+                                 origin_y,
+                                 origin_z,
+                                 cell_x,
+                                 cell_y,
+                                 cell_z,
+                                 particle_pos_x,
+                                 particle_pos_y,
+                                 particle_pos_z,
+                                 ax,
+                                 ay,
+                                 az);
+  }
   // The force grid is already fully normalized: the density FFT and the
   // Green's-function FFT normalizations are both applied in the spectrum pass.
 
@@ -2268,29 +2235,11 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
     const int nbr_z0 = max(0, fine_iz - 1);
     const int nbr_z1 = min(short_nz - 1, fine_iz + 1);
 
-    // Region(0): the 3x3x3 fine-cell neighborhood. Use direct particle sums if
-    // it is sparse enough, otherwise exact pairs for the particle's own cell
-    // plus octant moments for the 26 neighbors.
-    int neighborhood_occupancy = 0;
-    for (int cx = nbr_x0; cx <= nbr_x1 && neighborhood_occupancy <= direct_neighborhood_threshold; ++cx) {
-      for (int cy = nbr_y0; cy <= nbr_y1 && neighborhood_occupancy <= direct_neighborhood_threshold; ++cy) {
-        for (int cz = nbr_z0; cz <= nbr_z1; ++cz) {
-          const int cell = short_cell_linear_index(cx, cy, cz, short_ny, short_nz);
-          const int start = short_cell_start[cell];
-          if (start < 0) {
-            continue;
-          }
-          neighborhood_occupancy += short_cell_end[cell] - start;
-          if (neighborhood_occupancy > direct_neighborhood_threshold) {
-            break;
-          }
-        }
-      }
-    }
-
-    const bool sparse_neighborhood =
-        neighborhood_occupancy <= direct_neighborhood_threshold;
     const int own_cell = short_cell_linear_index(fine_ix, fine_iy, fine_iz, short_ny, short_nz);
+    // Region(0): the 3x3x3 fine-cell neighborhood. Its occupancy is cached once
+    // per force-structure build instead of serially re-scanned by every target.
+    const bool sparse_neighborhood =
+        short_neighborhood_occupancy[own_cell] <= direct_neighborhood_threshold;
 
     const float cutoff_sq_f = static_cast<float>(short_cutoff_sq);
     const float grav_f = static_cast<float>(grav_const);
@@ -2326,7 +2275,7 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
               particle_pos_z - (short_origin_z + (static_cast<double>(cz) + 0.5) * short_cell_z));
           // Predicated rather than branched: the unconditional math keeps the
           // loop software-pipelined instead of stalling on divergent skips.
-          for (int slot = start; slot < end; ++slot) {
+          for (int slot = start + group_lane; slot < end; slot += GroupSize) {
             const float4 source = sorted_source_posm[slot];
             const float dx = source.x - tx;
             const float dy = source.y - ty;
@@ -2370,7 +2319,7 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
               continue;
             }
             const std::size_t cell_base = static_cast<std::size_t>(cell) * 8u;
-            for (int octant = 0; octant < 8; ++octant) {
+            for (int octant = group_lane; octant < 8; octant += GroupSize) {
               const float4 moment = octant_moments[cell_base + static_cast<std::size_t>(octant)];
               const float dx = moment.x - pxf;
               const float dy = moment.y - pyf;
@@ -2421,6 +2370,7 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
       const int vy1 = min(level_ny - 1, 2 * (parent_y + 1) + 1);
       const int vz0 = max(0, 2 * (parent_z - 1));
       const int vz1 = min(level_nz - 1, 2 * (parent_z + 1) + 1);
+      int interaction_slot = 0;
 
       for (int cx = vx0; cx <= vx1; ++cx) {
         const bool near_x = cx >= own_x - 1 && cx <= own_x + 1;
@@ -2445,6 +2395,9 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
             const float center_z = (static_cast<float>(cz) + 0.5f) * level_cell_z;
             const float dz_aabb = fmaxf(fabsf(pzf - center_z) - half_lz, 0.0f);
             if (dxy_aabb_sq + dz_aabb * dz_aabb > cutoff_sq_f) {
+              continue;
+            }
+            if ((interaction_slot++ % GroupSize) != group_lane) {
               continue;
             }
 
@@ -2481,7 +2434,9 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
     az += static_cast<double>(faz);
   }
 
-  for (std::uint32_t galaxy_index = 0; galaxy_index < galaxy_count; ++galaxy_index) {
+  for (std::uint32_t galaxy_index = static_cast<std::uint32_t>(group_lane);
+       galaxy_index < galaxy_count;
+       galaxy_index += GroupSize) {
     const int source_index = galaxy_smbh_indices[galaxy_index];
     if (source_index < 0 || static_cast<std::uint64_t>(source_index) >= particle_count) {
       continue;
@@ -2500,6 +2455,17 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
     if (enable_smbh_post_newtonian != 0 && particle_component == 3u) {
       add_smbh_1pn_acceleration(ax, ay, az, particle, source, grav_const);
     }
+  }
+
+  const unsigned int active_mask = __activemask();
+#pragma unroll
+  for (int offset = GroupSize / 2; offset > 0; offset /= 2) {
+    ax += __shfl_down_sync(active_mask, ax, offset, GroupSize);
+    ay += __shfl_down_sync(active_mask, ay, offset, GroupSize);
+    az += __shfl_down_sync(active_mask, az, offset, GroupSize);
+  }
+  if (group_lane != 0) {
+    return;
   }
 
   const double accel_sq = ax * ax + ay * ay + az * az;
@@ -3105,6 +3071,7 @@ int build_short_range_structure(DeviceState* state,
   build_short_range_cell_ranges<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
       state->short_sorted_cell_ids,
       state->short_source_particle_count,
+      static_cast<int>(state->short_cell_count),
       state->short_cell_start,
       state->short_cell_end);
   cuda_status = cudaGetLastError();
@@ -3115,6 +3082,22 @@ int build_short_range_structure(DeviceState* state,
 
   const int cell_blocks =
       static_cast<int>((state->short_cell_count + threads_per_block - 1) / threads_per_block);
+  compute_short_neighborhood_occupancy<<<cell_blocks,
+                                         threads_per_block,
+                                         0,
+                                         state->compute_stream>>>(
+      state->short_cell_start,
+      state->short_cell_end,
+      state->short_nx,
+      state->short_ny,
+      state->short_nz,
+      state->short_neighborhood_occupancy);
+  cuda_status = cudaGetLastError();
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(
+        error_buffer, error_buffer_len, "short-range occupancy kernel failed", cuda_status);
+    return 1;
+  }
   normalize_short_range_cell_moments<<<cell_blocks, threads_per_block, 0, state->compute_stream>>>(
       state->short_cell_count,
       state->short_cell_mass,
@@ -3336,7 +3319,6 @@ int build_force_state(DeviceState* state,
 }
 
 int apply_force_kick_from_state(DeviceState* state,
-                                const int particle_blocks,
                                 const int threads_per_block,
                                 const double dt_fast_myr,
                                 const double dt_slow_myr,
@@ -3366,56 +3348,73 @@ int apply_force_kick_from_state(DeviceState* state,
       state->particle_count <= 300'000u ? kShortRangeDirectNeighborhoodThresholdLowN
                                         : kShortRangeDirectNeighborhoodThresholdDefault;
 
-  kick_particles_global<<<particle_blocks, threads_per_block, 0, state->compute_stream>>>(
-      state->particles,
-      state->particle_count,
-      state->force_x,
-      state->force_y,
-      state->force_z,
-      state->nx,
-      state->ny,
-      state->nz,
-      state->domain_origin[0],
-      state->domain_origin[1],
-      state->domain_origin[2],
-      state->cell_size[0],
-      state->cell_size[1],
-      state->cell_size[2],
-      state->short_sorted_particle_indices,
-      state->non_source_indices,
-      source_count,
-      state->short_cell_start,
-      state->short_cell_end,
-      state->sorted_source_posm,
-      state->sorted_source_softening,
-      state->octant_moments_f4,
-      state->short_force_factor_lut,
-      kShortRangeForceFactorLutSize,
-      state->short_force_factor_lut_scale,
-      pyramid,
-      state->short_nx,
-      state->short_ny,
-      state->short_nz,
-      state->short_domain_origin[0],
-      state->short_domain_origin[1],
-      state->short_domain_origin[2],
-      state->short_cell_size[0],
-      state->short_cell_size[1],
-      state->short_cell_size[2],
-      state->short_cutoff_kpc,
-      state->short_pm_softening_kpc,
-      state->max_softening_kpc,
-      direct_neighborhood_threshold,
-      state->short_range_target_baryons_only ? 1 : 0,
-      state->galaxy_smbh_indices,
-      state->galaxy_count,
-      state->grav_const,
-      state->enable_smbh_post_newtonian ? 1 : 0,
-      state->max_accel_sq,
-      dt_fast_myr,
-      dt_slow_myr,
-      state->time_bins,
-      state->accel_mag);
+  auto launch_kick = [&](auto group_size_tag) {
+    constexpr int group_size = decltype(group_size_tag)::value;
+    const int kick_blocks = static_cast<int>(
+        (state->particle_count * group_size + threads_per_block - 1) / threads_per_block);
+    kick_particles_global<group_size><<<kick_blocks,
+                                        threads_per_block,
+                                        0,
+                                        state->compute_stream>>>(
+        state->particles,
+        state->particle_count,
+        state->force_x,
+        state->force_y,
+        state->force_z,
+        state->nx,
+        state->ny,
+        state->nz,
+        state->domain_origin[0],
+        state->domain_origin[1],
+        state->domain_origin[2],
+        state->cell_size[0],
+        state->cell_size[1],
+        state->cell_size[2],
+        state->short_sorted_particle_indices,
+        state->non_source_indices,
+        source_count,
+        state->short_cell_start,
+        state->short_cell_end,
+        state->short_neighborhood_occupancy,
+        state->sorted_source_posm,
+        state->sorted_source_softening,
+        state->octant_moments_f4,
+        pyramid,
+        state->short_nx,
+        state->short_ny,
+        state->short_nz,
+        state->short_domain_origin[0],
+        state->short_domain_origin[1],
+        state->short_domain_origin[2],
+        state->short_cell_size[0],
+        state->short_cell_size[1],
+        state->short_cell_size[2],
+        state->short_cutoff_kpc,
+        state->short_pm_softening_kpc,
+        state->max_softening_kpc,
+        direct_neighborhood_threshold,
+        state->short_range_target_baryons_only ? 1 : 0,
+        state->galaxy_smbh_indices,
+        state->galaxy_count,
+        state->grav_const,
+        state->enable_smbh_post_newtonian ? 1 : 0,
+        state->max_accel_sq,
+        dt_fast_myr,
+        dt_slow_myr,
+        state->time_bins,
+        state->accel_mag);
+  };
+  switch (kick_group_size()) {
+    case 2:
+      launch_kick(std::integral_constant<int, 2>{});
+      break;
+    case 4:
+      launch_kick(std::integral_constant<int, 4>{});
+      break;
+    default:
+      launch_kick(std::integral_constant<int, 1>{});
+      break;
+  }
   cuda_status = cudaGetLastError();
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer, error_buffer_len, "global particle kick kernel failed", cuda_status);
@@ -3480,24 +3479,11 @@ int run_steps(DeviceState* state,
     if (finish_profile_stage("run_steps.build_force_state_open", stage_start) != 0) {
       return 1;
     }
-    // Fuse the previous advance's deferred closing half-kick into this
-    // opening kick: no drift separates them, so the force state is identical
-    // and the two launches collapse into one. (Time bins may have been
-    // reassigned in between; the resulting half-substep discrepancy applies
-    // only to the few particles that switched bins.)
-    double open_fast_dt_myr = half_substep_dt_myr;
-    double open_slow_dt_myr = use_bins ? substep_dt_myr : half_substep_dt_myr;
-    if (state->half_kick_pending) {
-      open_fast_dt_myr += state->pending_fast_dt_myr;
-      open_slow_dt_myr += state->pending_slow_dt_myr;
-      state->half_kick_pending = false;
-    }
     stage_start = std::chrono::steady_clock::now();
     if (apply_force_kick_from_state(state,
-                                    particle_blocks,
                                     threads_per_block,
-                                    open_fast_dt_myr,
-                                    open_slow_dt_myr,
+                                    half_substep_dt_myr,
+                                    use_bins ? substep_dt_myr : half_substep_dt_myr,
                                     error_buffer,
                                     error_buffer_len) != 0) {
       return 1;
@@ -3537,19 +3523,8 @@ int run_steps(DeviceState* state,
             : last_substep ? substep_dt_myr
                            : 2.0 * substep_dt_myr;
       }
-      if (last_substep && !kick_fusion_disabled()) {
-        // Defer the closing half-kick: it fuses with the next advance's
-        // opening kick against this exact force state (which stays valid —
-        // nothing drifts between advances). Velocities visible to preview and
-        // diagnostics are staggered by half a substep, which they tolerate.
-        state->pending_fast_dt_myr = kick_dt_myr;
-        state->pending_slow_dt_myr = slow_kick_dt_myr;
-        state->half_kick_pending = true;
-        continue;
-      }
       stage_start = std::chrono::steady_clock::now();
       if (apply_force_kick_from_state(state,
-                                      particle_blocks,
                                       threads_per_block,
                                       kick_dt_myr,
                                       slow_kick_dt_myr,
@@ -3567,7 +3542,8 @@ int run_steps(DeviceState* state,
   fill_basic_diagnostics(*state, advanced_myr, diagnostics);
   // The potential energy estimate only feeds the diagnostics panel; refresh
   // it every few advances instead of paying an extra FFT per step.
-  state->pe_age += 1;
+  state->pe_age = std::min(
+      4, state->pe_age + static_cast<int>(std::min<std::uint32_t>(step_count, 4u)));
   if (state->pe_age >= 4 || state->last_potential_energy == 0.0) {
     double potential_energy = 0.0;
     if (compute_potential_energy(state, &potential_energy, error_buffer, error_buffer_len) != 0) {

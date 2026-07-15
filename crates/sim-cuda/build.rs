@@ -18,9 +18,8 @@ fn main() {
 
     let mut config = cmake::Config::new("native");
     config.define("CMAKE_BUILD_TYPE", "Release");
-    if let Ok(arch) = std::env::var("CMAKE_CUDA_ARCHITECTURES") {
-        config.define("CMAKE_CUDA_ARCHITECTURES", arch);
-    }
+    let arch = std::env::var("CMAKE_CUDA_ARCHITECTURES").unwrap_or_else(|_| "native".to_string());
+    config.define("CMAKE_CUDA_ARCHITECTURES", arch);
     let dst = config.build();
 
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
