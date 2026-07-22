@@ -28,6 +28,10 @@ pub const MAX_STEP_SUBSTEPS: u32 = 64;
 
 /// Command backlog per session; fire-and-forget senders drop on overflow so a
 /// spamming websocket cannot grow memory while the GPU is busy.
+/// A running session with no connected frame viewers pauses itself after
+/// this long; resuming from the UI picks up exactly where it stopped.
+const IDLE_AUTO_PAUSE: std::time::Duration = std::time::Duration::from_secs(180);
+
 const COMMAND_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Debug, Error)]
@@ -299,6 +303,10 @@ struct SessionContext {
     preview_budget: u32,
     preview_pending: bool,
     last_captured_sim_time: f64,
+    /// Set when the session is running with zero frame subscribers; the
+    /// session auto-pauses once IDLE_AUTO_PAUSE elapses after the last
+    /// viewer disconnects, so an unwatched simulation stops burning GPU.
+    idle_since: Option<std::time::Instant>,
 }
 
 enum RequestOutcome {
@@ -358,6 +366,7 @@ async fn session_task(
         latest_frame,
         frame_tx,
         running: false,
+        idle_since: None,
         preview_budget,
         preview_pending: false,
         last_captured_sim_time: f64::NAN,
@@ -389,6 +398,22 @@ async fn session_task(
                 }
             }
             _ = frame_ticker.tick() => {
+                if ctx.running {
+                    if ctx.frame_tx.receiver_count() == 0 {
+                        let idle_since = *ctx.idle_since.get_or_insert_with(std::time::Instant::now);
+                        if idle_since.elapsed() >= IDLE_AUTO_PAUSE {
+                            info!(
+                                "session {id} auto-pausing: no viewers for {}s",
+                                IDLE_AUTO_PAUSE.as_secs()
+                            );
+                            ctx.running = false;
+                            ctx.summary.write().state = SessionState::Paused;
+                            ctx.idle_since = None;
+                        }
+                    } else {
+                        ctx.idle_since = None;
+                    }
+                }
                 // Preview capture runs on its own CUDA stream: collect the
                 // previous frame if it is ready and queue the next one, all
                 // without stalling the advance branch below.

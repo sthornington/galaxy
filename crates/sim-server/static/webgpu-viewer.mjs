@@ -1048,7 +1048,7 @@ function createViewer(canvas, restoreCanvas, sessionId) {
 
   function connectStream() {
     try {
-      worker = new Worker("/webgl-stream-worker.js?v=20260715-23");
+      worker = new Worker("/webgl-stream-worker.js?v=20260722-24");
       worker.onmessage = (event) => {
         if (state.disposed) {
           return;

@@ -36,6 +36,13 @@ struct PreviewDeltaEncoder {
 }
 
 impl PreviewDeltaEncoder {
+    /// Drops the delta reference so the next frame goes out as a keyframe;
+    /// the client requests this when it cannot apply a delta.
+    fn reset(&mut self) {
+        self.previous = None;
+        self.frames_since_keyframe = 0;
+    }
+
     fn encode(&mut self, frame: &bytes::Bytes) -> bytes::Bytes {
         let encoded = self
             .previous
@@ -469,10 +476,15 @@ async fn frame_socket(
             inbound = socket.recv() => {
                 match inbound {
                     Some(Ok(Message::Close(_))) | None => return,
-                    Some(Ok(Message::Text(message)))
-                        if use_delta && message.as_str() == "ready" =>
-                    {
-                        client_ready = true;
+                    Some(Ok(Message::Text(message))) if use_delta => {
+                        match message.as_str() {
+                            "ready" => client_ready = true,
+                            "resync" => {
+                                delta_encoder.reset();
+                                client_ready = true;
+                            }
+                            _ => {}
+                        }
                     }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => {

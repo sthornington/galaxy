@@ -99,23 +99,6 @@ int pm_substep_interval() {
   return interval;
 }
 
-int kick_group_size() {
-  static const int group_size = []() {
-    const char* raw_value = std::getenv("SIM_CUDA_KICK_GROUP_SIZE");
-    if (raw_value == nullptr || raw_value[0] == '\0') {
-      return 1;
-    }
-    char* end = nullptr;
-    const long parsed = std::strtol(raw_value, &end, 10);
-    if (end == raw_value || (end != nullptr && *end != '\0') ||
-        (parsed != 1 && parsed != 2 && parsed != 4)) {
-      return 1;
-    }
-    return static_cast<int>(parsed);
-  }();
-  return group_size;
-}
-
 double short_range_target_occupancy(const std::uint64_t particle_count) {
   static const double override = []() {
     const char* raw_value = std::getenv("SIM_CUDA_SHORT_RANGE_TARGET_OCCUPANCY");
@@ -191,6 +174,15 @@ struct DeviceState {
   bool short_range_target_baryons_only = false;
   bool force_state_valid = false;
   double last_max_accel_sq = 0.0;
+  // Cross-advance KDK fusion: the closing half-kick of an advance is deferred
+  // and fused with the next advance's opening half-kick (no drift separates
+  // them, so the force state is identical), eliminating one full force
+  // evaluation per advance. Any externally visible phase-space read
+  // (sim_cuda_copy_particles) synchronizes first, so downloaded state is
+  // exact; preview and diagnostics tolerate the half-substep stagger.
+  bool half_kick_pending = false;
+  double pending_fast_dt_myr = 0.0;
+  double pending_slow_dt_myr = 0.0;
   // PM mesh reuse: the long-range field changes slowly, so it is rebuilt
   // every SIM_CUDA_PM_SUBSTEP_INTERVAL substeps (default 2) unless the
   // domain geometry moved.
@@ -267,6 +259,11 @@ struct DeviceState {
   // with a doubled dt. Assigned per base step from each particle's velocity
   // and last kick acceleration; permuted alongside the particle array.
   std::uint8_t* time_bins = nullptr;
+  // Snapshot of time_bins as of the previous step's kicks; the fused opening
+  // kick reads the deferred (pending) dt through these so a particle that
+  // switches bins between steps still receives exactly the kick schedule it
+  // was integrated under.
+  std::uint8_t* previous_time_bins = nullptr;
   std::uint8_t* time_bins_scratch = nullptr;
   float* accel_mag = nullptr;
   float* accel_mag_scratch = nullptr;
@@ -470,6 +467,7 @@ void destroy_state(DeviceState* state) {
   cudaFree(state->accel_mag);
   cudaFree(state->time_bins_scratch);
   cudaFree(state->time_bins);
+  cudaFree(state->previous_time_bins);
   cudaFree(state->inverse_index);
   cudaFree(state->particles_scratch);
   cudaFree(state->particles);
@@ -1251,6 +1249,15 @@ std::uint32_t estimate_substeps_for_step(DeviceState* state,
                                          const double dt_myr,
                                          char* error_buffer,
                                          const std::size_t error_buffer_len) {
+  // Preserve the bin epoch the previous step's deferred half-kick was
+  // scheduled under; assign_time_bins below may reassign time_bins.
+  if (state->previous_time_bins != nullptr && state->time_bins != nullptr) {
+    cudaMemcpyAsync(state->previous_time_bins,
+                    state->time_bins,
+                    state->particle_count,
+                    cudaMemcpyDeviceToDevice,
+                    state->compute_stream);
+  }
   try {
     thrust::device_ptr<SimCudaParticle> begin(state->particles);
     thrust::device_ptr<SimCudaParticle> end = begin + state->particle_count;
@@ -2094,8 +2101,7 @@ __global__ void compute_force_from_potential(const cufftReal* potential_grid,
       static_cast<float>(cell_z);
 }
 
-template <int GroupSize>
-__global__ void __launch_bounds__(256, 4) kick_particles_global(
+__global__ void __launch_bounds__(256, 3) kick_particles_global(
                                       SimCudaParticle* __restrict__ particles,
                                       const std::uint64_t particle_count,
                                       const cufftReal* __restrict__ force_x,
@@ -2141,16 +2147,16 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
                                       double* __restrict__ max_accel_sq,
                                       const double dt_myr,
                                       const double dt_slow_myr,
+                                      const double pending_dt_myr,
+                                      const double pending_slow_dt_myr,
                                       const std::uint8_t* __restrict__ time_bins,
+                                      const std::uint8_t* __restrict__ previous_time_bins,
                                       float* __restrict__ accel_mag_out) {
-  static_assert(GroupSize == 1 || GroupSize == 2 || GroupSize == 4);
-  const std::uint64_t linear_thread =
+  const std::uint64_t thread_slot =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const std::uint64_t thread_slot = linear_thread / GroupSize;
   if (thread_slot >= particle_count) {
     return;
   }
-  const int group_lane = static_cast<int>(threadIdx.x) % GroupSize;
 
   // Threads walk targets in cell-sorted order so a warp shares its
   // interaction-list cells (and therefore its moment loads); the leftover
@@ -2169,7 +2175,11 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
 
   // Slow-bin particles integrate with a doubled dt on alternate substeps and
   // skip the off substeps entirely (dt 0).
-  const double particle_dt_myr = time_bins[index] != 0 ? dt_slow_myr : dt_myr;
+  // This step's dt follows the current bin; any deferred closing half-kick
+  // from the previous step follows the bin epoch it was scheduled under.
+  const double particle_dt_myr =
+      (time_bins[index] != 0 ? dt_slow_myr : dt_myr) +
+      (previous_time_bins[index] != 0 ? pending_slow_dt_myr : pending_dt_myr);
   if (particle_dt_myr == 0.0) {
     return;
   }
@@ -2188,8 +2198,7 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
   double ax = 0.0;
   double ay = 0.0;
   double az = 0.0;
-  if (group_lane == 0) {
-    sample_grid_trilinear_vector(force_x,
+  sample_grid_trilinear_vector(force_x,
                                  force_y,
                                  force_z,
                                  nx,
@@ -2201,13 +2210,12 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
                                  cell_x,
                                  cell_y,
                                  cell_z,
-                                 particle_pos_x,
-                                 particle_pos_y,
-                                 particle_pos_z,
-                                 ax,
-                                 ay,
-                                 az);
-  }
+                               particle_pos_x,
+                               particle_pos_y,
+                               particle_pos_z,
+                               ax,
+                               ay,
+                               az);
   // The force grid is already fully normalized: the density FFT and the
   // Green's-function FFT normalizations are both applied in the spectrum pass.
 
@@ -2275,7 +2283,7 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
               particle_pos_z - (short_origin_z + (static_cast<double>(cz) + 0.5) * short_cell_z));
           // Predicated rather than branched: the unconditional math keeps the
           // loop software-pipelined instead of stalling on divergent skips.
-          for (int slot = start + group_lane; slot < end; slot += GroupSize) {
+          for (int slot = start; slot < end; ++slot) {
             const float4 source = sorted_source_posm[slot];
             const float dx = source.x - tx;
             const float dy = source.y - ty;
@@ -2319,7 +2327,7 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
               continue;
             }
             const std::size_t cell_base = static_cast<std::size_t>(cell) * 8u;
-            for (int octant = group_lane; octant < 8; octant += GroupSize) {
+            for (int octant = 0; octant < 8; ++octant) {
               const float4 moment = octant_moments[cell_base + static_cast<std::size_t>(octant)];
               const float dx = moment.x - pxf;
               const float dy = moment.y - pyf;
@@ -2370,7 +2378,6 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
       const int vy1 = min(level_ny - 1, 2 * (parent_y + 1) + 1);
       const int vz0 = max(0, 2 * (parent_z - 1));
       const int vz1 = min(level_nz - 1, 2 * (parent_z + 1) + 1);
-      int interaction_slot = 0;
 
       for (int cx = vx0; cx <= vx1; ++cx) {
         const bool near_x = cx >= own_x - 1 && cx <= own_x + 1;
@@ -2397,10 +2404,6 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
             if (dxy_aabb_sq + dz_aabb * dz_aabb > cutoff_sq_f) {
               continue;
             }
-            if ((interaction_slot++ % GroupSize) != group_lane) {
-              continue;
-            }
-
             const float4 moment =
                 level_moments[short_cell_linear_index(cx, cy, cz, level_ny, level_nz)];
             const float dx = moment.x - pxf;
@@ -2434,9 +2437,7 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
     az += static_cast<double>(faz);
   }
 
-  for (std::uint32_t galaxy_index = static_cast<std::uint32_t>(group_lane);
-       galaxy_index < galaxy_count;
-       galaxy_index += GroupSize) {
+  for (std::uint32_t galaxy_index = 0; galaxy_index < galaxy_count; ++galaxy_index) {
     const int source_index = galaxy_smbh_indices[galaxy_index];
     if (source_index < 0 || static_cast<std::uint64_t>(source_index) >= particle_count) {
       continue;
@@ -2455,17 +2456,6 @@ __global__ void __launch_bounds__(256, 4) kick_particles_global(
     if (enable_smbh_post_newtonian != 0 && particle_component == 3u) {
       add_smbh_1pn_acceleration(ax, ay, az, particle, source, grav_const);
     }
-  }
-
-  const unsigned int active_mask = __activemask();
-#pragma unroll
-  for (int offset = GroupSize / 2; offset > 0; offset /= 2) {
-    ax += __shfl_down_sync(active_mask, ax, offset, GroupSize);
-    ay += __shfl_down_sync(active_mask, ay, offset, GroupSize);
-    az += __shfl_down_sync(active_mask, az, offset, GroupSize);
-  }
-  if (group_lane != 0) {
-    return;
   }
 
   const double accel_sq = ax * ax + ay * ay + az * az;
@@ -3322,6 +3312,8 @@ int apply_force_kick_from_state(DeviceState* state,
                                 const int threads_per_block,
                                 const double dt_fast_myr,
                                 const double dt_slow_myr,
+                                const double pending_fast_dt_myr,
+                                const double pending_slow_dt_myr,
                                 char* error_buffer,
                                 const std::size_t error_buffer_len) {
   cudaError_t cuda_status =
@@ -3348,73 +3340,59 @@ int apply_force_kick_from_state(DeviceState* state,
       state->particle_count <= 300'000u ? kShortRangeDirectNeighborhoodThresholdLowN
                                         : kShortRangeDirectNeighborhoodThresholdDefault;
 
-  auto launch_kick = [&](auto group_size_tag) {
-    constexpr int group_size = decltype(group_size_tag)::value;
-    const int kick_blocks = static_cast<int>(
-        (state->particle_count * group_size + threads_per_block - 1) / threads_per_block);
-    kick_particles_global<group_size><<<kick_blocks,
-                                        threads_per_block,
-                                        0,
-                                        state->compute_stream>>>(
-        state->particles,
-        state->particle_count,
-        state->force_x,
-        state->force_y,
-        state->force_z,
-        state->nx,
-        state->ny,
-        state->nz,
-        state->domain_origin[0],
-        state->domain_origin[1],
-        state->domain_origin[2],
-        state->cell_size[0],
-        state->cell_size[1],
-        state->cell_size[2],
-        state->short_sorted_particle_indices,
-        state->non_source_indices,
-        source_count,
-        state->short_cell_start,
-        state->short_cell_end,
-        state->short_neighborhood_occupancy,
-        state->sorted_source_posm,
-        state->sorted_source_softening,
-        state->octant_moments_f4,
-        pyramid,
-        state->short_nx,
-        state->short_ny,
-        state->short_nz,
-        state->short_domain_origin[0],
-        state->short_domain_origin[1],
-        state->short_domain_origin[2],
-        state->short_cell_size[0],
-        state->short_cell_size[1],
-        state->short_cell_size[2],
-        state->short_cutoff_kpc,
-        state->short_pm_softening_kpc,
-        state->max_softening_kpc,
-        direct_neighborhood_threshold,
-        state->short_range_target_baryons_only ? 1 : 0,
-        state->galaxy_smbh_indices,
-        state->galaxy_count,
-        state->grav_const,
-        state->enable_smbh_post_newtonian ? 1 : 0,
-        state->max_accel_sq,
-        dt_fast_myr,
-        dt_slow_myr,
-        state->time_bins,
-        state->accel_mag);
-  };
-  switch (kick_group_size()) {
-    case 2:
-      launch_kick(std::integral_constant<int, 2>{});
-      break;
-    case 4:
-      launch_kick(std::integral_constant<int, 4>{});
-      break;
-    default:
-      launch_kick(std::integral_constant<int, 1>{});
-      break;
-  }
+  const int kick_blocks = static_cast<int>(
+      (state->particle_count + threads_per_block - 1) / threads_per_block);
+  kick_particles_global<<<kick_blocks, threads_per_block, 0, state->compute_stream>>>(
+      state->particles,
+    state->particle_count,
+    state->force_x,
+    state->force_y,
+    state->force_z,
+    state->nx,
+    state->ny,
+    state->nz,
+    state->domain_origin[0],
+    state->domain_origin[1],
+    state->domain_origin[2],
+    state->cell_size[0],
+    state->cell_size[1],
+    state->cell_size[2],
+    state->short_sorted_particle_indices,
+    state->non_source_indices,
+    source_count,
+    state->short_cell_start,
+    state->short_cell_end,
+    state->short_neighborhood_occupancy,
+    state->sorted_source_posm,
+    state->sorted_source_softening,
+    state->octant_moments_f4,
+    pyramid,
+    state->short_nx,
+    state->short_ny,
+    state->short_nz,
+    state->short_domain_origin[0],
+    state->short_domain_origin[1],
+    state->short_domain_origin[2],
+    state->short_cell_size[0],
+    state->short_cell_size[1],
+    state->short_cell_size[2],
+    state->short_cutoff_kpc,
+    state->short_pm_softening_kpc,
+    state->max_softening_kpc,
+    direct_neighborhood_threshold,
+    state->short_range_target_baryons_only ? 1 : 0,
+    state->galaxy_smbh_indices,
+    state->galaxy_count,
+    state->grav_const,
+    state->enable_smbh_post_newtonian ? 1 : 0,
+    state->max_accel_sq,
+    dt_fast_myr,
+    dt_slow_myr,
+    pending_fast_dt_myr,
+    pending_slow_dt_myr,
+    state->time_bins,
+    state->previous_time_bins,
+    state->accel_mag);
   cuda_status = cudaGetLastError();
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer, error_buffer_len, "global particle kick kernel failed", cuda_status);
@@ -3479,11 +3457,24 @@ int run_steps(DeviceState* state,
     if (finish_profile_stage("run_steps.build_force_state_open", stage_start) != 0) {
       return 1;
     }
+    // Fuse the previous advance's deferred closing half-kick into this
+    // opening kick: no drift separates them, so the force state is identical
+    // and the two launches collapse into one (K(a) then K(b) with the same
+    // acceleration equals K(a+b) up to rounding).
+    double pending_fast_dt_myr = 0.0;
+    double pending_slow_dt_myr = 0.0;
+    if (state->half_kick_pending) {
+      pending_fast_dt_myr = state->pending_fast_dt_myr;
+      pending_slow_dt_myr = state->pending_slow_dt_myr;
+      state->half_kick_pending = false;
+    }
     stage_start = std::chrono::steady_clock::now();
     if (apply_force_kick_from_state(state,
                                     threads_per_block,
                                     half_substep_dt_myr,
                                     use_bins ? substep_dt_myr : half_substep_dt_myr,
+                                    pending_fast_dt_myr,
+                                    pending_slow_dt_myr,
                                     error_buffer,
                                     error_buffer_len) != 0) {
       return 1;
@@ -3523,11 +3514,23 @@ int run_steps(DeviceState* state,
             : last_substep ? substep_dt_myr
                            : 2.0 * substep_dt_myr;
       }
+      if (last_substep) {
+        // Defer the closing half-kick: it fuses with the next advance's
+        // opening kick against this exact force state (which stays valid —
+        // nothing drifts between advances). External phase-space reads go
+        // through synchronize_pending_kick, so downloads stay exact.
+        state->pending_fast_dt_myr = kick_dt_myr;
+        state->pending_slow_dt_myr = slow_kick_dt_myr;
+        state->half_kick_pending = true;
+        continue;
+      }
       stage_start = std::chrono::steady_clock::now();
       if (apply_force_kick_from_state(state,
                                       threads_per_block,
                                       kick_dt_myr,
                                       slow_kick_dt_myr,
+                                      0.0,
+                                      0.0,
                                       error_buffer,
                                       error_buffer_len) != 0) {
         return 1;
@@ -3555,6 +3558,34 @@ int run_steps(DeviceState* state,
     state->pe_age = 0;
   }
   diagnostics->estimated_potential_energy = state->last_potential_energy;
+  return 0;
+}
+
+// Applies any deferred closing half-kick so external readers observe exact
+// (non-staggered) phase space. The force state is still valid whenever a kick
+// is pending — nothing drifts between advances — so this is exactly the
+// launch run_steps skipped, just performed early.
+int synchronize_pending_kick(DeviceState* state,
+                             char* error_buffer,
+                             const std::size_t error_buffer_len) {
+  if (!state->half_kick_pending) {
+    return 0;
+  }
+  if (!state->force_state_valid &&
+      build_force_state(state, error_buffer, error_buffer_len) != 0) {
+    return 1;
+  }
+  if (apply_force_kick_from_state(state,
+                                  256,
+                                  0.0,
+                                  0.0,
+                                  state->pending_fast_dt_myr,
+                                  state->pending_slow_dt_myr,
+                                  error_buffer,
+                                  error_buffer_len) != 0) {
+    return 1;
+  }
+  state->half_kick_pending = false;
   return 0;
 }
 
@@ -3664,6 +3695,7 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
 
   if (cudaMalloc(reinterpret_cast<void**>(&state->time_bins), params->particle_count) != cudaSuccess ||
       cudaMalloc(reinterpret_cast<void**>(&state->time_bins_scratch), params->particle_count) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&state->previous_time_bins), params->particle_count) != cudaSuccess ||
       cudaMalloc(reinterpret_cast<void**>(&state->accel_mag),
                  sizeof(float) * params->particle_count) != cudaSuccess ||
       cudaMalloc(reinterpret_cast<void**>(&state->accel_mag_scratch),
@@ -3673,6 +3705,7 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
     return 1;
   }
   if (cudaMemset(state->time_bins, 0, params->particle_count) != cudaSuccess ||
+      cudaMemset(state->previous_time_bins, 0, params->particle_count) != cudaSuccess ||
       cudaMemset(state->accel_mag, 0, sizeof(float) * params->particle_count) != cudaSuccess) {
     fill_error(error_buffer, error_buffer_len, "cudaMemset for time bins failed");
     destroy_state(state);
@@ -4109,6 +4142,18 @@ extern "C" int sim_cuda_copy_particles(void* handle,
   auto* state = static_cast<DeviceState*>(handle);
   if (particle_capacity < state->particle_count) {
     fill_error(error_buffer, error_buffer_len, "particle capacity smaller than simulation state");
+    return 1;
+  }
+  if (synchronize_pending_kick(state, error_buffer, error_buffer_len) != 0) {
+    return 1;
+  }
+  // The compute stream is non-blocking: the default-stream memcpy below does
+  // not order against it, so drain it (including the sync kick just queued)
+  // before reading the particle buffer.
+  const cudaError_t stream_sync_status = cudaStreamSynchronize(state->compute_stream);
+  if (stream_sync_status != cudaSuccess) {
+    fill_cuda_error(
+        error_buffer, error_buffer_len, "compute stream sync failed", stream_sync_status);
     return 1;
   }
 

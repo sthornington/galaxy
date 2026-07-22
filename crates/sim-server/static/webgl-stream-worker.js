@@ -262,8 +262,17 @@ function handlePacket(data) {
   } else {
     reportPacketError("bad magic");
   }
-  if (accepted && socket) {
+  if (!socket) {
+    return;
+  }
+  if (accepted) {
     socket.send("ready");
+  } else {
+    // A rejected packet must still answer the server's flow control or the
+    // stream freezes forever waiting for an ack. "resync" makes the server
+    // drop its delta reference and send a fresh keyframe.
+    referenceReady = false;
+    socket.send("resync");
   }
 }
 
