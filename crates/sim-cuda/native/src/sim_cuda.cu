@@ -1249,15 +1249,6 @@ std::uint32_t estimate_substeps_for_step(DeviceState* state,
                                          const double dt_myr,
                                          char* error_buffer,
                                          const std::size_t error_buffer_len) {
-  // Preserve the bin epoch the previous step's deferred half-kick was
-  // scheduled under; assign_time_bins below may reassign time_bins.
-  if (state->previous_time_bins != nullptr && state->time_bins != nullptr) {
-    cudaMemcpyAsync(state->previous_time_bins,
-                    state->time_bins,
-                    state->particle_count,
-                    cudaMemcpyDeviceToDevice,
-                    state->compute_stream);
-  }
   try {
     thrust::device_ptr<SimCudaParticle> begin(state->particles);
     thrust::device_ptr<SimCudaParticle> end = begin + state->particle_count;
@@ -1295,8 +1286,15 @@ std::uint32_t estimate_substeps_for_step(DeviceState* state,
         state->cfl_safety_factor * std::max(1.0e-4, integration_scale);
     const double max_accel_kpc_per_myr2 =
         std::sqrt(std::max(0.0, state->last_max_accel_sq)) * kKpcPerKmPerMyr * kKpcPerKmPerMyr;
+    // Velocities were read before the deferred closing half-kick was applied,
+    // so bound the missing a*dt_pending without consuming the pending kick
+    // (which would forfeit the fusion).
+    const double pending_speed_kms = state->half_kick_pending
+        ? std::sqrt(std::max(0.0, state->last_max_accel_sq)) * kKpcPerKmPerMyr *
+              std::max(state->pending_fast_dt_myr, state->pending_slow_dt_myr)
+        : 0.0;
     const double predicted_displacement =
-        max_speed_kms * dt_myr * kKpcPerKmPerMyr +
+        (max_speed_kms + pending_speed_kms) * dt_myr * kKpcPerKmPerMyr +
         0.5 * max_accel_kpc_per_myr2 * dt_myr * dt_myr;
     const double raw_substeps = predicted_displacement / std::max(allowed_displacement, 1.0e-6);
     std::uint32_t substeps = static_cast<std::uint32_t>(
@@ -3519,6 +3517,15 @@ int run_steps(DeviceState* state,
         // opening kick against this exact force state (which stays valid —
         // nothing drifts between advances). External phase-space reads go
         // through synchronize_pending_kick, so downloads stay exact.
+        // Snapshot the bin epoch HERE: the pending dts were scheduled under
+        // the current bins, and both consumption paths (the next advance's
+        // fused opening kick, after assign_time_bins reassigns, and an
+        // immediate synchronize-on-download) must select through this epoch.
+        cudaMemcpyAsync(state->previous_time_bins,
+                        state->time_bins,
+                        state->particle_count,
+                        cudaMemcpyDeviceToDevice,
+                        state->compute_stream);
         state->pending_fast_dt_myr = kick_dt_myr;
         state->pending_slow_dt_myr = slow_kick_dt_myr;
         state->half_kick_pending = true;

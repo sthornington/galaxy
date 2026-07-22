@@ -249,18 +249,18 @@ function acceptDelta(data) {
 }
 
 function handlePacket(data) {
+  let accepted = false;
   if (!(data instanceof ArrayBuffer) || data.byteLength < 8) {
     reportPacketError("short packet");
-    return;
-  }
-  const magic = new DataView(data).getUint32(0, true);
-  let accepted = false;
-  if (magic === PACKET_MAGIC) {
-    accepted = acceptKeyframe(data);
-  } else if (magic === DELTA_MAGIC) {
-    accepted = acceptDelta(data);
   } else {
-    reportPacketError("bad magic");
+    const magic = new DataView(data).getUint32(0, true);
+    if (magic === PACKET_MAGIC) {
+      accepted = acceptKeyframe(data);
+    } else if (magic === DELTA_MAGIC) {
+      accepted = acceptDelta(data);
+    } else {
+      reportPacketError("bad magic");
+    }
   }
   if (!socket) {
     return;

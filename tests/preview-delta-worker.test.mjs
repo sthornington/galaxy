@@ -129,4 +129,21 @@ test("delta worker preserves its decode chain while renderer buffers are exhaust
   const latestView = new DataView(latest);
   assert.equal(latestView.getFloat64(0, true), 7);
   assert.equal(latestView.getUint16(META_BYTES, true), 20_007);
+
+  // Every rejected packet must still answer flow control ("resync"), or the
+  // server waits for an ack forever and the stream freezes: a packet too
+  // short for a magic word, garbage with an unknown magic, and a delta whose
+  // base no longer matches after the forced resync.
+  const ackCountBefore = acknowledgements.length;
+  sockets[0].onmessage({ data: new ArrayBuffer(4) });
+  assert.equal(acknowledgements.at(-1), "resync", "short packet must request resync");
+  sockets[0].onmessage({ data: fullFrame(8, 9).slice(4) });
+  assert.equal(acknowledgements.at(-1), "resync", "bad magic must request resync");
+  sockets[0].onmessage({ data: deltaFrame(frames[0], frames[1]) });
+  assert.equal(acknowledgements.at(-1), "resync", "stale delta must request resync");
+  assert.equal(acknowledgements.length, ackCountBefore + 3);
+
+  // A fresh keyframe recovers the stream.
+  sockets[0].onmessage({ data: fullFrame(8, 10) });
+  assert.equal(acknowledgements.at(-1), "ready");
 });
