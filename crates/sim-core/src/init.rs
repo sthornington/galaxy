@@ -22,6 +22,7 @@ pub enum ParticleComponent {
     Disk,
     Bulge,
     Smbh,
+    Gas,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,7 +161,7 @@ pub fn generate_analytic_galaxy(
     let potential = GalaxyPotential {
         halo_mass_msun: galaxy.halo_mass_msun,
         halo_scale_radius_kpc: galaxy.halo_scale_radius_kpc,
-        disk_mass_msun: galaxy.disk_mass_msun,
+        disk_mass_msun: galaxy.disk_mass_msun + galaxy.gas_mass_msun,
         disk_scale_radius_kpc: galaxy.disk_scale_radius_kpc,
         disk_scale_height_kpc: galaxy.disk_scale_height_kpc,
         bulge_mass_msun: galaxy.bulge_mass_msun,
@@ -188,6 +189,7 @@ pub fn generate_analytic_galaxy(
         &mut particles,
         rng,
         galaxy_index,
+        ParticleComponent::Disk,
         galaxy.disk_particle_count,
         galaxy.disk_mass_msun,
         galaxy.disk_scale_radius_kpc,
@@ -213,6 +215,39 @@ pub fn generate_analytic_galaxy(
         bulk_velocity,
         &equilibrium,
     )?;
+
+    if galaxy.gas_particle_count > 0 {
+        // The gas disk samples through the same Jeans machinery as the
+        // stellar disk (its mass is folded into the potential's disk term
+        // above); pressure support arrives with the SPH solver, so the MVP
+        // kinematics are simply a colder, more extended disk.
+        let gas_scale_radius_kpc = if galaxy.gas_scale_radius_kpc > 0.0 {
+            galaxy.gas_scale_radius_kpc
+        } else {
+            2.0 * galaxy.disk_scale_radius_kpc
+        };
+        let gas_scale_height_kpc = if galaxy.gas_scale_height_kpc > 0.0 {
+            galaxy.gas_scale_height_kpc
+        } else {
+            0.5 * galaxy.disk_scale_height_kpc
+        };
+        extend_exponential_disk(
+            &mut particles,
+            rng,
+            galaxy_index,
+            ParticleComponent::Gas,
+            galaxy.gas_particle_count,
+            galaxy.gas_mass_msun,
+            gas_scale_radius_kpc,
+            gas_scale_height_kpc,
+            config.gravity.disk_softening_kpc,
+            galaxy.color_rgba,
+            origin,
+            bulk_velocity,
+            rotation,
+            &equilibrium,
+        )?;
+    }
 
     particles.push(Particle {
         galaxy_index,
@@ -462,6 +497,7 @@ fn extend_exponential_disk(
     particles: &mut Vec<Particle>,
     rng: &mut SmallRng,
     galaxy_index: u32,
+    component: ParticleComponent,
     count: u32,
     total_mass_msun: f64,
     scale_radius_kpc: f64,
@@ -546,7 +582,7 @@ fn extend_exponential_disk(
 
         particles.push(Particle {
             galaxy_index,
-            component: ParticleComponent::Disk,
+            component,
             position_kpc: position,
             velocity_kms: velocity,
             mass_msun: particle_mass,
@@ -1157,6 +1193,7 @@ pub fn validate_particle_count(config: &SimulationConfig) -> anyhow::Result<u64>
         total += u64::from(galaxy.halo_particle_count)
             + u64::from(galaxy.disk_particle_count)
             + u64::from(galaxy.bulge_particle_count)
+            + u64::from(galaxy.gas_particle_count)
             + 1;
     }
     if total == 0 {
@@ -1167,6 +1204,23 @@ pub fn validate_particle_count(config: &SimulationConfig) -> anyhow::Result<u64>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gas_disk_generates_tagged_particles() {
+        let preset = crate::built_in_presets()
+            .into_iter()
+            .find(|preset| preset.id == "smbh-playground")
+            .expect("smbh-playground preset exists");
+        let host = &preset.config.galaxies[0];
+        assert_eq!(host.gas_particle_count, 350_000);
+        let ics = crate::InitialConditions::generate(&preset.config, 3).expect("ICs generate");
+        let gas = ics
+            .particles
+            .iter()
+            .filter(|particle| matches!(particle.component, super::ParticleComponent::Gas))
+            .count();
+        assert_eq!(gas, 350_000, "gas disk must generate exactly the configured particle count");
+    }
+
     use rand::SeedableRng;
     use rand::rngs::SmallRng;
 

@@ -204,6 +204,10 @@ fn major_merger() -> MergerPreset {
         bulge_mass_msun: 3.6e10,
         bulge_scale_radius_kpc: 0.55,
         bulge_particle_count: 64_000,
+        gas_mass_msun: 0.0,
+        gas_scale_radius_kpc: 0.0,
+        gas_scale_height_kpc: 0.0,
+        gas_particle_count: 0,
         smbh: SmbhConfig {
             mass_msun: 1.0e7,
             softening_kpc: 0.002,
@@ -228,6 +232,10 @@ fn major_merger() -> MergerPreset {
         bulge_mass_msun: 3.0e10,
         bulge_scale_radius_kpc: 0.5,
         bulge_particle_count: 56_000,
+        gas_mass_msun: 0.0,
+        gas_scale_radius_kpc: 0.0,
+        gas_scale_height_kpc: 0.0,
+        gas_particle_count: 0,
         smbh: SmbhConfig {
             mass_msun: 8.5e6,
             softening_kpc: 0.002,
@@ -371,6 +379,10 @@ fn smbh_playground() -> MergerPreset {
         bulge_mass_msun: 0.0,
         bulge_scale_radius_kpc: 0.5,
         bulge_particle_count: 0,
+        gas_mass_msun: 0.0,
+        gas_scale_radius_kpc: 0.0,
+        gas_scale_height_kpc: 0.0,
+        gas_particle_count: 0,
         // CFL keys on the fastest particle: stars bound at the SMBH softening
         // radius set v_max for the whole system, so each marauder's softening
         // scales with its mass to keep the peak bound-star speed ~450 km/s.
@@ -407,6 +419,11 @@ fn smbh_playground() -> MergerPreset {
         host.halo_particle_count = 600_000;
         host.smbh.mass_msun = 5.0e7;
         host.smbh.softening_kpc = 0.02;
+        // Cold gas disk: ~12% of the stellar disk mass, twice its scale
+        // radius (defaults), rendered as a distinct fluid layer. Gravity-only
+        // until the SPH solver lands.
+        host.gas_mass_msun = 1.6e10;
+        host.gas_particle_count = 350_000;
     }
     // Plunging orbits: velocities are mostly radial-inward (well below the
     // ~210 km/s circular speed) with just enough tangential motion to swing
@@ -500,6 +517,10 @@ fn uniform_sphere_collapse() -> MergerPreset {
                 bulge_mass_msun: 3.25e11,
                 bulge_scale_radius_kpc: 1.0,
                 bulge_particle_count: 120_000,
+        gas_mass_msun: 0.0,
+        gas_scale_radius_kpc: 0.0,
+        gas_scale_height_kpc: 0.0,
+        gas_particle_count: 0,
                 smbh: SmbhConfig {
                     mass_msun: 0.0,
                     softening_kpc: 0.01,
@@ -542,6 +563,10 @@ fn triple_sphere_orbit_debug() -> MergerPreset {
         bulge_mass_msun: stellar_mass_msun,
         bulge_scale_radius_kpc: 0.9,
         bulge_particle_count: 80_000,
+        gas_mass_msun: 0.0,
+        gas_scale_radius_kpc: 0.0,
+        gas_scale_height_kpc: 0.0,
+        gas_particle_count: 0,
         smbh: SmbhConfig {
             mass_msun: smbh_mass_msun,
             softening_kpc: 0.002,

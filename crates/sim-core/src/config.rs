@@ -75,6 +75,17 @@ pub struct GalaxyConfig {
     pub bulge_mass_msun: f64,
     pub bulge_scale_radius_kpc: f64,
     pub bulge_particle_count: u32,
+    /// Cold gas disk (SPH-bound; gravity-only until the hydro solver lands).
+    /// Zero mass/count means no gas; scale radius/height of zero default to
+    /// 2x the stellar disk radius and half its height.
+    #[serde(default)]
+    pub gas_mass_msun: f64,
+    #[serde(default)]
+    pub gas_scale_radius_kpc: f64,
+    #[serde(default)]
+    pub gas_scale_height_kpc: f64,
+    #[serde(default)]
+    pub gas_particle_count: u32,
     pub smbh: SmbhConfig,
     pub position_kpc: [f64; 3],
     pub velocity_kms: [f64; 3],

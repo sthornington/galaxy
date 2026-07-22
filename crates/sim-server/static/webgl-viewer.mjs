@@ -119,7 +119,10 @@ void main() {
   float h = fract(sin(float(gl_VertexID) * 12.9898) * 43758.5453);
   float h2 = fract(h * 61.803398875);
   vec3 base;
-  if (a_component == 2u) {
+  if (a_component == 4u) {
+    // Gas: cool teal-cyan fluid, hue drifting with the per-particle hash.
+    base = mix(vec3(0.30, 0.80, 0.72), vec3(0.50, 0.92, 1.05), h);
+  } else if (a_component == 2u) {
     // Bulge: old stars — K/M giants, warm gold through deep orange.
     base = mix(vec3(1.0, 0.70, 0.42), vec3(1.0, 0.88, 0.70),
                clamp(0.2 + 0.55 * h + 0.15 * massBias, 0.0, 1.0));
@@ -133,7 +136,10 @@ void main() {
   vec3 color = dopplerShift(base, dot(velocity, u_forward)) * (0.82 + 0.36 * h2);
 
   float perspective = clamp((u_pointScale / clip.w) * 0.18, 0.02, 3.5);
-  if (u_style > 0.5) {
+  // Gas is a fluid: always the soft-glow path (even in dots mode) with a
+  // broader footprint so it reads as a continuous medium between the stars.
+  float gasBoost = a_component == 4u ? 1.6 : 1.0;
+  if (u_style > 0.5 && a_component != 4u) {
     // Crisp dots: tiny fixed-ish footprint (near-zero fill cost), mild
     // distance attenuation, energy carried by the dot itself.
     gl_PointSize = clamp((1.7 + 1.3 * renderLuminosity) * pow(perspective, 0.35) * u_sizeBoost,
@@ -141,7 +147,7 @@ void main() {
     v_color = color * (0.05 + 0.11 * renderLuminosity);
     return;
   }
-  float size = 2.6 * renderLuminosity * pow(perspective, 0.9) * u_sizeBoost;
+  float size = 2.6 * gasBoost * renderLuminosity * pow(perspective, 0.9) * u_sizeBoost;
   gl_PointSize = clamp(size, 1.25, 48.0);
 
   // Fold the per-splat energy into the color (additive accumulation); divide

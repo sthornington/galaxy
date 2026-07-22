@@ -435,6 +435,7 @@ fn ffi_particle_from_particle(particle: &Particle) -> FfiParticle {
             ParticleComponent::Disk => 1,
             ParticleComponent::Bulge => 2,
             ParticleComponent::Smbh => 3,
+            ParticleComponent::Gas => 4,
         },
         color_rgba: particle.color_rgba,
     }
@@ -464,6 +465,7 @@ fn particle_from_ffi(particle: FfiParticle) -> Particle {
             1 => ParticleComponent::Disk,
             2 => ParticleComponent::Bulge,
             3 => ParticleComponent::Smbh,
+            4 => ParticleComponent::Gas,
             _ => ParticleComponent::Halo,
         },
         position_kpc: Vec3::new(

@@ -139,7 +139,10 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
   let h = fract(sin(f32(particle) * 12.9898) * 43758.5453);
   let h2 = fract(h * 61.803398875);
   var base: vec3f;
-  if (component == 2u) {
+  if (component == 4u) {
+    // Gas: cool teal-cyan fluid, hue drifting with the per-particle hash.
+    base = mix(vec3f(0.30, 0.80, 0.72), vec3f(0.50, 0.92, 1.05), h);
+  } else if (component == 2u) {
     base = mix(vec3f(1.0, 0.70, 0.42), vec3f(1.0, 0.88, 0.70),
                clamp(0.2 + 0.55 * h + 0.15 * massBias, 0.0, 1.0));
   } else {
@@ -158,12 +161,13 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
     marker = 1.0;
     size = clamp(18.0 * u.sizeBoost, 12.0, 40.0);
     splatColor = vec3f(0.45, 1.15, 1.55) * 7.0;
-  } else if (u.style > 0.5) {
+  } else if (u.style > 0.5 && component != 4u) {
     size = clamp((1.7 + 1.3 * renderLuminosity) * pow(perspective, 0.35) * u.sizeBoost,
                  1.5, 6.0);
     splatColor = color * (0.05 + 0.11 * renderLuminosity);
   } else {
-    size = clamp(2.6 * renderLuminosity * pow(perspective, 0.9) * u.sizeBoost, 1.25, 48.0);
+    let gasBoost = select(1.0, 1.6, component == 4u);
+    size = clamp(2.6 * gasBoost * renderLuminosity * pow(perspective, 0.9) * u.sizeBoost, 1.25, 48.0);
     let alpha = 0.055 * renderLuminosity * pow(perspective, 0.92);
     let area = size * size;
     splatColor = color * clamp(alpha * 52.0 / area, 0.0006, 0.35);
