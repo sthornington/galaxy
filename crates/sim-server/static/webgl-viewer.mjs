@@ -963,7 +963,7 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
   }
 
   try {
-    worker = new Worker("/webgl-stream-worker.js");
+    worker = new Worker("/webgl-stream-worker.js?v=20260715-23");
     worker.onmessage = (event) => {
       if (state.disposed) {
         return;
@@ -994,7 +994,7 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
         dispatchEvent("galaxy-viewer-error");
       }
     };
-    worker.postMessage({ kind: "connect", url: frameUrl });
+    worker.postMessage({ kind: "connect", url: `${frameUrl}?delta=1` });
   } catch (error) {
     console.warn("frame stream worker unavailable; using inline socket", error);
     worker = null;
