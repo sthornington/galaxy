@@ -12,6 +12,29 @@ pub struct SimulationConfig {
     pub initial_separation_kpc: f64,
     pub initial_relative_velocity_kms: f64,
     pub output_directory: String,
+    /// Hydrodynamics parameters for gas particles (isothermal SPH).
+    #[serde(default)]
+    pub gas: GasConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GasConfig {
+    /// Isothermal sound speed; P = cs^2 * rho. ~10 km/s matches the warm ISM.
+    pub sound_speed_kms: f64,
+    /// Monaghan artificial-viscosity alpha (beta is fixed at 2*alpha).
+    pub viscosity_alpha: f64,
+    /// Smoothing-length coefficient: h = eta * (m / rho)^(1/3).
+    pub smoothing_eta: f64,
+}
+
+impl Default for GasConfig {
+    fn default() -> Self {
+        Self {
+            sound_speed_kms: 10.0,
+            viscosity_alpha: 1.0,
+            smoothing_eta: 1.3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

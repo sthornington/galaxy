@@ -1211,14 +1211,14 @@ mod tests {
             .find(|preset| preset.id == "smbh-playground")
             .expect("smbh-playground preset exists");
         let host = &preset.config.galaxies[0];
-        assert_eq!(host.gas_particle_count, 350_000);
+        assert_eq!(host.gas_particle_count, 700_000);
         let ics = crate::InitialConditions::generate(&preset.config, 3).expect("ICs generate");
         let gas = ics
             .particles
             .iter()
             .filter(|particle| matches!(particle.component, super::ParticleComponent::Gas))
             .count();
-        assert_eq!(gas, 350_000, "gas disk must generate exactly the configured particle count");
+        assert_eq!(gas, 700_000, "gas disk must generate exactly the configured particle count");
     }
 
     use rand::SeedableRng;

@@ -1,6 +1,7 @@
 use crate::config::{
-    GalaxyConfig, GalaxyInitialProfile, GravityConfig, ObserverEffectsConfig, PreviewConfig,
-    RelativityConfig, SimulationConfig, SmbhConfig, SnapshotConfig, TimeIntegrationConfig,
+    GalaxyConfig, GalaxyInitialProfile, GasConfig, GravityConfig, ObserverEffectsConfig,
+    PreviewConfig, RelativityConfig, SimulationConfig, SmbhConfig, SnapshotConfig,
+    TimeIntegrationConfig,
 };
 use crate::math::GRAV_CONST_KPC_KMS2_PER_MSUN;
 
@@ -246,6 +247,13 @@ fn major_merger() -> MergerPreset {
         disk_tilt_deg: [-35.0, 70.0, 18.0],
         color_rgba: [0.45, 0.76, 1.0, 1.0],
     };
+    // Gas-rich late-type disks: ~15% of the stellar disk mass in cold gas at
+    // twice the stellar scale radius (sampler defaults). Every preset cloned
+    // from this pair inherits the gas unless it overrides the counts.
+    primary.gas_mass_msun = 2.0e10;
+    primary.gas_particle_count = 160_000;
+    secondary.gas_mass_msun = 1.8e10;
+    secondary.gas_particle_count = 140_000;
     let relative_speed =
         set_direct_infall_pair_orbit(&mut primary, &mut secondary, 24.0, 0.28, 0.16);
 
@@ -263,6 +271,7 @@ fn major_merger() -> MergerPreset {
             initial_separation_kpc: 24.0,
             initial_relative_velocity_kms: relative_speed,
             output_directory: "output/major-merger".to_string(),
+            gas: GasConfig::default(),
             galaxies: vec![primary, secondary],
         },
     }
@@ -336,7 +345,9 @@ fn grand_merger() -> MergerPreset {
         secondary.halo_particle_count = 750_000;
         secondary.disk_particle_count = 950_000;
         secondary.bulge_particle_count = 190_000;
+        secondary.gas_particle_count = 300_000;
     }
+    config.galaxies[0].gas_particle_count = 350_000;
     config.initial_separation_kpc = 60.0;
     let (primary, secondary) = config.galaxies.split_at_mut(1);
     config.initial_relative_velocity_kms =
@@ -422,8 +433,8 @@ fn smbh_playground() -> MergerPreset {
         // Cold gas disk: ~12% of the stellar disk mass, twice its scale
         // radius (defaults), rendered as a distinct fluid layer. Gravity-only
         // until the SPH solver lands.
-        host.gas_mass_msun = 1.6e10;
-        host.gas_particle_count = 350_000;
+        host.gas_mass_msun = 2.6e10;
+        host.gas_particle_count = 700_000;
     }
     // Plunging orbits: velocities are mostly radial-inward (well below the
     // ~210 km/s circular speed) with just enough tangential motion to swing
@@ -499,6 +510,7 @@ fn uniform_sphere_collapse() -> MergerPreset {
             initial_separation_kpc: 0.0,
             initial_relative_velocity_kms: 0.0,
             output_directory: "output/uniform-sphere-collapse".to_string(),
+            gas: GasConfig::default(),
             galaxies: vec![GalaxyConfig {
                 label: "Cold Sphere".to_string(),
                 equilibrium_snapshot: None,
@@ -609,6 +621,7 @@ fn triple_sphere_orbit_debug() -> MergerPreset {
             initial_separation_kpc: orbital_radius_kpc * 2.0,
             initial_relative_velocity_kms: orbital_speed,
             output_directory: "output/triple-sphere-orbit-debug".to_string(),
+            gas: GasConfig::default(),
             galaxies,
         },
     }
@@ -623,9 +636,11 @@ fn major_merger_debug() -> MergerPreset {
     config.galaxies[0].halo_particle_count = 80_000;
     config.galaxies[0].disk_particle_count = 32_000;
     config.galaxies[0].bulge_particle_count = 6_400;
+    config.galaxies[0].gas_particle_count = 16_000;
     config.galaxies[1].halo_particle_count = 72_000;
     config.galaxies[1].disk_particle_count = 28_000;
     config.galaxies[1].bulge_particle_count = 5_600;
+    config.galaxies[1].gas_particle_count = 14_000;
 
     MergerPreset {
         id: "major-merger-debug",
@@ -667,6 +682,8 @@ fn minor_merger() -> MergerPreset {
     config.galaxies[1].disk_particle_count = 360_000;
     config.galaxies[1].bulge_mass_msun = 7.5e9;
     config.galaxies[1].bulge_particle_count = 48_000;
+    config.galaxies[1].gas_mass_msun = 8.0e9;
+    config.galaxies[1].gas_particle_count = 64_000;
     config.galaxies[1].smbh.mass_msun = 3.0e6;
     config.galaxies[1].color_rgba = [0.59, 1.0, 0.74, 1.0];
     let (primary, secondary) = config.galaxies.split_at_mut(1);

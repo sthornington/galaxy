@@ -7,7 +7,7 @@ pub mod snapshot;
 
 pub use config::{
     GalaxyConfig, GalaxyInitialProfile, GravityConfig, ObserverEffectsConfig, PreviewConfig,
-    RelativityConfig, SimulationConfig, SmbhConfig, SnapshotConfig, TimeIntegrationConfig,
+    RelativityConfig, SimulationConfig, SmbhConfig, SnapshotConfig, TimeIntegrationConfig, GasConfig,
 };
 pub use init::{
     InitialConditionError, InitialConditions, Particle, ParticleComponent, generate_analytic_galaxy,

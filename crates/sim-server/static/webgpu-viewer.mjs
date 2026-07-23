@@ -132,7 +132,7 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
 
   let massQ = f32(rc.w & 0xFFFFu) / 65535.0;
   let logMass = (u.massLog.x + massQ * u.massLog.y) * 0.3010299957;
-  let luminosity = clamp((logMass - 3.7) / 2.2, 0.25, 1.8);
+  let luminosity = select(clamp((logMass - 3.7) / 2.2, 0.25, 1.8), 1.0, component == 4u);
   let renderLuminosity = pow(luminosity, 0.58);
   let massBias = clamp((logMass - 4.2) / 1.6, 0.0, 1.0);
 

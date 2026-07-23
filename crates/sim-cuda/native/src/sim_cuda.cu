@@ -259,6 +259,30 @@ struct DeviceState {
   // with a doubled dt. Assigned per base step from each particle's velocity
   // and last kick acceleration; permuted alongside the particle array.
   std::uint8_t* time_bins = nullptr;
+  // --- Isothermal SPH state (allocated only when gas particles exist) ---
+  double gas_sound_speed_kms = 0.0;
+  double gas_viscosity_alpha = 1.0;
+  double gas_smoothing_eta = 1.3;
+  std::uint32_t gas_count = 0;
+  // Per-particle smoothing length (meaningful for gas only); permuted with
+  // the particle array on every traversal-order compaction.
+  float* smoothing_h = nullptr;
+  float* smoothing_h_scratch = nullptr;
+  int* gas_indices = nullptr;          // canonical index of each gas particle
+  int* gas_cell_ids = nullptr;
+  int* gas_sorted_canonical = nullptr; // canonical index per sorted gas slot
+  int* gas_cell_start = nullptr;
+  int* gas_cell_end = nullptr;
+  std::size_t gas_cell_capacity = 0;
+  float4* gas_posh_sorted = nullptr;   // xyz rel gas-grid origin, w = h
+  float4* gas_velm_sorted = nullptr;   // xyz velocity, w = mass
+  float* gas_density_sorted = nullptr;
+  float4* gas_accel = nullptr;         // canonical-indexed, (km/s)^2/kpc
+  int gas_nx = 0;
+  int gas_ny = 0;
+  int gas_nz = 0;
+  double gas_grid_origin[3] = {0.0, 0.0, 0.0};
+  double gas_grid_cell_kpc = 0.0;
   // Snapshot of time_bins as of the previous step's kicks; the fused opening
   // kick reads the deferred (pending) dt through these so a particle that
   // switches bins between steps still receives exactly the kick schedule it
@@ -468,6 +492,17 @@ void destroy_state(DeviceState* state) {
   cudaFree(state->time_bins_scratch);
   cudaFree(state->time_bins);
   cudaFree(state->previous_time_bins);
+  cudaFree(state->smoothing_h);
+  cudaFree(state->smoothing_h_scratch);
+  cudaFree(state->gas_indices);
+  cudaFree(state->gas_cell_ids);
+  cudaFree(state->gas_sorted_canonical);
+  cudaFree(state->gas_cell_start);
+  cudaFree(state->gas_cell_end);
+  cudaFree(state->gas_posh_sorted);
+  cudaFree(state->gas_velm_sorted);
+  cudaFree(state->gas_density_sorted);
+  cudaFree(state->gas_accel);
   cudaFree(state->inverse_index);
   cudaFree(state->particles_scratch);
   cudaFree(state->particles);
@@ -1896,6 +1931,7 @@ __device__ __forceinline__ int traversal_particle_index(
 __global__ void gather_particles_traversal_order(const SimCudaParticle* __restrict__ in,
                                                  const std::uint8_t* __restrict__ bins_in,
                                                  const float* __restrict__ accel_in,
+                                                 const float* __restrict__ smoothing_in,
                                                  const int* __restrict__ sorted_particle_indices,
                                                  const std::uint32_t source_count,
                                                  const int* __restrict__ non_source_indices,
@@ -1903,6 +1939,7 @@ __global__ void gather_particles_traversal_order(const SimCudaParticle* __restri
                                                  SimCudaParticle* __restrict__ out,
                                                  std::uint8_t* __restrict__ bins_out,
                                                  float* __restrict__ accel_out,
+                                                 float* __restrict__ smoothing_out,
                                                  int* __restrict__ inverse_index) {
   const std::uint64_t slot =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1914,6 +1951,7 @@ __global__ void gather_particles_traversal_order(const SimCudaParticle* __restri
   out[slot] = in[old_index];
   bins_out[slot] = bins_in[old_index];
   accel_out[slot] = accel_in[old_index];
+  smoothing_out[slot] = smoothing_in[old_index];
   inverse_index[old_index] = static_cast<int>(slot);
 }
 
@@ -2149,6 +2187,7 @@ __global__ void __launch_bounds__(256, 3) kick_particles_global(
                                       const double pending_slow_dt_myr,
                                       const std::uint8_t* __restrict__ time_bins,
                                       const std::uint8_t* __restrict__ previous_time_bins,
+                                      const float4* __restrict__ gas_hydro_accel,
                                       float* __restrict__ accel_mag_out) {
   const std::uint64_t thread_slot =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -2454,6 +2493,13 @@ __global__ void __launch_bounds__(256, 3) kick_particles_global(
     if (enable_smbh_post_newtonian != 0 && particle_component == 3u) {
       add_smbh_1pn_acceleration(ax, ay, az, particle, source, grav_const);
     }
+  }
+
+  if (gas_hydro_accel != nullptr && particle_component == 4u) {
+    const float4 hydro = gas_hydro_accel[index];
+    ax += static_cast<double>(hydro.x);
+    ay += static_cast<double>(hydro.y);
+    az += static_cast<double>(hydro.z);
   }
 
   const double accel_sq = ax * ax + ay * ay + az * az;
@@ -3002,6 +3048,7 @@ int build_short_range_structure(DeviceState* state,
         state->particles,
         state->time_bins,
         state->accel_mag,
+        state->smoothing_h,
         state->short_sorted_particle_indices,
         state->short_source_particle_count,
         state->non_source_indices,
@@ -3009,6 +3056,7 @@ int build_short_range_structure(DeviceState* state,
         state->particles_scratch,
         state->time_bins_scratch,
         state->accel_mag_scratch,
+        state->smoothing_h_scratch,
         state->inverse_index);
     cuda_status = cudaGetLastError();
     if (cuda_status != cudaSuccess) {
@@ -3018,6 +3066,7 @@ int build_short_range_structure(DeviceState* state,
     std::swap(state->particles, state->particles_scratch);
     std::swap(state->time_bins, state->time_bins_scratch);
     std::swap(state->accel_mag, state->accel_mag_scratch);
+    std::swap(state->smoothing_h, state->smoothing_h_scratch);
 
     if (state->galaxy_count > 0) {
       const int smbh_blocks =
@@ -3220,6 +3269,424 @@ int build_short_range_structure(DeviceState* state,
   return 0;
 }
 
+
+// ---------------------------------------------------------------------------
+// Isothermal SPH: cubic-spline kernel, gather density with rate-limited
+// adaptive smoothing lengths, and symmetric pressure + Monaghan viscosity
+// forces. Gas neighbors come from a dedicated cell grid over the baryon box
+// (cells sized so max(h_i, h_j) always fits the 27-cell neighborhood). With
+// masses in Msun, distances in kpc, and cs in km/s, accelerations land
+// directly in the kick's (km/s)^2/kpc convention.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ float sph_kernel_w(const float r, const float h) {
+  const float q = r / h;
+  if (q >= 1.0f) {
+    return 0.0f;
+  }
+  const float sigma = 2.5464791f / (h * h * h);  // 8 / pi
+  if (q <= 0.5f) {
+    return sigma * (1.0f - 6.0f * q * q + 6.0f * q * q * q);
+  }
+  const float t = 1.0f - q;
+  return sigma * 2.0f * t * t * t;
+}
+
+__device__ __forceinline__ float sph_kernel_dwdr(const float r, const float h) {
+  const float q = r / h;
+  if (q >= 1.0f) {
+    return 0.0f;
+  }
+  const float sigma_h = 2.5464791f / (h * h * h * h);
+  if (q <= 0.5f) {
+    return sigma_h * (-12.0f * q + 18.0f * q * q);
+  }
+  const float t = 1.0f - q;
+  return -6.0f * sigma_h * t * t;
+}
+
+__global__ void compute_gas_cells(const SimCudaParticle* __restrict__ particles,
+                                  const int* __restrict__ gas_indices,
+                                  const std::uint32_t gas_count,
+                                  const double origin_x,
+                                  const double origin_y,
+                                  const double origin_z,
+                                  const double cell_kpc,
+                                  const int nx,
+                                  const int ny,
+                                  const int nz,
+                                  int* __restrict__ cell_ids,
+                                  int* __restrict__ sorted_canonical_seed) {
+  const std::uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g >= gas_count) {
+    return;
+  }
+  const int canonical = gas_indices[g];
+  const SimCudaParticle& particle = particles[canonical];
+  // Escapers clamp to border cells: their densities are negligible there and
+  // the clamp keeps every particle inside the range structure.
+  const int ix = min(nx - 1, max(0, static_cast<int>(floor((particle.position_kpc[0] - origin_x) / cell_kpc))));
+  const int iy = min(ny - 1, max(0, static_cast<int>(floor((particle.position_kpc[1] - origin_y) / cell_kpc))));
+  const int iz = min(nz - 1, max(0, static_cast<int>(floor((particle.position_kpc[2] - origin_z) / cell_kpc))));
+  cell_ids[g] = (ix * ny + iy) * nz + iz;
+  sorted_canonical_seed[g] = canonical;
+}
+
+__global__ void build_gas_cell_ranges(const int* __restrict__ sorted_cell_ids,
+                                      const std::uint32_t gas_count,
+                                      const int cell_count,
+                                      int* __restrict__ cell_start,
+                                      int* __restrict__ cell_end) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= gas_count) {
+    return;
+  }
+  const int cell_id = sorted_cell_ids[i];
+  if (cell_id < 0 || cell_id >= cell_count) {
+    return;
+  }
+  if (i == 0 || sorted_cell_ids[i - 1] != cell_id) {
+    cell_start[cell_id] = static_cast<int>(i);
+  }
+  if (i + 1 == gas_count || sorted_cell_ids[i + 1] != cell_id) {
+    cell_end[cell_id] = static_cast<int>(i + 1);
+  }
+}
+
+__global__ void gather_gas_sorted(const SimCudaParticle* __restrict__ particles,
+                                  const float* __restrict__ smoothing_h,
+                                  const int* __restrict__ sorted_canonical,
+                                  const std::uint32_t gas_count,
+                                  const double origin_x,
+                                  const double origin_y,
+                                  const double origin_z,
+                                  float4* __restrict__ posh_out,
+                                  float4* __restrict__ velm_out) {
+  const std::uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g >= gas_count) {
+    return;
+  }
+  const int canonical = sorted_canonical[g];
+  const SimCudaParticle& particle = particles[canonical];
+  posh_out[g] = make_float4(static_cast<float>(particle.position_kpc[0] - origin_x),
+                            static_cast<float>(particle.position_kpc[1] - origin_y),
+                            static_cast<float>(particle.position_kpc[2] - origin_z),
+                            smoothing_h[canonical]);
+  velm_out[g] = make_float4(static_cast<float>(particle.velocity_kms[0]),
+                            static_cast<float>(particle.velocity_kms[1]),
+                            static_cast<float>(particle.velocity_kms[2]),
+                            static_cast<float>(particle.mass_msun));
+}
+
+__global__ void gas_density_kernel(const float4* __restrict__ posh,
+                                   const float4* __restrict__ velm,
+                                   const int* __restrict__ sorted_canonical,
+                                   const std::uint32_t gas_count,
+                                   const int* __restrict__ cell_start,
+                                   const int* __restrict__ cell_end,
+                                   const double cell_kpc,
+                                   const int nx,
+                                   const int ny,
+                                   const int nz,
+                                   const float smoothing_eta,
+                                   float* __restrict__ density_out,
+                                   float* __restrict__ smoothing_h_canonical) {
+  const std::uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g >= gas_count) {
+    return;
+  }
+  const float4 self = posh[g];
+  const float h_i = self.w;
+  const float cell_f = static_cast<float>(cell_kpc);
+  const int ix = min(nx - 1, max(0, static_cast<int>(floorf(self.x / cell_f))));
+  const int iy = min(ny - 1, max(0, static_cast<int>(floorf(self.y / cell_f))));
+  const int iz = min(nz - 1, max(0, static_cast<int>(floorf(self.z / cell_f))));
+
+  float rho = 0.0f;
+  for (int cx = max(0, ix - 1); cx <= min(nx - 1, ix + 1); ++cx) {
+    for (int cy = max(0, iy - 1); cy <= min(ny - 1, iy + 1); ++cy) {
+      for (int cz = max(0, iz - 1); cz <= min(nz - 1, iz + 1); ++cz) {
+        const int cell = (cx * ny + cy) * nz + cz;
+        const int start = cell_start[cell];
+        if (start < 0) {
+          continue;
+        }
+        const int end = cell_end[cell];
+        for (int j = start; j < end; ++j) {
+          const float4 other = posh[j];
+          const float dx = other.x - self.x;
+          const float dy = other.y - self.y;
+          const float dz = other.z - self.z;
+          const float r = sqrtf(dx * dx + dy * dy + dz * dz);
+          rho += velm[j].w * sph_kernel_w(r, h_i);
+        }
+      }
+    }
+  }
+  rho = fmaxf(rho, 1.0e-12f);
+  density_out[g] = rho;
+
+  // Predictor update for the next build: h -> eta*(m/rho)^(1/3), rate-limited
+  // so a noisy first estimate cannot slew the neighborhood violently, and
+  // clamped so max(h_i, h_j) always fits the 27-cell search (cell >= 2h_max).
+  const float mass = velm[g].w;
+  float h_new = smoothing_eta * cbrtf(mass / rho);
+  h_new = fminf(fmaxf(h_new, 0.8f * h_i), 1.25f * h_i);
+  h_new = fminf(fmaxf(h_new, 0.02f), 0.45f);
+  smoothing_h_canonical[sorted_canonical[g]] = h_new;
+}
+
+__global__ void gas_force_kernel(const float4* __restrict__ posh,
+                                 const float4* __restrict__ velm,
+                                 const float* __restrict__ density,
+                                 const int* __restrict__ sorted_canonical,
+                                 const std::uint32_t gas_count,
+                                 const int* __restrict__ cell_start,
+                                 const int* __restrict__ cell_end,
+                                 const double cell_kpc,
+                                 const int nx,
+                                 const int ny,
+                                 const int nz,
+                                 const float sound_speed_kms,
+                                 const float viscosity_alpha,
+                                 float4* __restrict__ gas_accel_canonical) {
+  const std::uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g >= gas_count) {
+    return;
+  }
+  const float4 self = posh[g];
+  const float4 self_vel = velm[g];
+  const float h_i = self.w;
+  const float rho_i = density[g];
+  const float cs = sound_speed_kms;
+  const float cs2_over_rho_i = cs * cs / rho_i;
+  const float cell_f = static_cast<float>(cell_kpc);
+  const int ix = min(nx - 1, max(0, static_cast<int>(floorf(self.x / cell_f))));
+  const int iy = min(ny - 1, max(0, static_cast<int>(floorf(self.y / cell_f))));
+  const int iz = min(nz - 1, max(0, static_cast<int>(floorf(self.z / cell_f))));
+
+  float ax = 0.0f;
+  float ay = 0.0f;
+  float az = 0.0f;
+  for (int cx = max(0, ix - 1); cx <= min(nx - 1, ix + 1); ++cx) {
+    for (int cy = max(0, iy - 1); cy <= min(ny - 1, iy + 1); ++cy) {
+      for (int cz = max(0, iz - 1); cz <= min(nz - 1, iz + 1); ++cz) {
+        const int cell = (cx * ny + cy) * nz + cz;
+        const int start = cell_start[cell];
+        if (start < 0) {
+          continue;
+        }
+        const int end = cell_end[cell];
+        for (int j = start; j < end; ++j) {
+          const float4 other = posh[j];
+          const float dx = self.x - other.x;
+          const float dy = self.y - other.y;
+          const float dz = self.z - other.z;
+          const float r2 = dx * dx + dy * dy + dz * dz;
+          const float h_j = other.w;
+          const float h_max = fmaxf(h_i, h_j);
+          if (r2 <= 1.0e-12f || r2 >= h_max * h_max) {
+            continue;
+          }
+          const float r = sqrtf(r2);
+          const float4 other_vel = velm[j];
+          const float rho_j = density[j];
+
+          // Symmetrized kernel gradient magnitude (negative toward smaller r).
+          const float grad = 0.5f * (sph_kernel_dwdr(r, h_i) + sph_kernel_dwdr(r, h_j));
+
+          // Isothermal pressure: P/rho^2 = cs^2/rho per side.
+          float term = cs2_over_rho_i + cs * cs / rho_j;
+
+          // Monaghan viscosity for approaching pairs; the mu clamp bounds the
+          // impulse a single violent shock pair can deliver in one substep.
+          const float dvx = self_vel.x - other_vel.x;
+          const float dvy = self_vel.y - other_vel.y;
+          const float dvz = self_vel.z - other_vel.z;
+          const float vr = dvx * dx + dvy * dy + dvz * dz;
+          if (vr < 0.0f) {
+            const float h_bar = 0.5f * (h_i + h_j);
+            float mu = h_bar * vr / (r2 + 0.01f * h_bar * h_bar);
+            // Clamp the viscous signal to a few sound speeds: at our substep
+            // sizes a hypersonic mu delivers a deceleration impulse larger
+            // than the approach speed itself, which overshoots and amplifies
+            // instead of damping (measured: gas ping-ponged to >2000 km/s).
+            mu = fmaxf(mu, -3.0f * cs);
+            const float rho_bar = 0.5f * (rho_i + rho_j);
+            term += (-viscosity_alpha * cs * mu + 2.0f * viscosity_alpha * mu * mu) / rho_bar;
+          }
+
+          const float scale = other_vel.w * term * grad / r;
+          ax -= scale * dx;
+          ay -= scale * dy;
+          az -= scale * dz;
+        }
+      }
+    }
+  }
+  gas_accel_canonical[sorted_canonical[g]] = make_float4(ax, ay, az, 0.0f);
+}
+
+struct GasComponentPredicate {
+  const SimCudaParticle* particles;
+  __device__ bool operator()(const int index) const {
+    return particles[index].component == 4u;
+  }
+};
+
+int build_gas_structure(DeviceState* state,
+                        char* error_buffer,
+                        const std::size_t error_buffer_len) {
+  if (state->gas_count == 0) {
+    return 0;
+  }
+  const int threads_per_block = 256;
+  const int gas_blocks =
+      static_cast<int>((state->gas_count + threads_per_block - 1) / threads_per_block);
+
+  // Canonical gas indices for this build (the compaction permutes canonical
+  // order every substep).
+  try {
+    const auto copied_end = thrust::copy_if(
+        thrust::cuda::par.on(state->compute_stream),
+        thrust::counting_iterator<int>(0),
+        thrust::counting_iterator<int>(static_cast<int>(state->particle_count)),
+        thrust::device_pointer_cast(state->gas_indices),
+        GasComponentPredicate{state->particles});
+    const std::size_t found =
+        static_cast<std::size_t>(copied_end - thrust::device_pointer_cast(state->gas_indices));
+    if (found != state->gas_count) {
+      fill_error(error_buffer, error_buffer_len, "gas particle count changed unexpectedly");
+      return 1;
+    }
+  } catch (const std::exception& error) {
+    fill_error(error_buffer, error_buffer_len, error.what());
+    return 1;
+  }
+
+  // Grid over the baryon-tight box; cell >= 2 * h_max (h clamps at 0.45) so
+  // the 27-cell neighborhood always covers the interaction radius.
+  double max_extent_cells = 0.0;
+  double cell_kpc = 0.5;
+  int nx = 0;
+  int ny = 0;
+  int nz = 0;
+  for (;;) {
+    nx = max(1, static_cast<int>(std::ceil(state->tight_box_length[0] / cell_kpc)) + 2);
+    ny = max(1, static_cast<int>(std::ceil(state->tight_box_length[1] / cell_kpc)) + 2);
+    nz = max(1, static_cast<int>(std::ceil(state->tight_box_length[2] / cell_kpc)) + 2);
+    max_extent_cells = static_cast<double>(nx) * ny * nz;
+    if (max_extent_cells <= static_cast<double>(kMaxShortRangeCells)) {
+      break;
+    }
+    cell_kpc *= 1.5;
+  }
+  state->gas_nx = nx;
+  state->gas_ny = ny;
+  state->gas_nz = nz;
+  state->gas_grid_cell_kpc = cell_kpc;
+  state->gas_grid_origin[0] = state->tight_domain_origin[0] - cell_kpc;
+  state->gas_grid_origin[1] = state->tight_domain_origin[1] - cell_kpc;
+  state->gas_grid_origin[2] = state->tight_domain_origin[2] - cell_kpc;
+
+  const std::size_t cell_count = static_cast<std::size_t>(nx) * ny * nz;
+  if (cell_count > state->gas_cell_capacity) {
+    cudaFree(state->gas_cell_start);
+    cudaFree(state->gas_cell_end);
+    state->gas_cell_start = nullptr;
+    state->gas_cell_end = nullptr;
+    if (cudaMalloc(reinterpret_cast<void**>(&state->gas_cell_start), sizeof(int) * cell_count) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->gas_cell_end), sizeof(int) * cell_count) != cudaSuccess) {
+      fill_error(error_buffer, error_buffer_len, "cudaMalloc for gas cell ranges failed");
+      return 1;
+    }
+    state->gas_cell_capacity = cell_count;
+  }
+  cudaMemsetAsync(state->gas_cell_start, 0xFF, sizeof(int) * cell_count, state->compute_stream);
+  cudaMemsetAsync(state->gas_cell_end, 0xFF, sizeof(int) * cell_count, state->compute_stream);
+
+  compute_gas_cells<<<gas_blocks, threads_per_block, 0, state->compute_stream>>>(
+      state->particles,
+      state->gas_indices,
+      state->gas_count,
+      state->gas_grid_origin[0],
+      state->gas_grid_origin[1],
+      state->gas_grid_origin[2],
+      cell_kpc,
+      nx,
+      ny,
+      nz,
+      state->gas_cell_ids,
+      state->gas_sorted_canonical);
+  cudaError_t cuda_status = cudaGetLastError();
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "gas cell kernel failed", cuda_status);
+    return 1;
+  }
+
+  try {
+    thrust::sort_by_key(thrust::cuda::par.on(state->compute_stream),
+                        thrust::device_pointer_cast(state->gas_cell_ids),
+                        thrust::device_pointer_cast(state->gas_cell_ids + state->gas_count),
+                        thrust::device_pointer_cast(state->gas_sorted_canonical));
+  } catch (const std::exception& error) {
+    fill_error(error_buffer, error_buffer_len, error.what());
+    return 1;
+  }
+
+  build_gas_cell_ranges<<<gas_blocks, threads_per_block, 0, state->compute_stream>>>(
+      state->gas_cell_ids,
+      state->gas_count,
+      static_cast<int>(cell_count),
+      state->gas_cell_start,
+      state->gas_cell_end);
+  gather_gas_sorted<<<gas_blocks, threads_per_block, 0, state->compute_stream>>>(
+      state->particles,
+      state->smoothing_h,
+      state->gas_sorted_canonical,
+      state->gas_count,
+      state->gas_grid_origin[0],
+      state->gas_grid_origin[1],
+      state->gas_grid_origin[2],
+      state->gas_posh_sorted,
+      state->gas_velm_sorted);
+  gas_density_kernel<<<gas_blocks, threads_per_block, 0, state->compute_stream>>>(
+      state->gas_posh_sorted,
+      state->gas_velm_sorted,
+      state->gas_sorted_canonical,
+      state->gas_count,
+      state->gas_cell_start,
+      state->gas_cell_end,
+      cell_kpc,
+      nx,
+      ny,
+      nz,
+      static_cast<float>(state->gas_smoothing_eta),
+      state->gas_density_sorted,
+      state->smoothing_h);
+  gas_force_kernel<<<gas_blocks, threads_per_block, 0, state->compute_stream>>>(
+      state->gas_posh_sorted,
+      state->gas_velm_sorted,
+      state->gas_density_sorted,
+      state->gas_sorted_canonical,
+      state->gas_count,
+      state->gas_cell_start,
+      state->gas_cell_end,
+      cell_kpc,
+      nx,
+      ny,
+      nz,
+      static_cast<float>(state->gas_sound_speed_kms),
+      static_cast<float>(state->gas_viscosity_alpha),
+      state->gas_accel);
+  cuda_status = cudaGetLastError();
+  if (cuda_status != cudaSuccess) {
+    fill_cuda_error(error_buffer, error_buffer_len, "SPH kernel launch failed", cuda_status);
+    return 1;
+  }
+  return 0;
+}
+
 int build_force_state(DeviceState* state,
                       char* error_buffer,
                       const std::size_t error_buffer_len) {
@@ -3297,6 +3764,16 @@ int build_force_state(DeviceState* state,
   }
   if (finish_stage("build_short_range_structure", stage_start) != 0) {
     return 1;
+  }
+
+  if (state->gas_count > 0) {
+    stage_start = std::chrono::steady_clock::now();
+    if (build_gas_structure(state, error_buffer, error_buffer_len) != 0) {
+      return 1;
+    }
+    if (finish_stage("sph_pass", stage_start) != 0) {
+      return 1;
+    }
   }
 
   state->force_state_valid = true;
@@ -3390,6 +3867,7 @@ int apply_force_kick_from_state(DeviceState* state,
     pending_slow_dt_myr,
     state->time_bins,
     state->previous_time_bins,
+    state->gas_accel,
     state->accel_mag);
   cuda_status = cudaGetLastError();
   if (cuda_status != cudaSuccess) {
@@ -3710,6 +4188,62 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
     fill_error(error_buffer, error_buffer_len, "cudaMalloc for time bins failed");
     destroy_state(state);
     return 1;
+  }
+  state->gas_sound_speed_kms = params->gas_sound_speed_kms;
+  state->gas_viscosity_alpha = params->gas_viscosity_alpha > 0.0 ? params->gas_viscosity_alpha : 1.0;
+  state->gas_smoothing_eta = params->gas_smoothing_eta > 0.0 ? params->gas_smoothing_eta : 1.3;
+  std::uint32_t gas_count = 0;
+  for (std::uint64_t i = 0; i < params->particle_count; ++i) {
+    if (particles[i].component == 4u) {
+      gas_count += 1;
+    }
+  }
+  state->gas_count = gas_count;
+  if (cudaMalloc(reinterpret_cast<void**>(&state->smoothing_h),
+                 sizeof(float) * params->particle_count) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&state->smoothing_h_scratch),
+                 sizeof(float) * params->particle_count) != cudaSuccess) {
+    fill_error(error_buffer, error_buffer_len, "cudaMalloc for smoothing lengths failed");
+    destroy_state(state);
+    return 1;
+  }
+  {
+    // Seed h from a neutral 0.1 kpc; the density pass refines it toward
+    // eta*(m/rho)^(1/3) within a few builds (rate-limited per step).
+    std::vector<float> smoothing_host(params->particle_count, 0.0f);
+    for (std::uint64_t i = 0; i < params->particle_count; ++i) {
+      if (particles[i].component == 4u) {
+        smoothing_host[i] = 0.1f;
+      }
+    }
+    if (cudaMemcpy(state->smoothing_h,
+                   smoothing_host.data(),
+                   sizeof(float) * params->particle_count,
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+      fill_error(error_buffer, error_buffer_len, "smoothing length upload failed");
+      destroy_state(state);
+      return 1;
+    }
+  }
+  if (gas_count > 0) {
+    const std::size_t n = gas_count;
+    if (cudaMalloc(reinterpret_cast<void**>(&state->gas_indices), sizeof(int) * n) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->gas_cell_ids), sizeof(int) * n) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->gas_sorted_canonical), sizeof(int) * n) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->gas_posh_sorted), sizeof(float4) * n) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->gas_velm_sorted), sizeof(float4) * n) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->gas_density_sorted), sizeof(float) * n) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->gas_accel),
+                   sizeof(float4) * params->particle_count) != cudaSuccess) {
+      fill_error(error_buffer, error_buffer_len, "cudaMalloc for SPH buffers failed");
+      destroy_state(state);
+      return 1;
+    }
+    if (cudaMemset(state->gas_accel, 0, sizeof(float4) * params->particle_count) != cudaSuccess) {
+      fill_error(error_buffer, error_buffer_len, "cudaMemset for SPH accel failed");
+      destroy_state(state);
+      return 1;
+    }
   }
   if (cudaMemset(state->time_bins, 0, params->particle_count) != cudaSuccess ||
       cudaMemset(state->previous_time_bins, 0, params->particle_count) != cudaSuccess ||

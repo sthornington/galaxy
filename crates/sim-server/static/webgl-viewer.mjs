@@ -110,7 +110,9 @@ void main() {
   }
 
   float logMass = (u_massLog.x + a_mass * u_massLog.y) * 0.3010299957;
-  float luminosity = clamp((logMass - 3.7) / 2.2, 0.25, 1.8);
+  float luminosity = a_component == 4u
+      ? 1.0
+      : clamp((logMass - 3.7) / 2.2, 0.25, 1.8);
   float renderLuminosity = pow(luminosity, 0.58);
   float massBias = clamp((logMass - 4.2) / 1.6, 0.0, 1.0);
 

@@ -30,7 +30,7 @@ const _: () = {
     assert!(std::mem::size_of::<FfiParticle>() == 88);
     assert!(std::mem::size_of::<FfiPreviewParticle>() == 32);
     assert!(std::mem::size_of::<FfiDiagnostics>() == 72);
-    assert!(std::mem::size_of::<FfiCreateParams>() == 72);
+    assert!(std::mem::size_of::<FfiCreateParams>() == 96);
 };
 
 #[repr(C)]
@@ -56,6 +56,9 @@ struct FfiCreateParams {
     opening_angle: f64,
     mesh_resolution: [u32; 3],
     enable_smbh_post_newtonian: u32,
+    gas_sound_speed_kms: f64,
+    gas_viscosity_alpha: f64,
+    gas_smoothing_eta: f64,
 }
 
 unsafe extern "C" {
@@ -145,6 +148,9 @@ impl GpuBackend {
             enable_smbh_post_newtonian: u32::from(
                 config.relativity.enable_smbh_post_newtonian,
             ),
+            gas_sound_speed_kms: config.gas.sound_speed_kms,
+            gas_viscosity_alpha: config.gas.viscosity_alpha,
+            gas_smoothing_eta: config.gas.smoothing_eta,
         };
         let ffi_particles: Vec<FfiParticle> = initial_conditions
             .particles
@@ -730,6 +736,11 @@ mod tests {
             .config;
         for galaxy in &mut config.galaxies {
             galaxy.equilibrium_snapshot = None;
+            // Stellar-structure regression: the gas disk's initial SPH
+            // settling transient slightly thickens the stellar disk, which
+            // is physics, not the regression this test guards against.
+            galaxy.gas_particle_count = 0;
+            galaxy.gas_mass_msun = 0.0;
         }
         let initial_conditions = InitialConditions::generate(&config, 42).unwrap();
         let initial_metrics = [
@@ -962,9 +973,67 @@ mod tests {
             galaxy.halo_particle_count = 96;
             galaxy.disk_particle_count = 48;
             galaxy.bulge_particle_count = 12;
+            // The cloned preset carries a gas disk; the gravity smoke tests
+            // must stay hydro-free so their thresholds keep meaning.
+            galaxy.gas_particle_count = 0;
+            galaxy.gas_mass_msun = 0.0;
             galaxy.equilibrium_snapshot = None;
         }
         config
+    }
+
+    fn gas_median_radius(particles: &[Particle]) -> f64 {
+        let mut radii: Vec<f64> = particles
+            .iter()
+            .filter(|particle| matches!(particle.component, ParticleComponent::Gas))
+            .map(|particle| particle.position_kpc.length())
+            .collect();
+        assert!(!radii.is_empty(), "no gas particles found");
+        radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        radii[radii.len() / 2]
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA GPU"]
+    fn gas_disk_survives_sph_evolution() {
+        let _gpu_guard = lock_gpu();
+        let mut config = small_test_config();
+        config.galaxies.truncate(1);
+        config.name = "gas-sph-stability".to_string();
+        {
+            let galaxy = &mut config.galaxies[0];
+            galaxy.halo_particle_count = 20_000;
+            galaxy.disk_particle_count = 12_000;
+            galaxy.bulge_particle_count = 2_000;
+            galaxy.gas_mass_msun = 5.0e9;
+            galaxy.gas_particle_count = 8_000;
+        }
+
+        let initial_conditions = InitialConditions::generate(&config, 11).unwrap();
+        let initial_r50 = gas_median_radius(&initial_conditions.particles);
+        let mut backend = GpuBackend::new(&config, &initial_conditions).unwrap();
+        backend.advance(50).unwrap();
+
+        let particles = backend.download_particles().unwrap();
+        let mut max_speed = 0.0_f64;
+        for particle in particles
+            .iter()
+            .filter(|particle| matches!(particle.component, ParticleComponent::Gas))
+        {
+            assert!(
+                particle.position_kpc.length().is_finite()
+                    && particle.velocity_kms.length().is_finite(),
+                "SPH produced non-finite gas state"
+            );
+            max_speed = max_speed.max(particle.velocity_kms.length());
+        }
+        let final_r50 = gas_median_radius(&particles);
+        let ratio = final_r50 / initial_r50;
+        assert!(max_speed < 2000.0, "SPH launched gas to {max_speed:.0} km/s");
+        assert!(
+            (0.4..=2.5).contains(&ratio),
+            "gas r50 drifted: initial={initial_r50:.2} final={final_r50:.2} ratio={ratio:.3}"
+        );
     }
 
     fn self_gravity_only_config() -> SimulationConfig {
@@ -1015,6 +1084,10 @@ mod tests {
                 bulge_mass_msun: 0.0,
                 bulge_scale_radius_kpc: 1.0,
                 bulge_particle_count: 0,
+                gas_mass_msun: 0.0,
+                gas_scale_radius_kpc: 0.0,
+                gas_scale_height_kpc: 0.0,
+                gas_particle_count: 0,
                 smbh: SmbhConfig {
                     mass_msun: 0.0,
                     softening_kpc: 0.01,
@@ -1028,6 +1101,7 @@ mod tests {
             initial_separation_kpc: 0.0,
             initial_relative_velocity_kms: 0.0,
             output_directory: format!("/tmp/galaxy-self-gravity-{}", Uuid::new_v4()),
+            gas: sim_core::GasConfig::default(),
         }
     }
 }

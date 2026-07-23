@@ -42,6 +42,9 @@ struct SimCudaCreateParams {
   double opening_angle;
   std::uint32_t mesh_resolution[3];
   std::uint32_t enable_smbh_post_newtonian;
+  double gas_sound_speed_kms;
+  double gas_viscosity_alpha;
+  double gas_smoothing_eta;
 };
 
 int sim_cuda_create(const SimCudaCreateParams* params,

@@ -42,6 +42,10 @@ fn main() -> Result<()> {
         .with_context(|| format!("unknown preset `{preset_id}`"))?;
     // Analytic ICs only: this measures force accuracy, not equilibrium quality.
     for galaxy in &mut preset.config.galaxies {
+        // Pure gravity validation: hydro forces on gas would show up as
+        // "errors" against the brute-force gravitational reference.
+        galaxy.gas_particle_count = 0;
+        galaxy.gas_mass_msun = 0.0;
         galaxy.equilibrium_snapshot = None;
     }
 
