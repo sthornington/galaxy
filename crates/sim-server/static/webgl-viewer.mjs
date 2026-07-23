@@ -41,6 +41,7 @@ uniform vec3 u_velMin1;
 uniform vec3 u_velScale1;
 uniform vec2 u_massLog; // (log2 min, log2 scale) of the current frame
 uniform float u_spanMyr; // sim-time gap between the interpolation endpoints
+uniform float u_simTimeMyr;
 uniform mediump float u_style;  // 0 = soft glow sprites, 1 = small crisp dots
 
 layout(location = 0) in vec3 a_prevPos;   // normalized u16
@@ -49,22 +50,10 @@ layout(location = 2) in vec3 a_pos;       // normalized u16
 layout(location = 3) in vec3 a_vel;       // normalized u16
 layout(location = 4) in float a_mass;     // normalized u16 (log2-encoded)
 layout(location = 5) in uint a_component;
+layout(location = 6) in float a_age; // stellar age, 6.4 Myr per 1/255 (1.0 = old)
 
 out vec3 v_color;
 out float v_marker;
-
-vec3 dopplerShift(vec3 color, float radialVelocity) {
-  float shift = clamp(radialVelocity / 700.0, -0.28, 0.28);
-  if (shift >= 0.0) {
-    return clamp(vec3(color.r * (1.0 + 0.9 * shift),
-                      color.g * (1.0 + 0.2 * shift),
-                      color.b * (1.0 - 0.75 * shift)), 0.0, 1.0);
-  }
-  float blue = -shift;
-  return clamp(vec3(color.r * (1.0 - 0.75 * blue),
-                    color.g * (1.0 + 0.1 * blue),
-                    color.b * (1.0 + 0.95 * blue)), 0.0, 1.0);
-}
 
 void main() {
   v_marker = 0.0;
@@ -109,21 +98,40 @@ void main() {
     return;
   }
 
+  // Stable per-particle hash (preview slots map to fixed physical particles):
+  // temperature spread, IMF magnitude spread, and brightness jitter.
+  float h = fract(sin(float(gl_VertexID) * 12.9898) * 43758.5453);
+  float h2 = fract(h * 61.803398875);
+  // Newborn clusters blaze blue-hot then fade toward the old population;
+  // the first ~30 Myr get an extra flash while their massive stars die.
+  float youth = a_component == 5u ? 1.0 - a_age : 0.0;
+  float flash = a_component == 5u ? exp(-a_age * 42.0) : 0.0;
   float logMass = (u_massLog.x + a_mass * u_massLog.y) * 0.3010299957;
   float luminosity = a_component == 4u
-      ? 1.0
+      ? 0.55
       : clamp((logMass - 3.7) / 2.2, 0.25, 1.8);
+  // IMF-like magnitude spread: a heavy faint tail with rare bright outliers,
+  // so the stellar field sparkles instead of rendering uniform points.
+  if (a_component == 1u || a_component == 2u || a_component == 5u) {
+    float imf = 0.42 + 2.2 * pow(h2, 3.0);
+    luminosity *= imf;
+  }
+  luminosity *= 1.0 + 2.0 * youth + 6.0 * flash;
+  // Supernovae: clusters younger than ~40 Myr host core-collapse SNe; a few
+  // percent flare white-hot at any moment, re-rolled every ~0.8 Myr.
+  if (a_component == 5u && a_age < 0.026) {
+    float roll = fract(h * 977.31 + floor(u_simTimeMyr * 1.3) * 0.618034);
+    luminosity *= 1.0 + step(0.965, roll) * 14.0;
+  }
   float renderLuminosity = pow(luminosity, 0.58);
   float massBias = clamp((logMass - 4.2) / 1.6, 0.0, 1.0);
 
-  // Stable per-particle hash (preview slots map to fixed physical particles),
-  // used to spread each population across a blackbody-ish temperature range.
-  float h = fract(sin(float(gl_VertexID) * 12.9898) * 43758.5453);
-  float h2 = fract(h * 61.803398875);
   vec3 base;
   if (a_component == 4u) {
     // Gas: cool teal-cyan fluid, hue drifting with the per-particle hash.
     base = mix(vec3(0.30, 0.80, 0.72), vec3(0.50, 0.92, 1.05), h);
+  } else if (a_component == 5u) {
+    base = mix(vec3(1.0, 0.94, 0.80), vec3(0.62, 0.78, 1.35), 0.35 + 0.65 * youth);
   } else if (a_component == 2u) {
     // Bulge: old stars — K/M giants, warm gold through deep orange.
     base = mix(vec3(1.0, 0.70, 0.42), vec3(1.0, 0.88, 0.70),
@@ -135,7 +143,7 @@ void main() {
     base = mix(vec3(1.0, 0.82, 0.58), vec3(0.60, 0.74, 1.0), temperature);
     base = mix(base, vec3(1.0, 0.97, 0.93), 0.22);
   }
-  vec3 color = dopplerShift(base, dot(velocity, u_forward)) * (0.82 + 0.36 * h2);
+  vec3 color = base * (0.82 + 0.36 * h2);
 
   float perspective = clamp((u_pointScale / clip.w) * 0.18, 0.02, 3.5);
   // Gas is a fluid: always the soft-glow path (even in dots mode) with a
@@ -480,6 +488,7 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     velScale1: gl.getUniformLocation(pointProgram, "u_velScale1"),
     massLog: gl.getUniformLocation(pointProgram, "u_massLog"),
     spanMyr: gl.getUniformLocation(pointProgram, "u_spanMyr"),
+    simTimeMyr: gl.getUniformLocation(pointProgram, "u_simTimeMyr"),
     style: gl.getUniformLocation(pointProgram, "u_style"),
   };
   const tonemapUniforms = tonemapProgram
@@ -550,6 +559,8 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
     gl.vertexAttribPointer(4, 1, gl.UNSIGNED_SHORT, true, PARTICLE_STRIDE, 12);
     gl.enableVertexAttribArray(5);
     gl.vertexAttribIPointer(5, 1, gl.UNSIGNED_BYTE, PARTICLE_STRIDE, 14);
+    gl.enableVertexAttribArray(6);
+    gl.vertexAttribPointer(6, 1, gl.UNSIGNED_BYTE, true, PARTICLE_STRIDE, 15);
     gl.bindVertexArray(null);
   }
 
@@ -1214,6 +1225,7 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
       uniforms.spanMyr,
       Math.max(0, pair.current.simTime - pair.previous.simTime)
     );
+    gl.uniform1f(uniforms.simTimeMyr, pair.current.simTime);
     gl.uniform1f(uniforms.style, dotStyle ? 1.0 : 0.0);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE);

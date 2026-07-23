@@ -23,6 +23,13 @@ pub struct PreviewParticle {
     pub velocity_kms: [f32; 3],
     pub mass_msun: f32,
     pub component: u32,
+    /// Stellar age in 6.4 Myr ticks (255 = primordial / not a star).
+    #[serde(default = "default_age_ticks")]
+    pub age_ticks: u8,
+}
+
+fn default_age_ticks() -> u8 {
+    255
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -184,8 +191,10 @@ pub fn encode_preview_packet_into(
                 quantize(particle.velocity_kms[2], quant.velocity_min_kms[2], quant.velocity_scale_kms[2]),
             ],
             mass_q: quantize(particle.mass_msun.max(1.0).log2(), quant.mass_log2_min, quant.mass_log2_scale),
-            component: particle.component.min(255) as u8,
-            reserved: 0,
+            // Low byte: component id. High byte (from the backend's packed
+            // component word): stellar age in 6.4 Myr ticks, 255 = old.
+            component: (particle.component & 0xFF) as u8,
+            reserved: ((particle.component >> 8) & 0xFF) as u8,
         };
         out.extend_from_slice(bytes_of(&wire));
     }
@@ -249,6 +258,7 @@ pub fn decode_preview_packet(bytes: &[u8]) -> anyhow::Result<PreviewFrame> {
             ],
             mass_msun: dequantize(wire.mass_q, quant.mass_log2_min, quant.mass_log2_scale).exp2(),
             component: u32::from(wire.component),
+            age_ticks: wire.reserved,
         })
         .collect();
 

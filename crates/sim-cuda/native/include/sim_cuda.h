@@ -45,6 +45,10 @@ struct SimCudaCreateParams {
   double gas_sound_speed_kms;
   double gas_viscosity_alpha;
   double gas_smoothing_eta;
+  double star_formation_efficiency;
+  double star_formation_density_msun_kpc3;
+  double feedback_accel;
+  double feedback_radius_kpc;
 };
 
 int sim_cuda_create(const SimCudaCreateParams* params,

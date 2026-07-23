@@ -23,6 +23,9 @@ pub enum ParticleComponent {
     Bulge,
     Smbh,
     Gas,
+    /// Stars formed from collapsing gas during the run (wire id 5); they
+    /// carry a birth time on the GPU and render with a fading birth flash.
+    YoungStar,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

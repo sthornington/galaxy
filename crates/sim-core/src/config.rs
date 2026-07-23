@@ -25,6 +25,17 @@ pub struct GasConfig {
     pub viscosity_alpha: f64,
     /// Smoothing-length coefficient: h = eta * (m / rho)^(1/3).
     pub smoothing_eta: f64,
+    /// Star formation efficiency per free-fall time (Schmidt law); zero
+    /// disables star formation.
+    pub star_formation_efficiency: f64,
+    /// Gas density threshold for star formation [Msun/kpc^3];
+    /// 2.5e8 is roughly 10 hydrogen atoms per cm^3.
+    pub star_formation_density_msun_kpc3: f64,
+    /// Supernova feedback: outward acceleration [(km/s)^2/kpc] deposited on
+    /// gas near clusters younger than ~40 Myr; zero disables feedback.
+    pub feedback_accel: f64,
+    /// Radius of the feedback deposition around each young cluster [kpc].
+    pub feedback_radius_kpc: f64,
 }
 
 impl Default for GasConfig {
@@ -33,6 +44,10 @@ impl Default for GasConfig {
             sound_speed_kms: 10.0,
             viscosity_alpha: 1.0,
             smoothing_eta: 1.3,
+            star_formation_efficiency: 0.015,
+            star_formation_density_msun_kpc3: 8.0e8,
+            feedback_accel: 900.0,
+            feedback_radius_kpc: 0.25,
         }
     }
 }

@@ -30,7 +30,7 @@ const _: () = {
     assert!(std::mem::size_of::<FfiParticle>() == 88);
     assert!(std::mem::size_of::<FfiPreviewParticle>() == 32);
     assert!(std::mem::size_of::<FfiDiagnostics>() == 72);
-    assert!(std::mem::size_of::<FfiCreateParams>() == 96);
+    assert!(std::mem::size_of::<FfiCreateParams>() == 128);
 };
 
 #[repr(C)]
@@ -59,6 +59,10 @@ struct FfiCreateParams {
     gas_sound_speed_kms: f64,
     gas_viscosity_alpha: f64,
     gas_smoothing_eta: f64,
+    star_formation_efficiency: f64,
+    star_formation_density_msun_kpc3: f64,
+    feedback_accel: f64,
+    feedback_radius_kpc: f64,
 }
 
 unsafe extern "C" {
@@ -151,6 +155,10 @@ impl GpuBackend {
             gas_sound_speed_kms: config.gas.sound_speed_kms,
             gas_viscosity_alpha: config.gas.viscosity_alpha,
             gas_smoothing_eta: config.gas.smoothing_eta,
+            star_formation_efficiency: config.gas.star_formation_efficiency,
+            star_formation_density_msun_kpc3: config.gas.star_formation_density_msun_kpc3,
+            feedback_accel: config.gas.feedback_accel,
+            feedback_radius_kpc: config.gas.feedback_radius_kpc,
         };
         let ffi_particles: Vec<FfiParticle> = initial_conditions
             .particles
@@ -375,7 +383,9 @@ impl GpuBackend {
                     position_kpc: particle.position_kpc,
                     velocity_kms: particle.velocity_kms,
                     mass_msun: particle.mass_msun,
-                    component: particle.component,
+                    // The backend packs age ticks into the high byte.
+                    component: particle.component & 0xFF,
+                    age_ticks: ((particle.component >> 8) & 0xFF) as u8,
                 })
                 .collect(),
         })
@@ -442,6 +452,7 @@ fn ffi_particle_from_particle(particle: &Particle) -> FfiParticle {
             ParticleComponent::Bulge => 2,
             ParticleComponent::Smbh => 3,
             ParticleComponent::Gas => 4,
+            ParticleComponent::YoungStar => 5,
         },
         color_rgba: particle.color_rgba,
     }
@@ -472,6 +483,7 @@ fn particle_from_ffi(particle: FfiParticle) -> Particle {
             2 => ParticleComponent::Bulge,
             3 => ParticleComponent::Smbh,
             4 => ParticleComponent::Gas,
+            5 => ParticleComponent::YoungStar,
             _ => ParticleComponent::Halo,
         },
         position_kpc: Vec3::new(

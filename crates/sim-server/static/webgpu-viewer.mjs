@@ -37,7 +37,7 @@ struct Uniforms {
   forward: vec3f, alpha: f32,
   massLog: vec2f, style: f32, pointScale: f32,
   sizeBoost: f32, resX: f32, resY: f32, exposureBoost: f32,
-  headroom: f32, count: u32, spanMyr: f32, _j: f32,
+  headroom: f32, count: u32, spanMyr: f32, simTimeMyr: f32,
 }
 `;
 
@@ -72,19 +72,6 @@ fn decodeVel(r: vec4u, minV: vec3f, scaleV: vec3f) -> vec3f {
   return minV + q * scaleV;
 }
 
-fn dopplerShift(color: vec3f, radialVelocity: f32) -> vec3f {
-  let shift = clamp(radialVelocity / 700.0, -0.28, 0.28);
-  if (shift >= 0.0) {
-    return clamp(vec3f(color.r * (1.0 + 0.9 * shift),
-                       color.g * (1.0 + 0.2 * shift),
-                       color.b * (1.0 - 0.75 * shift)), vec3f(0.0), vec3f(1.0));
-  }
-  let blue = -shift;
-  return clamp(vec3f(color.r * (1.0 - 0.75 * blue),
-                     color.g * (1.0 + 0.1 * blue),
-                     color.b * (1.0 + 0.95 * blue)), vec3f(0.0), vec3f(1.0));
-}
-
 fn degenerate() -> VSOut {
   var out: VSOut;
   out.pos = vec4f(0.0, 0.0, 2.0, 1.0);
@@ -103,6 +90,7 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
   }
   let rc = curRecords[particle];
   let component = (rc.w >> 16u) & 0xFFu;
+  let age = f32((rc.w >> 24u) & 0xFFu) / 255.0;
   // Dark matter is never drawn.
   if (component == 0u) {
     return degenerate();
@@ -131,17 +119,33 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
   }
 
   let massQ = f32(rc.w & 0xFFFFu) / 65535.0;
+  let h = fract(sin(f32(particle) * 12.9898) * 43758.5453);
+  let h2 = fract(h * 61.803398875);
+  // Newborn clusters blaze blue-hot then fade toward the old population;
+  // the first ~30 Myr get an extra flash while their massive stars die.
+  let youth = select(0.0, 1.0 - age, component == 5u);
+  let flash = select(0.0, exp(-age * 42.0), component == 5u);
   let logMass = (u.massLog.x + massQ * u.massLog.y) * 0.3010299957;
-  let luminosity = select(clamp((logMass - 3.7) / 2.2, 0.25, 1.8), 1.0, component == 4u);
+  var luminosity = select(clamp((logMass - 3.7) / 2.2, 0.25, 1.8), 0.55, component == 4u);
+  if (component == 1u || component == 2u || component == 5u) {
+    luminosity *= 0.42 + 2.2 * pow(h2, 3.0);
+  }
+  luminosity *= 1.0 + 2.0 * youth + 6.0 * flash;
+  // Supernovae: a few percent of young clusters flare white-hot at any
+  // moment, re-rolled every ~0.8 Myr of sim time.
+  if (component == 5u && age < 0.026) {
+    let roll = fract(h * 977.31 + floor(u.simTimeMyr * 1.3) * 0.618034);
+    luminosity *= 1.0 + step(0.965, roll) * 14.0;
+  }
   let renderLuminosity = pow(luminosity, 0.58);
   let massBias = clamp((logMass - 4.2) / 1.6, 0.0, 1.0);
 
-  let h = fract(sin(f32(particle) * 12.9898) * 43758.5453);
-  let h2 = fract(h * 61.803398875);
   var base: vec3f;
   if (component == 4u) {
     // Gas: cool teal-cyan fluid, hue drifting with the per-particle hash.
     base = mix(vec3f(0.30, 0.80, 0.72), vec3f(0.50, 0.92, 1.05), h);
+  } else if (component == 5u) {
+    base = mix(vec3f(1.0, 0.94, 0.80), vec3f(0.62, 0.78, 1.35), 0.35 + 0.65 * youth);
   } else if (component == 2u) {
     base = mix(vec3f(1.0, 0.70, 0.42), vec3f(1.0, 0.88, 0.70),
                clamp(0.2 + 0.55 * h + 0.15 * massBias, 0.0, 1.0));
@@ -150,7 +154,7 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
     base = mix(vec3f(1.0, 0.82, 0.58), vec3f(0.60, 0.74, 1.0), temperature);
     base = mix(base, vec3f(1.0, 0.97, 0.93), 0.22);
   }
-  let color = dopplerShift(base, dot(velocity, u.forward)) * (0.82 + 0.36 * h2);
+  let color = base * (0.82 + 0.36 * h2);
 
   let perspective = clamp((u.pointScale / clip.w) * 0.18, 0.02, 3.5);
   var size: f32;
@@ -1206,6 +1210,7 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     uniformF32[60] = state.hdrActive ? (headroomOverride ?? 3.0) : 1.0;
     uniformU32[61] = pair.current.count;
     uniformF32[62] = Math.max(0, pair.current.simTime - pair.previous.simTime);
+    uniformF32[63] = pair.current.simTime;
     gpu.device.queue.writeBuffer(gpu.uniformBuffer, 0, uniformArray);
     gpu.device.queue.writeBuffer(
       gpu.exposureBoostBuffer,

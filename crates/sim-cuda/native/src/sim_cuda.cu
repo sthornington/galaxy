@@ -268,6 +268,18 @@ struct DeviceState {
   // the particle array on every traversal-order compaction.
   float* smoothing_h = nullptr;
   float* smoothing_h_scratch = nullptr;
+  // Birth time [Myr] for stars formed in-run (component 5); -1e30 for
+  // everything primordial. Permuted alongside the particles.
+  float* birth_time_myr = nullptr;
+  float* birth_time_scratch = nullptr;
+  double star_formation_efficiency = 0.0;
+  double star_formation_density = 0.0;
+  double feedback_accel = 0.0;
+  double feedback_radius_kpc = 0.25;
+  int* young_star_indices = nullptr;
+  std::uint32_t young_star_capacity = 0;
+  std::uint32_t gas_capacity = 0;
+  std::uint64_t sph_build_counter = 0;
   int* gas_indices = nullptr;          // canonical index of each gas particle
   int* gas_cell_ids = nullptr;
   int* gas_sorted_canonical = nullptr; // canonical index per sorted gas slot
@@ -343,6 +355,8 @@ __global__ void sample_preview(const SimCudaParticle* particles,
                                const int* anchor_indices,
                                const std::uint32_t anchor_count,
                                const std::uint32_t sampled_count,
+                               const float* __restrict__ birth_time_myr,
+                               const float sim_time_epoch_myr,
                                SimCudaPreviewParticle* out_particles);
 
 const char* cufft_error_string(const cufftResult status) {
@@ -494,6 +508,8 @@ void destroy_state(DeviceState* state) {
   cudaFree(state->previous_time_bins);
   cudaFree(state->smoothing_h);
   cudaFree(state->smoothing_h_scratch);
+  cudaFree(state->birth_time_myr);
+  cudaFree(state->birth_time_scratch);
   cudaFree(state->gas_indices);
   cudaFree(state->gas_cell_ids);
   cudaFree(state->gas_sorted_canonical);
@@ -503,6 +519,7 @@ void destroy_state(DeviceState* state) {
   cudaFree(state->gas_velm_sorted);
   cudaFree(state->gas_density_sorted);
   cudaFree(state->gas_accel);
+  cudaFree(state->young_star_indices);
   cudaFree(state->inverse_index);
   cudaFree(state->particles_scratch);
   cudaFree(state->particles);
@@ -669,6 +686,8 @@ int schedule_preview_capture(DeviceState* state,
       state->galaxy_smbh_indices,
       anchor_count,
       sampled_count,
+      state->birth_time_myr,
+      static_cast<float>(std::floor(state->sim_time_myr / 6.4) * 6.4),
       state->preview_particles);
   cudaError_t cuda_status = cudaGetLastError();
   if (cuda_status != cudaSuccess) {
@@ -1932,6 +1951,7 @@ __global__ void gather_particles_traversal_order(const SimCudaParticle* __restri
                                                  const std::uint8_t* __restrict__ bins_in,
                                                  const float* __restrict__ accel_in,
                                                  const float* __restrict__ smoothing_in,
+                                                 const float* __restrict__ birth_in,
                                                  const int* __restrict__ sorted_particle_indices,
                                                  const std::uint32_t source_count,
                                                  const int* __restrict__ non_source_indices,
@@ -1940,6 +1960,7 @@ __global__ void gather_particles_traversal_order(const SimCudaParticle* __restri
                                                  std::uint8_t* __restrict__ bins_out,
                                                  float* __restrict__ accel_out,
                                                  float* __restrict__ smoothing_out,
+                                                 float* __restrict__ birth_out,
                                                  int* __restrict__ inverse_index) {
   const std::uint64_t slot =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1952,6 +1973,7 @@ __global__ void gather_particles_traversal_order(const SimCudaParticle* __restri
   bins_out[slot] = bins_in[old_index];
   accel_out[slot] = accel_in[old_index];
   smoothing_out[slot] = smoothing_in[old_index];
+  birth_out[slot] = birth_in[old_index];
   inverse_index[old_index] = static_cast<int>(slot);
 }
 
@@ -2533,6 +2555,8 @@ __global__ void sample_preview(const SimCudaParticle* particles,
                                const int* anchor_indices,
                                const std::uint32_t anchor_count,
                                const std::uint32_t sampled_count,
+                               const float* __restrict__ birth_time_myr,
+                               const float sim_time_epoch_myr,
                                SimCudaPreviewParticle* out_particles) {
   const std::uint32_t preview_count = anchor_count + sampled_count;
   const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2562,7 +2586,16 @@ __global__ void sample_preview(const SimCudaParticle* particles,
   out_particles[index].velocity_kms[1] = static_cast<float>(particle.velocity_kms[1]);
   out_particles[index].velocity_kms[2] = static_cast<float>(particle.velocity_kms[2]);
   out_particles[index].mass_msun = static_cast<float>(particle.mass_msun);
-  out_particles[index].component = particle.component;
+  // High byte: stellar age in 6.4 Myr ticks (255 = primordial). The epoch
+  // quantization makes every young star's byte change on the same frames,
+  // keeping the preview delta encoder effective between those keyframes.
+  std::uint32_t age_ticks = 255u;
+  const float birth = birth_time_myr[source_index];
+  if (birth > -1.0e29f) {
+    const float age = fmaxf(0.0f, sim_time_epoch_myr - birth);
+    age_ticks = min(255u, static_cast<std::uint32_t>(age / 6.4f));
+  }
+  out_particles[index].component = particle.component | (age_ticks << 8);
 }
 
 SimCudaPreviewParticle preview_particle_from_host_particle(const SimCudaParticle& particle) {
@@ -2574,7 +2607,8 @@ SimCudaPreviewParticle preview_particle_from_host_particle(const SimCudaParticle
   preview.velocity_kms[1] = static_cast<float>(particle.velocity_kms[1]);
   preview.velocity_kms[2] = static_cast<float>(particle.velocity_kms[2]);
   preview.mass_msun = static_cast<float>(particle.mass_msun);
-  preview.component = particle.component;
+  // Host-side previews have no birth-time context: mark everything primordial.
+  preview.component = particle.component | (255u << 8);
   return preview;
 }
 
@@ -3049,6 +3083,7 @@ int build_short_range_structure(DeviceState* state,
         state->time_bins,
         state->accel_mag,
         state->smoothing_h,
+        state->birth_time_myr,
         state->short_sorted_particle_indices,
         state->short_source_particle_count,
         state->non_source_indices,
@@ -3057,6 +3092,7 @@ int build_short_range_structure(DeviceState* state,
         state->time_bins_scratch,
         state->accel_mag_scratch,
         state->smoothing_h_scratch,
+        state->birth_time_scratch,
         state->inverse_index);
     cuda_status = cudaGetLastError();
     if (cuda_status != cudaSuccess) {
@@ -3067,6 +3103,7 @@ int build_short_range_structure(DeviceState* state,
     std::swap(state->time_bins, state->time_bins_scratch);
     std::swap(state->accel_mag, state->accel_mag_scratch);
     std::swap(state->smoothing_h, state->smoothing_h_scratch);
+    std::swap(state->birth_time_myr, state->birth_time_scratch);
 
     if (state->galaxy_count > 0) {
       const int smbh_blocks =
@@ -3432,7 +3469,7 @@ __global__ void gas_density_kernel(const float4* __restrict__ posh,
   const float mass = velm[g].w;
   float h_new = smoothing_eta * cbrtf(mass / rho);
   h_new = fminf(fmaxf(h_new, 0.8f * h_i), 1.25f * h_i);
-  h_new = fminf(fmaxf(h_new, 0.02f), 0.45f);
+  h_new = fminf(fmaxf(h_new, 0.05f), 0.45f);
   smoothing_h_canonical[sorted_canonical[g]] = h_new;
 }
 
@@ -3527,6 +3564,121 @@ __global__ void gas_force_kernel(const float4* __restrict__ posh,
   gas_accel_canonical[sorted_canonical[g]] = make_float4(ax, ay, az, 0.0f);
 }
 
+// Schmidt-law star formation: gas above the density threshold converts with
+// probability eps * dt / t_ff per conversion epoch. Conversions are batched
+// (every 16th SPH build, probability scaled accordingly) so the preview
+// delta encoder sees component changes only on occasional keyframes.
+__global__ void form_stars_kernel(SimCudaParticle* __restrict__ particles,
+                                  float* __restrict__ birth_time_myr,
+                                  const float* __restrict__ density,
+                                  const int* __restrict__ sorted_canonical,
+                                  const std::uint32_t gas_count,
+                                  const float density_threshold,
+                                  const float efficiency_dt_scaled,
+                                  const float grav_const,
+                                  const float sim_time_myr,
+                                  const std::uint32_t salt) {
+  const std::uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g >= gas_count) {
+    return;
+  }
+  const float rho = density[g];
+  if (rho < density_threshold) {
+    return;
+  }
+  // Free-fall time in Myr: sqrt(3*pi / (32 G rho)) with G rho in
+  // (km/s)^2/kpc^2; sqrt gives kpc/(km/s) = 977.8 Myr.
+  const float t_ff_myr =
+      sqrtf(0.2945243f / (grav_const * rho)) * 977.79222f;
+  const float p_convert = fminf(efficiency_dt_scaled / t_ff_myr, 0.25f);
+
+  // Cheap counter-based RNG (xorshift of slot + salt).
+  std::uint32_t r = (g * 2654435761u) ^ (salt * 2246822519u);
+  r ^= r << 13; r ^= r >> 17; r ^= r << 5;
+  const float u = static_cast<float>(r & 0x00FFFFFFu) / 16777216.0f;
+  if (u < p_convert) {
+    const int canonical = sorted_canonical[g];
+    particles[canonical].component = 5u;
+    birth_time_myr[canonical] = sim_time_myr;
+  }
+}
+
+// Supernova feedback: clusters younger than ~40 Myr push outward on the gas
+// around them. The impulse accumulates into the hydro acceleration buffer
+// (atomically -- overlapping bubbles add), so it integrates through the same
+// kick path as pressure and respects the deferred-kick invariants.
+__global__ void apply_sn_feedback(const SimCudaParticle* __restrict__ particles,
+                                  const int* __restrict__ young_star_indices,
+                                  const std::uint32_t young_count,
+                                  const int* __restrict__ gas_cell_start,
+                                  const int* __restrict__ gas_cell_end,
+                                  const int* __restrict__ gas_sorted_canonical,
+                                  const float4* __restrict__ gas_posh,
+                                  const double grid_origin_x,
+                                  const double grid_origin_y,
+                                  const double grid_origin_z,
+                                  const double cell_kpc,
+                                  const int nx,
+                                  const int ny,
+                                  const int nz,
+                                  const float feedback_accel,
+                                  const float feedback_radius,
+                                  float4* __restrict__ gas_accel_canonical) {
+  const std::uint32_t y = blockIdx.x * blockDim.x + threadIdx.x;
+  if (y >= young_count) {
+    return;
+  }
+  const SimCudaParticle& star = particles[young_star_indices[y]];
+  const float sx = static_cast<float>(star.position_kpc[0] - grid_origin_x);
+  const float sy = static_cast<float>(star.position_kpc[1] - grid_origin_y);
+  const float sz = static_cast<float>(star.position_kpc[2] - grid_origin_z);
+  const float cell_f = static_cast<float>(cell_kpc);
+  const int ix = min(nx - 1, max(0, static_cast<int>(floorf(sx / cell_f))));
+  const int iy = min(ny - 1, max(0, static_cast<int>(floorf(sy / cell_f))));
+  const int iz = min(nz - 1, max(0, static_cast<int>(floorf(sz / cell_f))));
+  const float radius_sq = feedback_radius * feedback_radius;
+
+  for (int cx = max(0, ix - 1); cx <= min(nx - 1, ix + 1); ++cx) {
+    for (int cy = max(0, iy - 1); cy <= min(ny - 1, iy + 1); ++cy) {
+      for (int cz = max(0, iz - 1); cz <= min(nz - 1, iz + 1); ++cz) {
+        const int cell = (cx * ny + cy) * nz + cz;
+        const int start = gas_cell_start[cell];
+        if (start < 0) {
+          continue;
+        }
+        const int end = gas_cell_end[cell];
+        for (int j = start; j < end; ++j) {
+          const float4 gp = gas_posh[j];
+          const float dx = gp.x - sx;
+          const float dy = gp.y - sy;
+          const float dz = gp.z - sz;
+          const float r2 = dx * dx + dy * dy + dz * dz;
+          if (r2 <= 1.0e-8f || r2 >= radius_sq) {
+            continue;
+          }
+          const float r = sqrtf(r2);
+          const float taper = 1.0f - r / feedback_radius;
+          const float scale = feedback_accel * taper / r;
+          float* accel = reinterpret_cast<float*>(&gas_accel_canonical[gas_sorted_canonical[j]]);
+          atomicAdd(accel + 0, scale * dx);
+          atomicAdd(accel + 1, scale * dy);
+          atomicAdd(accel + 2, scale * dz);
+        }
+      }
+    }
+  }
+}
+
+struct YoungStarPredicate {
+  const SimCudaParticle* particles;
+  const float* birth_time_myr;
+  float now_myr;
+  __device__ bool operator()(const int index) const {
+    return particles[index].component == 5u &&
+           now_myr - birth_time_myr[index] < 40.0f;
+  }
+};
+
 struct GasComponentPredicate {
   const SimCudaParticle* particles;
   __device__ bool operator()(const int index) const {
@@ -3555,9 +3707,14 @@ int build_gas_structure(DeviceState* state,
         GasComponentPredicate{state->particles});
     const std::size_t found =
         static_cast<std::size_t>(copied_end - thrust::device_pointer_cast(state->gas_indices));
-    if (found != state->gas_count) {
-      fill_error(error_buffer, error_buffer_len, "gas particle count changed unexpectedly");
+    if (found > state->gas_capacity) {
+      fill_error(error_buffer, error_buffer_len, "gas particle count exceeded its capacity");
       return 1;
+    }
+    // Star formation converts gas in place, so the population only shrinks.
+    state->gas_count = static_cast<std::uint32_t>(found);
+    if (state->gas_count == 0) {
+      return 0;
     }
   } catch (const std::exception& error) {
     fill_error(error_buffer, error_buffer_len, error.what());
@@ -3679,6 +3836,68 @@ int build_gas_structure(DeviceState* state,
       static_cast<float>(state->gas_sound_speed_kms),
       static_cast<float>(state->gas_viscosity_alpha),
       state->gas_accel);
+  if (state->feedback_accel > 0.0 && state->young_star_capacity > 0) {
+    std::uint32_t young_count = 0;
+    try {
+      const auto young_end = thrust::copy_if(
+          thrust::cuda::par.on(state->compute_stream),
+          thrust::counting_iterator<int>(0),
+          thrust::counting_iterator<int>(static_cast<int>(state->particle_count)),
+          thrust::device_pointer_cast(state->young_star_indices),
+          YoungStarPredicate{state->particles,
+                             state->birth_time_myr,
+                             static_cast<float>(state->sim_time_myr)});
+      young_count = static_cast<std::uint32_t>(
+          young_end - thrust::device_pointer_cast(state->young_star_indices));
+      young_count = min(young_count, state->young_star_capacity);
+    } catch (const std::exception& error) {
+      fill_error(error_buffer, error_buffer_len, error.what());
+      return 1;
+    }
+    if (young_count > 0) {
+      const int young_blocks =
+          static_cast<int>((young_count + threads_per_block - 1) / threads_per_block);
+      apply_sn_feedback<<<young_blocks, threads_per_block, 0, state->compute_stream>>>(
+          state->particles,
+          state->young_star_indices,
+          young_count,
+          state->gas_cell_start,
+          state->gas_cell_end,
+          state->gas_sorted_canonical,
+          state->gas_posh_sorted,
+          state->gas_grid_origin[0],
+          state->gas_grid_origin[1],
+          state->gas_grid_origin[2],
+          state->gas_grid_cell_kpc,
+          state->gas_nx,
+          state->gas_ny,
+          state->gas_nz,
+          static_cast<float>(state->feedback_accel),
+          static_cast<float>(state->feedback_radius_kpc),
+          state->gas_accel);
+    }
+  }
+
+  state->sph_build_counter += 1;
+  if (state->star_formation_efficiency > 0.0 &&
+      state->star_formation_density > 0.0 &&
+      state->sph_build_counter % 16 == 0) {
+    // dt per conversion epoch: 16 builds at roughly the current substep
+    // cadence; base_timestep is a good stand-in since builds track substeps.
+    const float epoch_dt_myr =
+        static_cast<float>(16.0 * state->base_timestep_myr * 0.5);
+    form_stars_kernel<<<gas_blocks, threads_per_block, 0, state->compute_stream>>>(
+        state->particles,
+        state->birth_time_myr,
+        state->gas_density_sorted,
+        state->gas_sorted_canonical,
+        state->gas_count,
+        static_cast<float>(state->star_formation_density),
+        static_cast<float>(state->star_formation_efficiency) * epoch_dt_myr,
+        static_cast<float>(state->grav_const),
+        static_cast<float>(state->sim_time_myr),
+        static_cast<std::uint32_t>(state->sph_build_counter));
+  }
   cuda_status = cudaGetLastError();
   if (cuda_status != cudaSuccess) {
     fill_cuda_error(error_buffer, error_buffer_len, "SPH kernel launch failed", cuda_status);
@@ -4189,6 +4408,10 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
     destroy_state(state);
     return 1;
   }
+  state->star_formation_efficiency = params->star_formation_efficiency;
+  state->star_formation_density = params->star_formation_density_msun_kpc3;
+  state->feedback_accel = params->feedback_accel;
+  state->feedback_radius_kpc = params->feedback_radius_kpc > 0.0 ? params->feedback_radius_kpc : 0.25;
   state->gas_sound_speed_kms = params->gas_sound_speed_kms;
   state->gas_viscosity_alpha = params->gas_viscosity_alpha > 0.0 ? params->gas_viscosity_alpha : 1.0;
   state->gas_smoothing_eta = params->gas_smoothing_eta > 0.0 ? params->gas_smoothing_eta : 1.3;
@@ -4199,13 +4422,30 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
     }
   }
   state->gas_count = gas_count;
+  state->gas_capacity = gas_count;
+  state->young_star_capacity = gas_count;
   if (cudaMalloc(reinterpret_cast<void**>(&state->smoothing_h),
                  sizeof(float) * params->particle_count) != cudaSuccess ||
       cudaMalloc(reinterpret_cast<void**>(&state->smoothing_h_scratch),
+                 sizeof(float) * params->particle_count) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&state->birth_time_myr),
+                 sizeof(float) * params->particle_count) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&state->birth_time_scratch),
                  sizeof(float) * params->particle_count) != cudaSuccess) {
     fill_error(error_buffer, error_buffer_len, "cudaMalloc for smoothing lengths failed");
     destroy_state(state);
     return 1;
+  }
+  {
+    std::vector<float> births_host(params->particle_count, -1.0e30f);
+    if (cudaMemcpy(state->birth_time_myr,
+                   births_host.data(),
+                   sizeof(float) * params->particle_count,
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+      fill_error(error_buffer, error_buffer_len, "birth time upload failed");
+      destroy_state(state);
+      return 1;
+    }
   }
   {
     // Seed h from a neutral 0.1 kpc; the density pass refines it toward
@@ -4234,7 +4474,9 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
         cudaMalloc(reinterpret_cast<void**>(&state->gas_velm_sorted), sizeof(float4) * n) != cudaSuccess ||
         cudaMalloc(reinterpret_cast<void**>(&state->gas_density_sorted), sizeof(float) * n) != cudaSuccess ||
         cudaMalloc(reinterpret_cast<void**>(&state->gas_accel),
-                   sizeof(float4) * params->particle_count) != cudaSuccess) {
+                   sizeof(float4) * params->particle_count) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->young_star_indices),
+                   sizeof(int) * n) != cudaSuccess) {
       fill_error(error_buffer, error_buffer_len, "cudaMalloc for SPH buffers failed");
       destroy_state(state);
       return 1;
