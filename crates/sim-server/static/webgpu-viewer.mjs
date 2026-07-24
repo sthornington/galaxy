@@ -154,29 +154,7 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
   var size: f32;
   var splatColor: vec3f;
   var marker = 0.0;
-  var supernova = false;
-  if (component == 5u && age < 0.013) {
-    // Supernova light curve: sharp rise, brief white-blue peak, exponential
-    // decay cooling through orange to an ember (see the WebGL tier).
-    let t = u.simTimeMyr * 4.0 + h * 37.0;
-    let epoch = floor(t);
-    let roll = fract(h * 977.31 + epoch * 0.618034);
-    if (roll > 0.97) {
-      let p = fract(t);
-      let curve = smoothstep(0.0, 0.06, p) * min(1.0, exp(-(p - 0.06) * 7.0));
-      if (curve > 0.02) {
-        // Lens-flare fragment path (marker 2): pinpoint HDR core plus thin
-        // diffraction spikes; subtle by area, bright by intensity.
-        marker = 2.0;
-        size = clamp((10.0 + 14.0 * curve) * u.sizeBoost, 8.0, 26.0);
-        splatColor = mix(vec3f(1.8, 0.8, 0.4), vec3f(1.0, 1.05, 1.3), curve) * (3.0 + 52.0 * curve);
-        supernova = true;
-      }
-    }
-  }
-  if (supernova) {
-    // handled above
-  } else if (component == 3u) {
+  if (component == 3u) {
     // SMBH beacon: fixed-size cyan ring + core, unaffected by style.
     marker = 1.0;
     size = clamp(18.0 * u.sizeBoost, 12.0, 40.0);
@@ -213,15 +191,6 @@ fn fs(in: VSOut) -> @location(0) vec4f {
   let r2 = dot(in.uv, in.uv);
   if (r2 > 1.0) {
     discard;
-  }
-  if (in.marker > 1.5) {
-    // Supernova lens flare: pinpoint core + thin diffraction spikes.
-    let ax = abs(in.uv.x);
-    let ay = abs(in.uv.y);
-    let core = exp(-r2 * 55.0);
-    let spikes = exp(-ay * ay * 260.0) * max(0.0, 1.0 - ax)
-               + exp(-ax * ax * 260.0) * max(0.0, 1.0 - ay);
-    return vec4f(in.color * (core + 0.22 * spikes), 1.0);
   }
   if (in.marker > 0.5) {
     let ring = smoothstep(0.40, 0.55, r2) * (1.0 - smoothstep(0.75, 1.0, r2));

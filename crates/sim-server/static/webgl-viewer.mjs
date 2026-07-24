@@ -144,30 +144,6 @@ void main() {
   // oversized white-hot sprites that bypass the area normalization — pushed
   // through the regular luminosity path, the tonemap compresses them into
   // invisibility.
-  if (a_component == 5u && a_age < 0.013) {
-    // Supernova light curve: sharp rise to a brief white-blue peak, then an
-    // exponential decay cooling through orange to a faint ember. Per-particle
-    // phase offsets desynchronize the flares; the peak is bright but lives
-    // only ~6% of the flare window, so the population reads as scattered
-    // transient flashes rather than steady beacons.
-    float t = u_simTimeMyr * 4.0 + h * 37.0;
-    float epoch = floor(t);
-    float roll = fract(h * 977.31 + epoch * 0.618034);
-    if (roll > 0.97) {
-      float p = fract(t);
-      float curve = smoothstep(0.0, 0.06, p) * min(1.0, exp(-(p - 0.06) * 7.0));
-      if (curve > 0.02) {
-        // Lens-flare fragment path (marker 2): the sprite canvas is mostly
-        // transparent — a pinpoint HDR core the bloom halos, plus thin
-        // diffraction spikes. Subtle by area, bright by intensity.
-        v_marker = 2.0;
-        gl_PointSize = clamp((10.0 + 14.0 * curve) * u_sizeBoost, 8.0, 26.0);
-        v_color = mix(vec3(1.8, 0.8, 0.4), vec3(1.0, 1.05, 1.3), curve) * (3.0 + 52.0 * curve);
-        return;
-      }
-    }
-  }
-
   float perspective = clamp((u_pointScale / clip.w) * 0.18, 0.02, 3.5);
   // Gas is a fluid: always the soft-glow path (even in dots mode) with a
   // broader footprint so it reads as a continuous medium between the stars.
@@ -205,16 +181,6 @@ void main() {
   float r2 = dot(offset, offset);
   if (r2 > 1.0) {
     discard;
-  }
-  if (v_marker > 1.5) {
-    // Supernova lens flare: pinpoint core + thin diffraction spikes.
-    float ax = abs(offset.x);
-    float ay = abs(offset.y);
-    float core = exp(-r2 * 55.0);
-    float spikes = exp(-ay * ay * 260.0) * max(0.0, 1.0 - ax)
-                 + exp(-ax * ax * 260.0) * max(0.0, 1.0 - ay);
-    fragColor = vec4(v_color * (core + 0.22 * spikes), 1.0);
-    return;
   }
   if (v_marker > 0.5) {
     float ring = smoothstep(0.40, 0.55, r2) * (1.0 - smoothstep(0.75, 1.0, r2));
