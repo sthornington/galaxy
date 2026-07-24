@@ -697,6 +697,7 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     state.displayHdr = dynRange?.matches ?? false;
     dynRange?.addEventListener?.("change", (e) => {
       state.displayHdr = e.matches;
+      reportClient({ src: "webgpu-viewer", event: "display-change", dynamicRange: e.matches });
     });
     reportClient({
       event: "webgpu-init",
