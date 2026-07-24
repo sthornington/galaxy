@@ -174,7 +174,12 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
     splatColor = color * (0.05 + 0.11 * renderLuminosity);
   } else {
     let gasBoost = select(1.0, 1.6, component == 4u);
-    size = clamp(2.6 * gasBoost * renderLuminosity * pow(perspective, 0.9) * u.sizeBoost, 1.25, 48.0);
+    // Gas footprint is density-independent: a collapsing knot is compact,
+    // and letting the bright dense gas also grow its sprite piles fill cost
+    // and additive white-out into the nuclei. Density still drives its
+    // energy (alpha below) and color.
+    let sizeLuminosity = select(renderLuminosity, 0.76, component == 4u);
+    size = clamp(2.6 * gasBoost * sizeLuminosity * pow(perspective, 0.9) * u.sizeBoost, 1.25, 48.0);
     let alpha = 0.055 * renderLuminosity * pow(perspective, 0.92);
     let area = size * size;
     splatColor = color * clamp(alpha * 52.0 / area, 0.0006, 0.35);
@@ -1205,9 +1210,15 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     uniformF32[53] = pair.current.massLog[1];
     uniformF32[54] = dotStyle ? 1.0 : 0.0;
     uniformF32[55] = focalLength;
-    uniformF32[56] = Math.max(1, gpu.hdrWidth / Math.max(1, state.cssWidth));
-    uniformF32[57] = gpu.hdrWidth;
-    uniformF32[58] = gpu.hdrHeight;
+    // Size/brightness math runs in FULL backing-store pixel units (stable),
+    // never the adaptive HDR-target resolution: perspective feeds splat alpha
+    // (^0.92), so deriving it from the auto-quality target made luminosity
+    // track the render scale — brightness visibly pumped with zoom and load.
+    // resX/resY must stay in the same units so size -> NDC stays correct;
+    // the smaller target then just samples the same additive field coarser.
+    uniformF32[56] = Math.max(1, canvas.width / Math.max(1, state.cssWidth));
+    uniformF32[57] = canvas.width;
+    uniformF32[58] = canvas.height;
     uniformF32[59] =
       exposureBoost * Math.min(5, Math.max(0.12, 460000 / Math.max(1, pair.current.count)));
     uniformF32[60] = state.hdrActive ? (headroomOverride ?? 3.0) : 1.0;
@@ -1265,7 +1276,7 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     lookAtInto(viewMatrix, basis.eye, camera.focus, WORLD_UP);
     multiplyInto(viewProjMatrix, projMatrix, viewMatrix);
 
-    const focalLength = (Math.min(gpu.hdrWidth, gpu.hdrHeight) * 0.5) / Math.tan(Math.PI / 8);
+    const focalLength = (Math.min(canvas.width, canvas.height) * 0.5) / Math.tan(Math.PI / 8);
     writeUniforms(pair, focalLength);
     writeAxes();
 

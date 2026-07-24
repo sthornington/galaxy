@@ -165,7 +165,12 @@ void main() {
     v_color = color * (0.05 + 0.11 * renderLuminosity);
     return;
   }
-  float size = 2.6 * gasBoost * renderLuminosity * pow(perspective, 0.9) * u_sizeBoost;
+  // Gas footprint is density-independent: a collapsing knot is compact, and
+  // letting the bright dense gas also grow its sprite piles fill cost and
+  // additive white-out into the nuclei. Density still drives its energy
+  // (alpha below) and color.
+  float sizeLuminosity = a_component == 4u ? 0.76 : renderLuminosity;
+  float size = 2.6 * gasBoost * sizeLuminosity * pow(perspective, 0.9) * u_sizeBoost;
   gl_PointSize = clamp(size, 1.25, 48.0);
 
   // Fold the per-splat energy into the color (additive accumulation); divide
