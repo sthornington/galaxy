@@ -131,12 +131,6 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
     luminosity *= 0.42 + 2.2 * pow(h2, 3.0);
   }
   luminosity *= 1.0 + 2.0 * youth + 6.0 * flash;
-  // Supernovae: a few percent of young clusters flare white-hot at any
-  // moment, re-rolled every ~0.8 Myr of sim time.
-  if (component == 5u && age < 0.026) {
-    let roll = fract(h * 977.31 + floor(u.simTimeMyr * 1.3) * 0.618034);
-    luminosity *= 1.0 + step(0.965, roll) * 14.0;
-  }
   let renderLuminosity = pow(luminosity, 0.58);
   let massBias = clamp((logMass - 4.2) / 1.6, 0.0, 1.0);
 
@@ -160,7 +154,22 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
   var size: f32;
   var splatColor: vec3f;
   var marker = 0.0;
-  if (component == 3u) {
+  var supernova = false;
+  if (component == 5u && age < 0.04) {
+    let roll = fract(h * 977.31 + floor(u.simTimeMyr * 1.3) * 0.618034);
+    if (roll > 0.975) {
+      // A supernova must punch through the log tonemap AND cross the bloom
+      // threshold to read as a white star: that takes hundreds of HDR units
+      // at typical auto-exposure, not single digits.
+      let pulse = fract(roll * 83.7);
+      size = clamp((7.0 + 5.0 * pulse) * u.sizeBoost, 6.0, 18.0);
+      splatColor = vec3f(120.0, 128.0, 150.0) * (0.4 + 1.2 * pulse);
+      supernova = true;
+    }
+  }
+  if (supernova) {
+    // handled above
+  } else if (component == 3u) {
     // SMBH beacon: fixed-size cyan ring + core, unaffected by style.
     marker = 1.0;
     size = clamp(18.0 * u.sizeBoost, 12.0, 40.0);

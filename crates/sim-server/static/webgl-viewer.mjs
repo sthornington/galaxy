@@ -117,12 +117,6 @@ void main() {
     luminosity *= imf;
   }
   luminosity *= 1.0 + 2.0 * youth + 6.0 * flash;
-  // Supernovae: clusters younger than ~40 Myr host core-collapse SNe; a few
-  // percent flare white-hot at any moment, re-rolled every ~0.8 Myr.
-  if (a_component == 5u && a_age < 0.026) {
-    float roll = fract(h * 977.31 + floor(u_simTimeMyr * 1.3) * 0.618034);
-    luminosity *= 1.0 + step(0.965, roll) * 14.0;
-  }
   float renderLuminosity = pow(luminosity, 0.58);
   float massBias = clamp((logMass - 4.2) / 1.6, 0.0, 1.0);
 
@@ -144,6 +138,24 @@ void main() {
     base = mix(base, vec3(1.0, 0.97, 0.93), 0.22);
   }
   vec3 color = base * (0.82 + 0.36 * h2);
+
+  // Supernovae: clusters younger than ~40 Myr host core-collapse SNe; a few
+  // percent flare at any moment (re-rolled every ~0.8 Myr) and render as
+  // oversized white-hot sprites that bypass the area normalization — pushed
+  // through the regular luminosity path, the tonemap compresses them into
+  // invisibility.
+  if (a_component == 5u && a_age < 0.04) {
+    float roll = fract(h * 977.31 + floor(u_simTimeMyr * 1.3) * 0.618034);
+    if (roll > 0.975) {
+      // A supernova must punch through the log tonemap AND cross the bloom
+      // threshold to read as a white star: that takes hundreds of HDR units
+      // at typical auto-exposure, not single digits.
+      float pulse = fract(roll * 83.7);
+      gl_PointSize = clamp((7.0 + 5.0 * pulse) * u_sizeBoost, 6.0, 18.0);
+      v_color = vec3(120.0, 128.0, 150.0) * (0.4 + 1.2 * pulse);
+      return;
+    }
+  }
 
   float perspective = clamp((u_pointScale / clip.w) * 0.18, 0.02, 3.5);
   // Gas is a fluid: always the soft-glow path (even in dots mode) with a
