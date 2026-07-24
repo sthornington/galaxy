@@ -113,7 +113,7 @@ void main() {
   // dense lanes where stars ignite glow warm.
   float gasDensity = clamp((logMass - 6.4) * 0.36, 0.0, 1.0);
   float luminosity = a_component == 4u
-      ? 0.16 + 1.25 * gasDensity * gasDensity
+      ? 0.09 + 0.85 * gasDensity * gasDensity
       : clamp((logMass - 3.7) / 2.2, 0.25, 1.8);
   // IMF-like magnitude spread: a heavy faint tail with rare bright outliers,
   // so the stellar field sparkles instead of rendering uniform points.
@@ -156,7 +156,7 @@ void main() {
   float perspective = clamp((u_pointScale / clip.w) * 0.18, 0.02, 3.5);
   // Gas is a fluid: always the soft-glow path (even in dots mode) with a
   // broader footprint so it reads as a continuous medium between the stars.
-  float gasBoost = a_component == 4u ? 1.35 : 1.0;
+  float gasBoost = a_component == 4u ? 1.25 : 1.0;
   if (u_style > 0.5 && a_component != 4u) {
     // Crisp dots: tiny fixed-ish footprint (near-zero fill cost), mild
     // distance attenuation, energy carried by the dot itself.

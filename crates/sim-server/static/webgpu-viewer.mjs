@@ -131,7 +131,7 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
   // star-forming knots (~1.5e9, just past the collapse threshold).
   let gasDensity = clamp((logMass - 6.4) * 0.36, 0.0, 1.0);
   var luminosity = select(clamp((logMass - 3.7) / 2.2, 0.25, 1.8),
-                          0.16 + 1.25 * gasDensity * gasDensity, component == 4u);
+                          0.09 + 0.85 * gasDensity * gasDensity, component == 4u);
   if (component == 1u || component == 2u || component == 5u) {
     luminosity *= 0.42 + 2.2 * pow(h2, 3.0);
   }
@@ -173,7 +173,7 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
                  1.5, 6.0);
     splatColor = color * (0.05 + 0.11 * renderLuminosity);
   } else {
-    let gasBoost = select(1.0, 1.35, component == 4u);
+    let gasBoost = select(1.0, 1.25, component == 4u);
     // Gas footprint is density-independent: a collapsing knot is compact,
     // and letting the bright dense gas also grow its sprite piles fill cost
     // and additive white-out into the nuclei. Density still drives its
