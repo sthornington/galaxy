@@ -17,7 +17,7 @@ const PACKET_MAGIC = 0x54_4b_50_47; // "GPKT"
 const PACKET_VERSION = 2;
 const PACKET_PREFIX_BYTES = HEADER_BYTES + QUANT_BLOCK_BYTES;
 const DELTA_MAGIC = 0x4c_44_50_47; // "GPDL"
-const DELTA_VERSION = 1;
+const DELTA_VERSION = 2;
 const DELTA_HEADER_BYTES = 32;
 const POOL_SIZE = 4;
 
@@ -133,10 +133,12 @@ function acceptDelta(data) {
   const previewCount = header.getUint32(8, true);
   const positionBits = header.getUint8(12);
   const velocityBits = header.getUint8(13);
+  const massBits = header.getUint8(14);
   const baseSimTime = header.getFloat64(16, true);
   const fullFrameBytes = header.getUint32(24, true);
   const payloadBytes = header.getUint32(28, true);
-  const expectedBits = previewCount * 3 * (positionBits + velocityBits);
+  const expectedBits =
+    previewCount * (3 * (positionBits + velocityBits) + massBits);
   const expectedPayloadBytes = Math.ceil(expectedBits / 8);
   if (
     header.getUint32(4, true) !== DELTA_VERSION ||
@@ -144,6 +146,8 @@ function acceptDelta(data) {
     positionBits > 17 ||
     velocityBits < 1 ||
     velocityBits > 17 ||
+    massBits < 1 ||
+    massBits > 17 ||
     fullFrameBytes !== PACKET_PREFIX_BYTES + previewCount * PARTICLE_STRIDE ||
     payloadBytes !== expectedPayloadBytes ||
     data.byteLength !== DELTA_HEADER_BYTES + PACKET_PREFIX_BYTES + payloadBytes
@@ -184,8 +188,10 @@ function acceptDelta(data) {
     new Uint8Array(data, prefixOffset, PACKET_PREFIX_BYTES)
   );
 
-  // Particle records are eight little-endian u16 words. The first six are
-  // signed deltas; mass, component, and the reserved byte remain unchanged.
+  // Particle records are eight little-endian u16 words. The first seven are
+  // signed deltas (positions, velocities, then the quantized mass word, which
+  // carries evolving SPH density for gas); component and the reserved byte
+  // remain unchanged.
   const previousWords = new Uint16Array(
     previous,
     PACKET_PREFIX_BYTES,
@@ -207,22 +213,27 @@ function acceptDelta(data) {
   const velocityMask = (1 << velocityBits) - 1;
   const velocitySign = 1 << (velocityBits - 1);
   const velocityRange = 1 << velocityBits;
+  const massMask = (1 << massBits) - 1;
+  const massSign = 1 << (massBits - 1);
+  const massRange = 1 << massBits;
   let packedIndex = 0;
   let bitBuffer = 0;
   let bufferedBits = 0;
 
   for (let particle = 0; particle < previewCount; particle += 1) {
     const record = particle * (PARTICLE_STRIDE / 2);
-    for (let field = 0; field < 6; field += 1) {
-      const bits = field < 3 ? positionBits : velocityBits;
+    for (let field = 0; field < 7; field += 1) {
+      const bits =
+        field < 3 ? positionBits : field < 6 ? velocityBits : massBits;
       while (bufferedBits < bits) {
         bitBuffer |= packed[packedIndex] << bufferedBits;
         packedIndex += 1;
         bufferedBits += 8;
       }
-      const mask = field < 3 ? positionMask : velocityMask;
-      const sign = field < 3 ? positionSign : velocitySign;
-      const range = field < 3 ? positionRange : velocityRange;
+      const mask = field < 3 ? positionMask : field < 6 ? velocityMask : massMask;
+      const sign = field < 3 ? positionSign : field < 6 ? velocitySign : massSign;
+      const range =
+        field < 3 ? positionRange : field < 6 ? velocityRange : massRange;
       const encoded = bitBuffer & mask;
       const delta = encoded & sign ? encoded - range : encoded;
       const value = previousWords[record + field] + delta;
@@ -234,7 +245,6 @@ function acceptDelta(data) {
       bitBuffer >>>= bits;
       bufferedBits -= bits;
     }
-    nextWords[record + 6] = previousWords[record + 6];
     nextWords[record + 7] = previousWords[record + 7];
   }
 

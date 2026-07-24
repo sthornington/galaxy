@@ -29,26 +29,27 @@ function fullFrame(count, step) {
       base + 5 + step * 2,
     ];
     values.forEach((value, field) => view.setUint16(offset + field * 2, value, true));
-    view.setUint16(offset + 12, 500 + particle, true);
+    view.setUint16(offset + 12, 500 + particle + step * 3, true);
     view.setUint8(offset + 14, particle % 4);
   }
   return buffer;
 }
 
-function deltaFrame(previous, current, positionBits = 4, velocityBits = 5) {
+function deltaFrame(previous, current, positionBits = 4, velocityBits = 5, massBits = 4) {
   const previousView = new DataView(previous);
   const currentView = new DataView(current);
   const count = currentView.getUint32(16, true);
-  const payloadBits = count * 3 * (positionBits + velocityBits);
+  const payloadBits = count * (3 * (positionBits + velocityBits) + massBits);
   const payloadBytes = Math.ceil(payloadBits / 8);
   const buffer = new ArrayBuffer(32 + PREFIX_BYTES + payloadBytes);
   const bytes = new Uint8Array(buffer);
   const view = new DataView(buffer);
   bytes.set(new TextEncoder().encode("GPDL"), 0);
-  view.setUint32(4, 1, true);
+  view.setUint32(4, 2, true);
   view.setUint32(8, count, true);
   view.setUint8(12, positionBits);
   view.setUint8(13, velocityBits);
+  view.setUint8(14, massBits);
   view.setFloat64(16, previousView.getFloat64(24, true), true);
   view.setUint32(24, current.byteLength, true);
   view.setUint32(28, payloadBytes, true);
@@ -57,8 +58,8 @@ function deltaFrame(previous, current, positionBits = 4, velocityBits = 5) {
   let bitOffset = 0;
   for (let particle = 0; particle < count; particle += 1) {
     const record = PREFIX_BYTES + particle * PARTICLE_BYTES;
-    for (let field = 0; field < 6; field += 1) {
-      const bits = field < 3 ? positionBits : velocityBits;
+    for (let field = 0; field < 7; field += 1) {
+      const bits = field < 3 ? positionBits : field < 6 ? velocityBits : massBits;
       const previousValue = previousView.getUint16(record + field * 2, true);
       const currentValue = currentView.getUint16(record + field * 2, true);
       const encoded = (currentValue - previousValue) & ((1 << bits) - 1);

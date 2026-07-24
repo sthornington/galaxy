@@ -107,8 +107,13 @@ void main() {
   float youth = a_component == 5u ? 1.0 - a_age : 0.0;
   float flash = a_component == 5u ? exp(-a_age * 42.0) : 0.0;
   float logMass = (u_massLog.x + a_mass * u_massLog.y) * 0.3010299957;
+  // Gas streams its SPH density (Msun/kpc^3) through the mass slot: ramp
+  // from diffuse cirrus (~2.5e6) through the disk median (~7e7, teal) to
+  // star-forming knots (~1.5e9, just past the collapse threshold), so the
+  // dense lanes where stars ignite glow warm.
+  float gasDensity = clamp((logMass - 6.4) * 0.36, 0.0, 1.0);
   float luminosity = a_component == 4u
-      ? 0.55
+      ? 0.30 + 1.10 * gasDensity * gasDensity
       : clamp((logMass - 3.7) / 2.2, 0.25, 1.8);
   // IMF-like magnitude spread: a heavy faint tail with rare bright outliers,
   // so the stellar field sparkles instead of rendering uniform points.
@@ -122,8 +127,12 @@ void main() {
 
   vec3 base;
   if (a_component == 4u) {
-    // Gas: cool teal-cyan fluid, hue drifting with the per-particle hash.
-    base = mix(vec3(0.30, 0.80, 0.72), vec3(0.50, 0.92, 1.05), h);
+    // Gas: density-colored fluid — dim slate-blue cirrus, teal mid-density,
+    // warm HII pink where it has collapsed to the star-formation threshold.
+    vec3 cool = mix(vec3(0.20, 0.42, 0.60), vec3(0.36, 0.85, 0.88),
+                    min(gasDensity * 1.8182, 1.0));
+    base = mix(cool, vec3(1.15, 0.52, 0.62), smoothstep(0.55, 1.0, gasDensity));
+    base = mix(base, base.bgr, 0.10 * h);
   } else if (a_component == 5u) {
     base = mix(vec3(1.0, 0.94, 0.80), vec3(0.62, 0.78, 1.35), 0.35 + 0.65 * youth);
   } else if (a_component == 2u) {
@@ -981,7 +990,7 @@ function createViewer(gl, canvas, restoreCanvas, sessionId) {
   }
 
   try {
-    worker = new Worker("/webgl-stream-worker.js?v=20260722-24");
+    worker = new Worker("/webgl-stream-worker.js?v=20260724-35");
     worker.onmessage = (event) => {
       if (state.disposed) {
         return;

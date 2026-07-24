@@ -290,6 +290,7 @@ struct DeviceState {
   float4* gas_velm_sorted = nullptr;   // xyz velocity, w = mass
   float* gas_density_sorted = nullptr;
   float4* gas_accel = nullptr;         // canonical-indexed, (km/s)^2/kpc
+  float* gas_density_canonical = nullptr; // canonical-indexed, Msun/kpc^3
   int gas_nx = 0;
   int gas_ny = 0;
   int gas_nz = 0;
@@ -357,6 +358,7 @@ __global__ void sample_preview(const SimCudaParticle* particles,
                                const std::uint32_t sampled_count,
                                const float* __restrict__ birth_time_myr,
                                const float sim_time_epoch_myr,
+                               const float* __restrict__ gas_density_canonical,
                                SimCudaPreviewParticle* out_particles);
 
 const char* cufft_error_string(const cufftResult status) {
@@ -519,6 +521,7 @@ void destroy_state(DeviceState* state) {
   cudaFree(state->gas_velm_sorted);
   cudaFree(state->gas_density_sorted);
   cudaFree(state->gas_accel);
+  cudaFree(state->gas_density_canonical);
   cudaFree(state->young_star_indices);
   cudaFree(state->inverse_index);
   cudaFree(state->particles_scratch);
@@ -688,6 +691,7 @@ int schedule_preview_capture(DeviceState* state,
       sampled_count,
       state->birth_time_myr,
       static_cast<float>(std::floor(state->sim_time_myr / 6.4) * 6.4),
+      state->gas_density_canonical,
       state->preview_particles);
   cudaError_t cuda_status = cudaGetLastError();
   if (cuda_status != cudaSuccess) {
@@ -2557,6 +2561,7 @@ __global__ void sample_preview(const SimCudaParticle* particles,
                                const std::uint32_t sampled_count,
                                const float* __restrict__ birth_time_myr,
                                const float sim_time_epoch_myr,
+                               const float* __restrict__ gas_density_canonical,
                                SimCudaPreviewParticle* out_particles) {
   const std::uint32_t preview_count = anchor_count + sampled_count;
   const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2585,7 +2590,16 @@ __global__ void sample_preview(const SimCudaParticle* particles,
   out_particles[index].velocity_kms[0] = static_cast<float>(particle.velocity_kms[0]);
   out_particles[index].velocity_kms[1] = static_cast<float>(particle.velocity_kms[1]);
   out_particles[index].velocity_kms[2] = static_cast<float>(particle.velocity_kms[2]);
-  out_particles[index].mass_msun = static_cast<float>(particle.mass_msun);
+  // Gas particles all share one mass, so their mass slot streams the local
+  // SPH density instead (the renderers color and weight gas by it).
+  float mass_out = static_cast<float>(particle.mass_msun);
+  if (particle.component == 4u && gas_density_canonical != nullptr) {
+    const float rho = gas_density_canonical[source_index];
+    if (rho > 0.0f) {
+      mass_out = rho;
+    }
+  }
+  out_particles[index].mass_msun = mass_out;
   // High byte: stellar age in 6.4 Myr ticks (255 = primordial). The epoch
   // quantization makes every young star's byte change on the same frames,
   // keeping the preview delta encoder effective between those keyframes.
@@ -3427,7 +3441,8 @@ __global__ void gas_density_kernel(const float4* __restrict__ posh,
                                    const int nz,
                                    const float smoothing_eta,
                                    float* __restrict__ density_out,
-                                   float* __restrict__ smoothing_h_canonical) {
+                                   float* __restrict__ smoothing_h_canonical,
+                                   float* __restrict__ density_canonical) {
   const std::uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
   if (g >= gas_count) {
     return;
@@ -3440,6 +3455,7 @@ __global__ void gas_density_kernel(const float4* __restrict__ posh,
   const int iz = min(nz - 1, max(0, static_cast<int>(floorf(self.z / cell_f))));
 
   float rho = 0.0f;
+  int neighbors = 0;
   for (int cx = max(0, ix - 1); cx <= min(nx - 1, ix + 1); ++cx) {
     for (int cy = max(0, iy - 1); cy <= min(ny - 1, iy + 1); ++cy) {
       for (int cz = max(0, iz - 1); cz <= min(nz - 1, iz + 1); ++cz) {
@@ -3456,6 +3472,7 @@ __global__ void gas_density_kernel(const float4* __restrict__ posh,
           const float dz = other.z - self.z;
           const float r = sqrtf(dx * dx + dy * dy + dz * dz);
           rho += velm[j].w * sph_kernel_w(r, h_i);
+          neighbors += (r > 0.0f && r < h_i) ? 1 : 0;
         }
       }
     }
@@ -3463,14 +3480,29 @@ __global__ void gas_density_kernel(const float4* __restrict__ posh,
   rho = fmaxf(rho, 1.0e-12f);
   density_out[g] = rho;
 
-  // Predictor update for the next build: h -> eta*(m/rho)^(1/3), rate-limited
-  // so a noisy first estimate cannot slew the neighborhood violently, and
-  // clamped so max(h_i, h_j) always fits the 27-cell search (cell >= 2h_max).
+  // Self-contribution trap: with no real neighbors inside h, the kernel sum
+  // is just the particle's own W(0) term, which reports a huge density and
+  // drives the adaptive h onto (and pins it at) the lower clamp -- isolated
+  // ambient gas then reads as "collapsing" everywhere. A healthy neighborhood
+  // at eta = 1.3 holds ~9 neighbors; below 4 the estimate has no support, so
+  // grow h instead of trusting it and pass the self-free density downstream
+  // (star formation and the streamed preview).
   const float mass = velm[g].w;
-  float h_new = smoothing_eta * cbrtf(mass / rho);
-  h_new = fminf(fmaxf(h_new, 0.8f * h_i), 1.25f * h_i);
+  const bool starved = neighbors < 4;
+  float h_new;
+  if (starved) {
+    h_new = h_i * 1.25f;
+  } else {
+    // Predictor update for the next build: h -> eta*(m/rho)^(1/3),
+    // rate-limited so a noisy estimate cannot slew the neighborhood violently.
+    h_new = smoothing_eta * cbrtf(mass / rho);
+    h_new = fminf(fmaxf(h_new, 0.8f * h_i), 1.25f * h_i);
+  }
+  // Clamped so max(h_i, h_j) always fits the 27-cell search (cell >= 2h_max).
   h_new = fminf(fmaxf(h_new, 0.05f), 0.45f);
   smoothing_h_canonical[sorted_canonical[g]] = h_new;
+  const float rho_neighbors = fmaxf(rho - mass * sph_kernel_w(0.0f, h_i), 1.0e-12f);
+  density_canonical[sorted_canonical[g]] = starved ? rho_neighbors : rho;
 }
 
 __global__ void gas_force_kernel(const float4* __restrict__ posh,
@@ -3570,7 +3602,7 @@ __global__ void gas_force_kernel(const float4* __restrict__ posh,
 // delta encoder sees component changes only on occasional keyframes.
 __global__ void form_stars_kernel(SimCudaParticle* __restrict__ particles,
                                   float* __restrict__ birth_time_myr,
-                                  const float* __restrict__ density,
+                                  const float* __restrict__ density_canonical,
                                   const int* __restrict__ sorted_canonical,
                                   const std::uint32_t gas_count,
                                   const float density_threshold,
@@ -3582,7 +3614,11 @@ __global__ void form_stars_kernel(SimCudaParticle* __restrict__ particles,
   if (g >= gas_count) {
     return;
   }
-  const float rho = density[g];
+  // The canonical density is the neighbor-supported estimate (self-free when
+  // the neighborhood is starved), so isolated gas can never pass the
+  // threshold on its own W(0) term.
+  const int canonical = sorted_canonical[g];
+  const float rho = density_canonical[canonical];
   if (rho < density_threshold) {
     return;
   }
@@ -3597,7 +3633,6 @@ __global__ void form_stars_kernel(SimCudaParticle* __restrict__ particles,
   r ^= r << 13; r ^= r >> 17; r ^= r << 5;
   const float u = static_cast<float>(r & 0x00FFFFFFu) / 16777216.0f;
   if (u < p_convert) {
-    const int canonical = sorted_canonical[g];
     particles[canonical].component = 5u;
     birth_time_myr[canonical] = sim_time_myr;
   }
@@ -3820,7 +3855,8 @@ int build_gas_structure(DeviceState* state,
       nz,
       static_cast<float>(state->gas_smoothing_eta),
       state->gas_density_sorted,
-      state->smoothing_h);
+      state->smoothing_h,
+      state->gas_density_canonical);
   gas_force_kernel<<<gas_blocks, threads_per_block, 0, state->compute_stream>>>(
       state->gas_posh_sorted,
       state->gas_velm_sorted,
@@ -3889,7 +3925,7 @@ int build_gas_structure(DeviceState* state,
     form_stars_kernel<<<gas_blocks, threads_per_block, 0, state->compute_stream>>>(
         state->particles,
         state->birth_time_myr,
-        state->gas_density_sorted,
+        state->gas_density_canonical,
         state->gas_sorted_canonical,
         state->gas_count,
         static_cast<float>(state->star_formation_density),
@@ -4448,12 +4484,14 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
     }
   }
   {
-    // Seed h from a neutral 0.1 kpc; the density pass refines it toward
-    // eta*(m/rho)^(1/3) within a few builds (rate-limited per step).
+    // Seed h near the ambient-disk equilibrium (~0.2 kpc); the density pass
+    // refines it toward eta*(m/rho)^(1/3) within a few builds (rate-limited
+    // per step). Seeding low is the dangerous direction: the self-term
+    // inflates the density estimate and drags h toward the floor.
     std::vector<float> smoothing_host(params->particle_count, 0.0f);
     for (std::uint64_t i = 0; i < params->particle_count; ++i) {
       if (particles[i].component == 4u) {
-        smoothing_host[i] = 0.1f;
+        smoothing_host[i] = 0.2f;
       }
     }
     if (cudaMemcpy(state->smoothing_h,
@@ -4476,12 +4514,15 @@ extern "C" int sim_cuda_create(const SimCudaCreateParams* params,
         cudaMalloc(reinterpret_cast<void**>(&state->gas_accel),
                    sizeof(float4) * params->particle_count) != cudaSuccess ||
         cudaMalloc(reinterpret_cast<void**>(&state->young_star_indices),
-                   sizeof(int) * n) != cudaSuccess) {
+                   sizeof(int) * n) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->gas_density_canonical),
+                   sizeof(float) * params->particle_count) != cudaSuccess) {
       fill_error(error_buffer, error_buffer_len, "cudaMalloc for SPH buffers failed");
       destroy_state(state);
       return 1;
     }
-    if (cudaMemset(state->gas_accel, 0, sizeof(float4) * params->particle_count) != cudaSuccess) {
+    if (cudaMemset(state->gas_accel, 0, sizeof(float4) * params->particle_count) != cudaSuccess ||
+        cudaMemset(state->gas_density_canonical, 0, sizeof(float) * params->particle_count) != cudaSuccess) {
       fill_error(error_buffer, error_buffer_len, "cudaMemset for SPH accel failed");
       destroy_state(state);
       return 1;

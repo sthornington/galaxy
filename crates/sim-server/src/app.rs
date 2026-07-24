@@ -26,7 +26,7 @@ use crate::session::{
 const PREVIEW_PACKET_PREFIX_BYTES: usize = 80 + 56;
 const PREVIEW_PARTICLE_BYTES: usize = 16;
 const PREVIEW_DELTA_HEADER_BYTES: usize = 32;
-const PREVIEW_DELTA_VERSION: u32 = 1;
+const PREVIEW_DELTA_VERSION: u32 = 2;
 const PREVIEW_DELTA_KEYFRAME_INTERVAL: u32 = 64;
 
 #[derive(Default)]
@@ -112,12 +112,16 @@ fn encode_preview_delta(previous: &[u8], current: &[u8]) -> Option<Vec<u8>> {
 
     let mut max_position_delta = 0_u32;
     let mut max_velocity_delta = 0_u32;
+    let mut max_mass_delta = 0_u32;
     for particle in 0..current_count {
         let offset = PREVIEW_PACKET_PREFIX_BYTES + particle * PREVIEW_PARTICLE_BYTES;
-        if previous[offset + 12..offset + 16] != current[offset + 12..offset + 16] {
+        // Component and reserved byte must match; the quantized mass word is
+        // delta-coded like the kinematic fields because gas particles stream
+        // their evolving SPH density through it.
+        if previous[offset + 14..offset + 16] != current[offset + 14..offset + 16] {
             return None;
         }
-        for field in 0..6 {
+        for field in 0..7 {
             let field_offset = offset + field * 2;
             let previous_value =
                 u16::from_le_bytes(previous[field_offset..field_offset + 2].try_into().ok()?);
@@ -126,19 +130,23 @@ fn encode_preview_delta(previous: &[u8], current: &[u8]) -> Option<Vec<u8>> {
             let magnitude = (i32::from(current_value) - i32::from(previous_value)).unsigned_abs();
             if field < 3 {
                 max_position_delta = max_position_delta.max(magnitude);
-            } else {
+            } else if field < 6 {
                 max_velocity_delta = max_velocity_delta.max(magnitude);
+            } else {
+                max_mass_delta = max_mass_delta.max(magnitude);
             }
         }
     }
     let position_bits = signed_bits_required(max_position_delta);
     let velocity_bits = signed_bits_required(max_velocity_delta);
-    if position_bits > 17 || velocity_bits > 17 {
+    let mass_bits = signed_bits_required(max_mass_delta);
+    if position_bits > 17 || velocity_bits > 17 || mass_bits > 17 {
         return None;
     }
 
-    let payload_bits =
-        current_count.checked_mul(3 * (usize::from(position_bits) + usize::from(velocity_bits)))?;
+    let payload_bits = current_count.checked_mul(
+        3 * (usize::from(position_bits) + usize::from(velocity_bits)) + usize::from(mass_bits),
+    )?;
     let payload_bytes = payload_bits.div_ceil(8);
     let mut out = Vec::with_capacity(
         PREVIEW_DELTA_HEADER_BYTES + PREVIEW_PACKET_PREFIX_BYTES + payload_bytes,
@@ -148,7 +156,8 @@ fn encode_preview_delta(previous: &[u8], current: &[u8]) -> Option<Vec<u8>> {
     out.extend_from_slice(&(current_count as u32).to_le_bytes());
     out.push(position_bits);
     out.push(velocity_bits);
-    out.extend_from_slice(&0_u16.to_le_bytes());
+    out.push(mass_bits);
+    out.push(0_u8);
     out.extend_from_slice(&previous_sim_time.to_le_bytes());
     out.extend_from_slice(&(current.len() as u32).to_le_bytes());
     out.extend_from_slice(&(payload_bytes as u32).to_le_bytes());
@@ -158,7 +167,7 @@ fn encode_preview_delta(previous: &[u8], current: &[u8]) -> Option<Vec<u8>> {
     let mut buffered_bits = 0_u8;
     for particle in 0..current_count {
         let offset = PREVIEW_PACKET_PREFIX_BYTES + particle * PREVIEW_PARTICLE_BYTES;
-        for field in 0..6 {
+        for field in 0..7 {
             let field_offset = offset + field * 2;
             let previous_value =
                 u16::from_le_bytes(previous[field_offset..field_offset + 2].try_into().ok()?);
@@ -171,8 +180,10 @@ fn encode_preview_delta(previous: &[u8], current: &[u8]) -> Option<Vec<u8>> {
                 i32::from(current_value) - i32::from(previous_value),
                 if field < 3 {
                     position_bits
-                } else {
+                } else if field < 6 {
                     velocity_bits
+                } else {
+                    mass_bits
                 },
             );
         }
@@ -648,7 +659,8 @@ mod preview_delta_tests {
                 frame[offset + field * 2..offset + field * 2 + 2]
                     .copy_from_slice(&(value as u16).to_le_bytes());
             }
-            frame[offset + 12..offset + 14].copy_from_slice(&(particle as u16 + 100).to_le_bytes());
+            frame[offset + 12..offset + 14]
+                .copy_from_slice(&((particle as i32 + 100 + step * 2) as u16).to_le_bytes());
             frame[offset + 14] = (particle % 4) as u8;
         }
         bytes::Bytes::from(frame)
@@ -659,6 +671,7 @@ mod preview_delta_tests {
         let count = u32::from_le_bytes(delta[8..12].try_into().unwrap()) as usize;
         let position_bits = delta[12];
         let velocity_bits = delta[13];
+        let mass_bits = delta[14];
         let full_frame_bytes = u32::from_le_bytes(delta[24..28].try_into().unwrap()) as usize;
         let mut output = vec![0_u8; full_frame_bytes];
         output[..PREVIEW_PACKET_PREFIX_BYTES].copy_from_slice(
@@ -670,11 +683,13 @@ mod preview_delta_tests {
         let mut bit_offset = 0_usize;
         for particle in 0..count {
             let record_offset = PREVIEW_PACKET_PREFIX_BYTES + particle * PREVIEW_PARTICLE_BYTES;
-            for field in 0..6 {
+            for field in 0..7 {
                 let bits = if field < 3 {
                     position_bits
-                } else {
+                } else if field < 6 {
                     velocity_bits
+                } else {
+                    mass_bits
                 };
                 let mut encoded = 0_u32;
                 for bit in 0..usize::from(bits) {
@@ -695,8 +710,8 @@ mod preview_delta_tests {
                 output[field_offset..field_offset + 2]
                     .copy_from_slice(&((i32::from(previous_value) + value) as u16).to_le_bytes());
             }
-            output[record_offset + 12..record_offset + 16]
-                .copy_from_slice(&previous[record_offset + 12..record_offset + 16]);
+            output[record_offset + 14..record_offset + 16]
+                .copy_from_slice(&previous[record_offset + 14..record_offset + 16]);
         }
         output
     }
@@ -717,15 +732,29 @@ mod preview_delta_tests {
     #[test]
     fn preview_delta_keyframes_on_record_layout_changes() {
         let first = preview_frame(1.0, 64, 0);
-        let mut changed_mass = preview_frame(2.0, 64, 1).to_vec();
-        changed_mass[PREVIEW_PACKET_PREFIX_BYTES + 12] ^= 1;
-        let changed_mass = bytes::Bytes::from(changed_mass);
+        let mut changed_component = preview_frame(2.0, 64, 1).to_vec();
+        changed_component[PREVIEW_PACKET_PREFIX_BYTES + 14] ^= 1;
+        let changed_component = bytes::Bytes::from(changed_component);
         let changed_count = preview_frame(3.0, 32, 2);
         let mut encoder = PreviewDeltaEncoder::default();
 
         assert_eq!(&encoder.encode(&first)[..4], b"GPKT");
-        assert_eq!(&encoder.encode(&changed_mass)[..4], b"GPKT");
+        assert_eq!(&encoder.encode(&changed_component)[..4], b"GPKT");
         assert_eq!(&encoder.encode(&changed_count)[..4], b"GPKT");
+    }
+
+    #[test]
+    fn preview_delta_carries_mass_changes() {
+        let first = preview_frame(1.0, 64, 0);
+        let mut changed_mass = preview_frame(2.0, 64, 1).to_vec();
+        changed_mass[PREVIEW_PACKET_PREFIX_BYTES + 12] ^= 1;
+        let changed_mass = bytes::Bytes::from(changed_mass);
+        let mut encoder = PreviewDeltaEncoder::default();
+
+        assert_eq!(&encoder.encode(&first)[..4], b"GPKT");
+        let encoded = encoder.encode(&changed_mass);
+        assert_eq!(&encoded[..4], b"GPDL");
+        assert_eq!(decode_delta(&first, &encoded), changed_mass.as_ref());
     }
 
     #[test]

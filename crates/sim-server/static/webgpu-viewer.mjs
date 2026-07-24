@@ -126,7 +126,12 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
   let youth = select(0.0, 1.0 - age, component == 5u);
   let flash = select(0.0, exp(-age * 42.0), component == 5u);
   let logMass = (u.massLog.x + massQ * u.massLog.y) * 0.3010299957;
-  var luminosity = select(clamp((logMass - 3.7) / 2.2, 0.25, 1.8), 0.55, component == 4u);
+  // Gas streams its SPH density (Msun/kpc^3) through the mass slot: ramp
+  // from diffuse cirrus (~2.5e6) through the disk median (~7e7, teal) to
+  // star-forming knots (~1.5e9, just past the collapse threshold).
+  let gasDensity = clamp((logMass - 6.4) * 0.36, 0.0, 1.0);
+  var luminosity = select(clamp((logMass - 3.7) / 2.2, 0.25, 1.8),
+                          0.30 + 1.10 * gasDensity * gasDensity, component == 4u);
   if (component == 1u || component == 2u || component == 5u) {
     luminosity *= 0.42 + 2.2 * pow(h2, 3.0);
   }
@@ -136,8 +141,12 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
 
   var base: vec3f;
   if (component == 4u) {
-    // Gas: cool teal-cyan fluid, hue drifting with the per-particle hash.
-    base = mix(vec3f(0.30, 0.80, 0.72), vec3f(0.50, 0.92, 1.05), h);
+    // Gas: density-colored fluid — dim slate-blue cirrus, teal mid-density,
+    // warm HII pink where it has collapsed to the star-formation threshold.
+    let cool = mix(vec3f(0.20, 0.42, 0.60), vec3f(0.36, 0.85, 0.88),
+                   min(gasDensity * 1.8182, 1.0));
+    base = mix(cool, vec3f(1.15, 0.52, 0.62), smoothstep(0.55, 1.0, gasDensity));
+    base = mix(base, base.bgr, 0.10 * h);
   } else if (component == 5u) {
     base = mix(vec3f(1.0, 0.94, 0.80), vec3f(0.62, 0.78, 1.35), 0.35 + 0.65 * youth);
   } else if (component == 2u) {
@@ -1050,7 +1059,7 @@ function createViewer(canvas, restoreCanvas, sessionId) {
 
   function connectStream() {
     try {
-      worker = new Worker("/webgl-stream-worker.js?v=20260722-24");
+      worker = new Worker("/webgl-stream-worker.js?v=20260724-35");
       worker.onmessage = (event) => {
         if (state.disposed) {
           return;
