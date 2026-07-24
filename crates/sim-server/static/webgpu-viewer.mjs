@@ -155,13 +155,13 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
   var splatColor: vec3f;
   var marker = 0.0;
   var supernova = false;
-  if (component == 5u && age < 0.04) {
+  if (component == 5u && age < 0.013) {
     // Supernova light curve: sharp rise, brief white-blue peak, exponential
     // decay cooling through orange to an ember (see the WebGL tier).
-    let t = u.simTimeMyr * 1.3 + h * 37.0;
+    let t = u.simTimeMyr * 4.0 + h * 37.0;
     let epoch = floor(t);
     let roll = fract(h * 977.31 + epoch * 0.618034);
-    if (roll > 0.99) {
+    if (roll > 0.97) {
       let p = fract(t);
       let curve = smoothstep(0.0, 0.06, p) * min(1.0, exp(-(p - 0.06) * 7.0));
       if (curve > 0.02) {
@@ -1235,7 +1235,7 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     uniformF32[60] = state.hdrActive ? (headroomOverride ?? 3.0) : 1.0;
     uniformU32[61] = pair.current.count;
     uniformF32[62] = Math.max(0, pair.current.simTime - pair.previous.simTime);
-    uniformF32[63] = pair.current.simTime;
+    uniformF32[63] = state.playbackSimTime ?? pair.current.simTime;
     gpu.device.queue.writeBuffer(gpu.uniformBuffer, 0, uniformArray);
     gpu.device.queue.writeBuffer(
       gpu.exposureBoostBuffer,
