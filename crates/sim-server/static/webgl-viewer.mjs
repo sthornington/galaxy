@@ -176,7 +176,11 @@ void main() {
   // Fold the per-splat energy into the color (additive accumulation); divide
   // by the sprite area so a splat's total light is size-independent, then the
   // clamp keeps close-up sprites from vanishing entirely.
-  float alpha = 0.055 * renderLuminosity * pow(perspective, 0.92);
+  // Inverse-square distance falloff: per-splat energy ~ perspective^2 keeps
+  // SURFACE brightness zoom-invariant (screen area shrinks as d^-2, so the
+  // energy must too). The old ^0.92 made galaxies brighten roughly linearly
+  // with distance — masked by the SDR tonemap, glaring in HDR.
+  float alpha = 0.055 * renderLuminosity * perspective * perspective;
   float area = gl_PointSize * gl_PointSize;
   v_color = color * clamp(alpha * 52.0 / area, 0.0006, 0.35);
 }

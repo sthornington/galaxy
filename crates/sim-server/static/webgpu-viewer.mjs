@@ -180,7 +180,11 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
     // energy (alpha below) and color.
     let sizeLuminosity = select(renderLuminosity, 0.76, component == 4u);
     size = clamp(2.6 * gasBoost * sizeLuminosity * pow(perspective, 0.9) * u.sizeBoost, 1.25, 48.0);
-    let alpha = 0.055 * renderLuminosity * pow(perspective, 0.92);
+    // Inverse-square distance falloff: per-splat energy ~ perspective^2
+    // keeps SURFACE brightness zoom-invariant (screen area shrinks as d^-2,
+    // so the energy must too). The old ^0.92 made galaxies brighten roughly
+    // linearly with distance — masked by the SDR tonemap, glaring in HDR.
+    let alpha = 0.055 * renderLuminosity * perspective * perspective;
     let area = size * size;
     splatColor = color * clamp(alpha * 52.0 / area, 0.0006, 0.35);
   }
