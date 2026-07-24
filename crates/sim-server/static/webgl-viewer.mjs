@@ -145,15 +145,22 @@ void main() {
   // through the regular luminosity path, the tonemap compresses them into
   // invisibility.
   if (a_component == 5u && a_age < 0.04) {
-    float roll = fract(h * 977.31 + floor(u_simTimeMyr * 1.3) * 0.618034);
-    if (roll > 0.975) {
-      // A supernova must punch through the log tonemap AND cross the bloom
-      // threshold to read as a white star: that takes hundreds of HDR units
-      // at typical auto-exposure, not single digits.
-      float pulse = fract(roll * 83.7);
-      gl_PointSize = clamp((7.0 + 5.0 * pulse) * u_sizeBoost, 6.0, 18.0);
-      v_color = vec3(120.0, 128.0, 150.0) * (0.4 + 1.2 * pulse);
-      return;
+    // Supernova light curve: sharp rise to a brief white-blue peak, then an
+    // exponential decay cooling through orange to a faint ember. Per-particle
+    // phase offsets desynchronize the flares; the peak is bright but lives
+    // only ~6% of the flare window, so the population reads as scattered
+    // transient flashes rather than steady beacons.
+    float t = u_simTimeMyr * 1.3 + h * 37.0;
+    float epoch = floor(t);
+    float roll = fract(h * 977.31 + epoch * 0.618034);
+    if (roll > 0.95) {
+      float p = fract(t);
+      float curve = smoothstep(0.0, 0.06, p) * min(1.0, exp(-(p - 0.06) * 7.0));
+      if (curve > 0.02) {
+        gl_PointSize = clamp((3.5 + 7.5 * curve) * u_sizeBoost, 3.0, 15.0);
+        v_color = mix(vec3(2.0, 0.85, 0.4), vec3(1.0, 1.05, 1.3), curve) * (8.0 + 280.0 * curve);
+        return;
+      }
     }
   }
 

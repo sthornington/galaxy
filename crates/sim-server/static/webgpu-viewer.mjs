@@ -156,15 +156,19 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
   var marker = 0.0;
   var supernova = false;
   if (component == 5u && age < 0.04) {
-    let roll = fract(h * 977.31 + floor(u.simTimeMyr * 1.3) * 0.618034);
-    if (roll > 0.975) {
-      // A supernova must punch through the log tonemap AND cross the bloom
-      // threshold to read as a white star: that takes hundreds of HDR units
-      // at typical auto-exposure, not single digits.
-      let pulse = fract(roll * 83.7);
-      size = clamp((7.0 + 5.0 * pulse) * u.sizeBoost, 6.0, 18.0);
-      splatColor = vec3f(120.0, 128.0, 150.0) * (0.4 + 1.2 * pulse);
-      supernova = true;
+    // Supernova light curve: sharp rise, brief white-blue peak, exponential
+    // decay cooling through orange to an ember (see the WebGL tier).
+    let t = u.simTimeMyr * 1.3 + h * 37.0;
+    let epoch = floor(t);
+    let roll = fract(h * 977.31 + epoch * 0.618034);
+    if (roll > 0.95) {
+      let p = fract(t);
+      let curve = smoothstep(0.0, 0.06, p) * min(1.0, exp(-(p - 0.06) * 7.0));
+      if (curve > 0.02) {
+        size = clamp((3.5 + 7.5 * curve) * u.sizeBoost, 3.0, 15.0);
+        splatColor = mix(vec3f(2.0, 0.85, 0.4), vec3f(1.0, 1.05, 1.3), curve) * (8.0 + 280.0 * curve);
+        supernova = true;
+      }
     }
   }
   if (supernova) {
