@@ -470,6 +470,12 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     simTimeMyr: -Infinity,
     playbackSimTime: null,
     lastArrivalWallMs: 0,
+    statArrivals: 0,
+    statGapSumMs: 0,
+    statGapMaxMs: 0,
+    statUnderrunMs: 0,
+    statResets: 0,
+    statLastReportMs: 0,
     lastRafMs: 0,
     lagIntervals: 2.5,
     underrunStreak: 0,
@@ -1022,11 +1028,18 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     slot.wallMs = performance.now();
     ringFrames = Math.min(ringFrames + 1, RING_SIZE);
 
+    if (state.lastArrivalWallMs > 0) {
+      const gap = slot.wallMs - state.lastArrivalWallMs;
+      state.statArrivals += 1;
+      state.statGapSumMs += gap;
+      state.statGapMaxMs = Math.max(state.statGapMaxMs, gap);
+    }
     if (state.lastArrivalWallMs > 0 && slot.wallMs - state.lastArrivalWallMs > 2500) {
       ringFrames = 1;
       state.playbackSimTime = null;
       state.lagIntervals = 2.5;
       state.underrunStreak = 0;
+      state.statResets += 1;
     }
     state.lastArrivalWallMs = slot.wallMs;
 
@@ -1153,6 +1166,7 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     const streamLive = nowMs - state.lastArrivalWallMs < 1500;
     if (state.playbackSimTime >= latest.simTime) {
       if (streamLive) {
+        state.statUnderrunMs += dtWall;
         state.underrunStreak += 1;
         if (state.underrunStreak > 8) {
           state.lagIntervals = Math.min(6, state.lagIntervals + 0.5);
@@ -1277,6 +1291,31 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     state.rafHandle = window.requestAnimationFrame(render);
     if (!gpu.device || !gpu.accumulatePipeline) {
       return;
+    }
+    if (state.statLastReportMs === 0) {
+      state.statLastReportMs = nowMs;
+    } else if (nowMs - state.statLastReportMs > 15000) {
+      if (state.statArrivals > 0) {
+        reportClient({
+          src: "webgpu-viewer",
+          event: "playback-stats",
+          arrivals: state.statArrivals,
+          meanGapMs: Math.round(state.statGapSumMs / state.statArrivals),
+          maxGapMs: Math.round(state.statGapMaxMs),
+          underrunMs: Math.round(state.statUnderrunMs),
+          resets: state.statResets,
+          ringFrames,
+          lagIntervals: Number(state.lagIntervals.toFixed(2)),
+          renderScale: Number(state.renderScale.toFixed(2)),
+          frameCostMs: Number(state.frameCostEmaMs.toFixed(1)),
+        });
+      }
+      state.statArrivals = 0;
+      state.statGapSumMs = 0;
+      state.statGapMaxMs = 0;
+      state.statUnderrunMs = 0;
+      state.statResets = 0;
+      state.statLastReportMs = nowMs;
     }
     updateAutoQuality(nowMs);
     const pair = selectFramePair(nowMs);
