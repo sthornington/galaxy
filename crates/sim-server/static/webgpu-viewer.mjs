@@ -308,14 +308,20 @@ fn fs(in: FSOut) -> @location(0) vec4f {
   // extended-range mode, the brightest end re-expands into the display's EDR
   // headroom: SDR content is unchanged, galaxy cores actually glow.
   let lum = dot(x, vec3f(0.2126, 0.7152, 0.0722));
-  let compressed = min(log2(1.0 + 4.0 * lum) / log2(513.0), 1.0);
+  // Log-luminance compression (see webgl-viewer.mjs for rationale). In
+  // extended-range mode the curve CONTINUES past 1.0 into the display's EDR
+  // headroom instead of plateauing: clamping at 1.0 and multiplying by the
+  // headroom painted every core pixel the same flat white disc. SDR content
+  // is bit-identical to before; each unit of headroom above 1.0 now displays
+  // ~2.7 more decades of structure, so merger cores resolve to the center.
+  let compressed = min(log2(1.0 + 4.0 * lum) / log2(513.0), u.headroom);
   var mapped = vec3f(0.0);
   if (lum > 1.0e-6) {
     mapped = x * (compressed / lum);
   }
-  mapped = mix(mapped, vec3f(compressed), smoothstep(0.72, 1.0, compressed) * 0.7);
-  mapped = pow(clamp(mapped, vec3f(0.0), vec3f(1.0)), vec3f(0.9));
-  mapped *= mix(1.0, u.headroom, smoothstep(0.7, 1.0, compressed));
+  let sdrPart = min(compressed, 1.0);
+  mapped = mix(mapped, vec3f(compressed), smoothstep(0.72, 1.0, sdrPart) * 0.7);
+  mapped = pow(clamp(mapped, vec3f(0.0), vec3f(u.headroom)), vec3f(0.9));
   let background = vec3f(0.008, 0.031, 0.063);
   return vec4f(max(mapped, background), 1.0);
 }
@@ -456,6 +462,7 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     device: null,
     context: null,
     hdrActive: false,
+    displayHdr: false,
     sawFirstFrame: false,
     firstFramePending: false,
     renderFailed: false,
@@ -682,6 +689,15 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     }
     const configured = context.getConfiguration?.();
     state.hdrActive = configured?.toneMapping?.mode === "extended";
+    // An extended-range canvas only helps if the CURRENT display actually
+    // presents HDR; pushing values above SDR white at an SDR display just
+    // clips them to a flat white disc. Track the media query live so
+    // dragging the window between monitors adjusts the headroom.
+    const dynRange = window.matchMedia?.("(dynamic-range: high)");
+    state.displayHdr = dynRange?.matches ?? false;
+    dynRange?.addEventListener?.("change", (e) => {
+      state.displayHdr = e.matches;
+    });
     reportClient({
       event: "webgpu-init",
       hdrActive: state.hdrActive,
@@ -1225,7 +1241,8 @@ function createViewer(canvas, restoreCanvas, sessionId) {
     uniformF32[58] = canvas.height;
     uniformF32[59] =
       exposureBoost * Math.min(5, Math.max(0.12, 460000 / Math.max(1, pair.current.count)));
-    uniformF32[60] = state.hdrActive ? (headroomOverride ?? 3.0) : 1.0;
+    uniformF32[60] =
+      state.hdrActive && state.displayHdr ? (headroomOverride ?? 3.0) : 1.0;
     uniformU32[61] = pair.current.count;
     uniformF32[62] = Math.max(0, pair.current.simTime - pair.previous.simTime);
     uniformF32[63] = state.playbackSimTime ?? pair.current.simTime;
