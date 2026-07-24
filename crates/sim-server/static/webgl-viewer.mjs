@@ -157,8 +157,12 @@ void main() {
       float p = fract(t);
       float curve = smoothstep(0.0, 0.06, p) * min(1.0, exp(-(p - 0.06) * 7.0));
       if (curve > 0.02) {
-        gl_PointSize = clamp((3.5 + 7.5 * curve) * u_sizeBoost, 3.0, 15.0);
-        v_color = mix(vec3(2.0, 0.85, 0.4), vec3(1.0, 1.05, 1.3), curve) * (8.0 + 280.0 * curve);
+        // Lens-flare fragment path (marker 2): the sprite canvas is mostly
+        // transparent — a pinpoint HDR core the bloom halos, plus thin
+        // diffraction spikes. Subtle by area, bright by intensity.
+        v_marker = 2.0;
+        gl_PointSize = clamp((10.0 + 14.0 * curve) * u_sizeBoost, 8.0, 26.0);
+        v_color = mix(vec3(1.8, 0.8, 0.4), vec3(1.0, 1.05, 1.3), curve) * (3.0 + 52.0 * curve);
         return;
       }
     }
@@ -201,6 +205,16 @@ void main() {
   float r2 = dot(offset, offset);
   if (r2 > 1.0) {
     discard;
+  }
+  if (v_marker > 1.5) {
+    // Supernova lens flare: pinpoint core + thin diffraction spikes.
+    float ax = abs(offset.x);
+    float ay = abs(offset.y);
+    float core = exp(-r2 * 55.0);
+    float spikes = exp(-ay * ay * 260.0) * max(0.0, 1.0 - ax)
+                 + exp(-ax * ax * 260.0) * max(0.0, 1.0 - ay);
+    fragColor = vec4(v_color * (core + 0.22 * spikes), 1.0);
+    return;
   }
   if (v_marker > 0.5) {
     float ring = smoothstep(0.40, 0.55, r2) * (1.0 - smoothstep(0.75, 1.0, r2));

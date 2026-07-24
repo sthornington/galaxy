@@ -165,8 +165,11 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
       let p = fract(t);
       let curve = smoothstep(0.0, 0.06, p) * min(1.0, exp(-(p - 0.06) * 7.0));
       if (curve > 0.02) {
-        size = clamp((3.5 + 7.5 * curve) * u.sizeBoost, 3.0, 15.0);
-        splatColor = mix(vec3f(2.0, 0.85, 0.4), vec3f(1.0, 1.05, 1.3), curve) * (8.0 + 280.0 * curve);
+        // Lens-flare fragment path (marker 2): pinpoint HDR core plus thin
+        // diffraction spikes; subtle by area, bright by intensity.
+        marker = 2.0;
+        size = clamp((10.0 + 14.0 * curve) * u.sizeBoost, 8.0, 26.0);
+        splatColor = mix(vec3f(1.8, 0.8, 0.4), vec3f(1.0, 1.05, 1.3), curve) * (3.0 + 52.0 * curve);
         supernova = true;
       }
     }
@@ -210,6 +213,15 @@ fn fs(in: VSOut) -> @location(0) vec4f {
   let r2 = dot(in.uv, in.uv);
   if (r2 > 1.0) {
     discard;
+  }
+  if (in.marker > 1.5) {
+    // Supernova lens flare: pinpoint core + thin diffraction spikes.
+    let ax = abs(in.uv.x);
+    let ay = abs(in.uv.y);
+    let core = exp(-r2 * 55.0);
+    let spikes = exp(-ay * ay * 260.0) * max(0.0, 1.0 - ax)
+               + exp(-ax * ax * 260.0) * max(0.0, 1.0 - ay);
+    return vec4f(in.color * (core + 0.22 * spikes), 1.0);
   }
   if (in.marker > 0.5) {
     let ring = smoothstep(0.40, 0.55, r2) * (1.0 - smoothstep(0.75, 1.0, r2));
