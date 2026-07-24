@@ -161,7 +161,7 @@ fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
     let t = u.simTimeMyr * 1.3 + h * 37.0;
     let epoch = floor(t);
     let roll = fract(h * 977.31 + epoch * 0.618034);
-    if (roll > 0.95) {
+    if (roll > 0.99) {
       let p = fract(t);
       let curve = smoothstep(0.0, 0.06, p) * min(1.0, exp(-(p - 0.06) * 7.0));
       if (curve > 0.02) {

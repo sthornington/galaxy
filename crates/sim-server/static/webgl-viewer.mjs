@@ -153,7 +153,7 @@ void main() {
     float t = u_simTimeMyr * 1.3 + h * 37.0;
     float epoch = floor(t);
     float roll = fract(h * 977.31 + epoch * 0.618034);
-    if (roll > 0.95) {
+    if (roll > 0.99) {
       float p = fract(t);
       float curve = smoothstep(0.0, 0.06, p) * min(1.0, exp(-(p - 0.06) * 7.0));
       if (curve > 0.02) {
