@@ -3518,6 +3518,7 @@ __global__ void gas_force_kernel(const float4* __restrict__ posh,
                                  const int nz,
                                  const float sound_speed_kms,
                                  const float viscosity_alpha,
+                                 const float jeans_floor,
                                  float4* __restrict__ gas_accel_canonical) {
   const std::uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
   if (g >= gas_count) {
@@ -3529,6 +3530,13 @@ __global__ void gas_force_kernel(const float4* __restrict__ posh,
   const float rho_i = density[g];
   const float cs = sound_speed_kms;
   const float cs2_over_rho_i = cs * cs / rho_i;
+  // Jeans pressure floor: isothermal gas has nothing to stop collapse once a
+  // clump shrinks below the resolution scale, and unresolved runaway knots
+  // pack grid cells until the short-range pair work dominates the advance.
+  // Flooring P/rho^2 at (alpha^2/pi) G h^2 keeps the Jeans length >= ~4
+  // smoothing lengths, halting collapse at the resolution limit (standard
+  // practice in cosmological SPH codes). jeans_floor = (16/pi) * G.
+  const float pressure_i = fmaxf(cs2_over_rho_i, jeans_floor * h_i * h_i);
   const float cell_f = static_cast<float>(cell_kpc);
   const int ix = min(nx - 1, max(0, static_cast<int>(floorf(self.x / cell_f))));
   const int iy = min(ny - 1, max(0, static_cast<int>(floorf(self.y / cell_f))));
@@ -3564,8 +3572,8 @@ __global__ void gas_force_kernel(const float4* __restrict__ posh,
           // Symmetrized kernel gradient magnitude (negative toward smaller r).
           const float grad = 0.5f * (sph_kernel_dwdr(r, h_i) + sph_kernel_dwdr(r, h_j));
 
-          // Isothermal pressure: P/rho^2 = cs^2/rho per side.
-          float term = cs2_over_rho_i + cs * cs / rho_j;
+          // Isothermal pressure with the Jeans floor, P/rho^2 per side.
+          float term = pressure_i + fmaxf(cs * cs / rho_j, jeans_floor * h_j * h_j);
 
           // Monaghan viscosity for approaching pairs; the mu clamp bounds the
           // impulse a single violent shock pair can deliver in one substep.
@@ -3871,6 +3879,7 @@ int build_gas_structure(DeviceState* state,
       nz,
       static_cast<float>(state->gas_sound_speed_kms),
       static_cast<float>(state->gas_viscosity_alpha),
+      5.0929581f * static_cast<float>(state->grav_const),
       state->gas_accel);
   if (state->feedback_accel > 0.0 && state->young_star_capacity > 0) {
     std::uint32_t young_count = 0;
