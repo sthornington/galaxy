@@ -291,6 +291,7 @@ struct DeviceState {
   float* gas_density_sorted = nullptr;
   float4* gas_accel = nullptr;         // canonical-indexed, (km/s)^2/kpc
   float* gas_density_canonical = nullptr; // canonical-indexed, Msun/kpc^3
+  float* gas_cell_max_h = nullptr;     // per gas cell, for ring pruning
   int gas_nx = 0;
   int gas_ny = 0;
   int gas_nz = 0;
@@ -517,6 +518,7 @@ void destroy_state(DeviceState* state) {
   cudaFree(state->gas_sorted_canonical);
   cudaFree(state->gas_cell_start);
   cudaFree(state->gas_cell_end);
+  cudaFree(state->gas_cell_max_h);
   cudaFree(state->gas_posh_sorted);
   cudaFree(state->gas_velm_sorted);
   cudaFree(state->gas_density_sorted);
@@ -3356,6 +3358,36 @@ __device__ __forceinline__ float sph_kernel_dwdr(const float r, const float h) {
   return -6.0f * sigma_h * t * t;
 }
 
+struct GasAxisPos {
+  const SimCudaParticle* particles;
+  int axis;
+  __host__ __device__ double operator()(const int idx) const {
+    return particles[idx].position_kpc[axis];
+  }
+};
+
+// Per-cell maximum smoothing length, used to prune outer scan rings: a cell
+// whose nearest face is farther than every member's reach cannot interact.
+__global__ void gas_cell_max_h_kernel(const int* __restrict__ cell_start,
+                                      const int* __restrict__ cell_end,
+                                      const float4* __restrict__ posh_sorted,
+                                      const int cell_count,
+                                      float* __restrict__ cell_max_h) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= cell_count) {
+    return;
+  }
+  const int start = cell_start[c];
+  float h_max = 0.0f;
+  if (start >= 0) {
+    const int end = cell_end[c];
+    for (int j = start; j < end; ++j) {
+      h_max = fmaxf(h_max, posh_sorted[j].w);
+    }
+  }
+  cell_max_h[c] = h_max;
+}
+
 __global__ void compute_gas_cells(const SimCudaParticle* __restrict__ particles,
                                   const int* __restrict__ gas_indices,
                                   const std::uint32_t gas_count,
@@ -3439,6 +3471,7 @@ __global__ void gas_density_kernel(const float4* __restrict__ posh,
                                    const int nx,
                                    const int ny,
                                    const int nz,
+                                   const int rings,
                                    const float smoothing_eta,
                                    float* __restrict__ density_out,
                                    float* __restrict__ smoothing_h_canonical,
@@ -3456,9 +3489,15 @@ __global__ void gas_density_kernel(const float4* __restrict__ posh,
 
   float rho = 0.0f;
   int neighbors = 0;
-  for (int cx = max(0, ix - 1); cx <= min(nx - 1, ix + 1); ++cx) {
-    for (int cy = max(0, iy - 1); cy <= min(ny - 1, iy + 1); ++cy) {
-      for (int cz = max(0, iz - 1); cz <= min(nz - 1, iz + 1); ++cz) {
+  for (int cx = max(0, ix - rings); cx <= min(nx - 1, ix + rings); ++cx) {
+    for (int cy = max(0, iy - rings); cy <= min(ny - 1, iy + rings); ++cy) {
+      for (int cz = max(0, iz - rings); cz <= min(nz - 1, iz + rings); ++cz) {
+        const int ring = max(abs(cx - ix), max(abs(cy - iy), abs(cz - iz)));
+        // Gather sum: cells whose nearest face lies beyond this particle's
+        // own support cannot contribute.
+        if (ring > 1 && static_cast<float>(ring - 1) * cell_f >= h_i) {
+          continue;
+        }
         const int cell = (cx * ny + cy) * nz + cz;
         const int start = cell_start[cell];
         if (start < 0) {
@@ -3516,6 +3555,8 @@ __global__ void gas_force_kernel(const float4* __restrict__ posh,
                                  const int nx,
                                  const int ny,
                                  const int nz,
+                                 const int rings,
+                                 const float* __restrict__ cell_max_h,
                                  const float sound_speed_kms,
                                  const float viscosity_alpha,
                                  const float jeans_floor,
@@ -3545,10 +3586,19 @@ __global__ void gas_force_kernel(const float4* __restrict__ posh,
   float ax = 0.0f;
   float ay = 0.0f;
   float az = 0.0f;
-  for (int cx = max(0, ix - 1); cx <= min(nx - 1, ix + 1); ++cx) {
-    for (int cy = max(0, iy - 1); cy <= min(ny - 1, iy + 1); ++cy) {
-      for (int cz = max(0, iz - 1); cz <= min(nz - 1, iz + 1); ++cz) {
+  for (int cx = max(0, ix - rings); cx <= min(nx - 1, ix + rings); ++cx) {
+    for (int cy = max(0, iy - rings); cy <= min(ny - 1, iy + rings); ++cy) {
+      for (int cz = max(0, iz - rings); cz <= min(nz - 1, iz + rings); ++cz) {
+        const int ring = max(abs(cx - ix), max(abs(cy - iy), abs(cz - iz)));
         const int cell = (cx * ny + cy) * nz + cz;
+        if (ring > 1) {
+          // Pairs act within max(h_i, h_j): prune cells that no member can
+          // reach and that this particle cannot reach either.
+          const float reach = fmaxf(h_i, cell_max_h[cell]);
+          if (static_cast<float>(ring - 1) * cell_f >= reach) {
+            continue;
+          }
+        }
         const int start = cell_start[cell];
         if (start < 0) {
           continue;
@@ -3676,14 +3726,28 @@ __global__ void apply_sn_feedback(const SimCudaParticle* __restrict__ particles,
   const float sy = static_cast<float>(star.position_kpc[1] - grid_origin_y);
   const float sz = static_cast<float>(star.position_kpc[2] - grid_origin_z);
   const float cell_f = static_cast<float>(cell_kpc);
+  // The grid is gas-tight: a cluster ejected beyond it (padding >= the
+  // feedback radius) has no gas within reach, and clamping it to a border
+  // cell would push unrelated boundary gas instead.
+  if (sx < 0.0f || sy < 0.0f || sz < 0.0f ||
+      sx >= static_cast<float>(nx) * cell_f ||
+      sy >= static_cast<float>(ny) * cell_f ||
+      sz >= static_cast<float>(nz) * cell_f) {
+    return;
+  }
   const int ix = min(nx - 1, max(0, static_cast<int>(floorf(sx / cell_f))));
   const int iy = min(ny - 1, max(0, static_cast<int>(floorf(sy / cell_f))));
   const int iz = min(nz - 1, max(0, static_cast<int>(floorf(sz / cell_f))));
   const float radius_sq = feedback_radius * feedback_radius;
+  const int rings = max(1, static_cast<int>(ceilf(feedback_radius / cell_f - 1.0e-6f)));
 
-  for (int cx = max(0, ix - 1); cx <= min(nx - 1, ix + 1); ++cx) {
-    for (int cy = max(0, iy - 1); cy <= min(ny - 1, iy + 1); ++cy) {
-      for (int cz = max(0, iz - 1); cz <= min(nz - 1, iz + 1); ++cz) {
+  for (int cx = max(0, ix - rings); cx <= min(nx - 1, ix + rings); ++cx) {
+    for (int cy = max(0, iy - rings); cy <= min(ny - 1, iy + rings); ++cy) {
+      for (int cz = max(0, iz - rings); cz <= min(nz - 1, iz + rings); ++cz) {
+        const int ring = max(abs(cx - ix), max(abs(cy - iy), abs(cz - iz)));
+        if (ring > 1 && static_cast<float>(ring - 1) * cell_f >= feedback_radius) {
+          continue;
+        }
         const int cell = (cx * ny + cy) * nz + cz;
         const int start = gas_cell_start[cell];
         if (start < 0) {
@@ -3764,39 +3828,69 @@ int build_gas_structure(DeviceState* state,
     return 1;
   }
 
-  // Grid over the baryon-tight box; cell >= 2 * h_max (h clamps at 0.45) so
-  // the 27-cell neighborhood always covers the interaction radius.
+  // Grid over the GAS-tight box, never the baryon box: slingshot stellar
+  // escapers balloon the baryon extent to hundreds of kpc, and under the
+  // cell-count cap that once grew gas cells to ~4 kpc -- the 27-cell scan
+  // then covered the whole disk and SPH candidate work went quadratic
+  // (profiled at t=400: 395 ms/build). Gas stays compact, so its own box
+  // keeps cells small.
+  double gas_min[3] = {0.0, 0.0, 0.0};
+  double gas_max[3] = {0.0, 0.0, 0.0};
+  try {
+    for (int axis = 0; axis < 3; ++axis) {
+      const GasAxisPos functor{state->particles, axis};
+      const auto begin = thrust::make_transform_iterator(
+          thrust::device_pointer_cast(state->gas_indices), functor);
+      const auto end = begin + state->gas_count;
+      gas_min[axis] = thrust::reduce(thrust::cuda::par.on(state->compute_stream),
+                                     begin, end, 1.0e30, thrust::minimum<double>());
+      gas_max[axis] = thrust::reduce(thrust::cuda::par.on(state->compute_stream),
+                                     begin, end, -1.0e30, thrust::maximum<double>());
+    }
+  } catch (const std::exception& error) {
+    fill_error(error_buffer, error_buffer_len, error.what());
+    return 1;
+  }
+  // Cells target 0.25 kpc -- deliberately below h_max = 0.45. Coverage comes
+  // from scanning `rings` shells (ceil(h_max / cell)); the outer rings are
+  // pruned per cell against the reachable smoothing lengths, so dense
+  // floor-h regions touch only their immediate neighborhood.
   double max_extent_cells = 0.0;
-  double cell_kpc = 0.5;
+  double cell_kpc = 0.25;
   int nx = 0;
   int ny = 0;
   int nz = 0;
   for (;;) {
-    nx = max(1, static_cast<int>(std::ceil(state->tight_box_length[0] / cell_kpc)) + 2);
-    ny = max(1, static_cast<int>(std::ceil(state->tight_box_length[1] / cell_kpc)) + 2);
-    nz = max(1, static_cast<int>(std::ceil(state->tight_box_length[2] / cell_kpc)) + 2);
+    nx = max(1, static_cast<int>(std::ceil((gas_max[0] - gas_min[0]) / cell_kpc)) + 2);
+    ny = max(1, static_cast<int>(std::ceil((gas_max[1] - gas_min[1]) / cell_kpc)) + 2);
+    nz = max(1, static_cast<int>(std::ceil((gas_max[2] - gas_min[2]) / cell_kpc)) + 2);
     max_extent_cells = static_cast<double>(nx) * ny * nz;
     if (max_extent_cells <= static_cast<double>(kMaxShortRangeCells)) {
       break;
     }
     cell_kpc *= 1.5;
   }
+  const int rings =
+      max(1, static_cast<int>(std::ceil(0.45 / cell_kpc - 1.0e-6)));
   state->gas_nx = nx;
   state->gas_ny = ny;
   state->gas_nz = nz;
   state->gas_grid_cell_kpc = cell_kpc;
-  state->gas_grid_origin[0] = state->tight_domain_origin[0] - cell_kpc;
-  state->gas_grid_origin[1] = state->tight_domain_origin[1] - cell_kpc;
-  state->gas_grid_origin[2] = state->tight_domain_origin[2] - cell_kpc;
+  state->gas_grid_origin[0] = gas_min[0] - cell_kpc;
+  state->gas_grid_origin[1] = gas_min[1] - cell_kpc;
+  state->gas_grid_origin[2] = gas_min[2] - cell_kpc;
 
   const std::size_t cell_count = static_cast<std::size_t>(nx) * ny * nz;
   if (cell_count > state->gas_cell_capacity) {
     cudaFree(state->gas_cell_start);
     cudaFree(state->gas_cell_end);
+    cudaFree(state->gas_cell_max_h);
     state->gas_cell_start = nullptr;
     state->gas_cell_end = nullptr;
+    state->gas_cell_max_h = nullptr;
     if (cudaMalloc(reinterpret_cast<void**>(&state->gas_cell_start), sizeof(int) * cell_count) != cudaSuccess ||
-        cudaMalloc(reinterpret_cast<void**>(&state->gas_cell_end), sizeof(int) * cell_count) != cudaSuccess) {
+        cudaMalloc(reinterpret_cast<void**>(&state->gas_cell_end), sizeof(int) * cell_count) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&state->gas_cell_max_h), sizeof(float) * cell_count) != cudaSuccess) {
       fill_error(error_buffer, error_buffer_len, "cudaMalloc for gas cell ranges failed");
       return 1;
     }
@@ -3850,6 +3944,16 @@ int build_gas_structure(DeviceState* state,
       state->gas_grid_origin[2],
       state->gas_posh_sorted,
       state->gas_velm_sorted);
+  {
+    const int cell_blocks =
+        static_cast<int>((cell_count + threads_per_block - 1) / threads_per_block);
+    gas_cell_max_h_kernel<<<cell_blocks, threads_per_block, 0, state->compute_stream>>>(
+        state->gas_cell_start,
+        state->gas_cell_end,
+        state->gas_posh_sorted,
+        static_cast<int>(cell_count),
+        state->gas_cell_max_h);
+  }
   gas_density_kernel<<<gas_blocks, threads_per_block, 0, state->compute_stream>>>(
       state->gas_posh_sorted,
       state->gas_velm_sorted,
@@ -3861,6 +3965,7 @@ int build_gas_structure(DeviceState* state,
       nx,
       ny,
       nz,
+      rings,
       static_cast<float>(state->gas_smoothing_eta),
       state->gas_density_sorted,
       state->smoothing_h,
@@ -3877,6 +3982,8 @@ int build_gas_structure(DeviceState* state,
       nx,
       ny,
       nz,
+      rings,
+      state->gas_cell_max_h,
       static_cast<float>(state->gas_sound_speed_kms),
       static_cast<float>(state->gas_viscosity_alpha),
       5.0929581f * static_cast<float>(state->grav_const),

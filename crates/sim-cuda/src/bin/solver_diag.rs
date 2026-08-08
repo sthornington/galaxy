@@ -108,6 +108,21 @@ fn main() -> Result<()> {
         completed += run_steps;
     }
 
+    // Optional final-state dump for offline crowding/structure analysis:
+    // 16 bytes per particle, little-endian f32 [x, y, z, component].
+    if let Ok(path) = std::env::var("SOLVER_DIAG_DUMP") {
+        let particles = backend.download_particles().context("download for dump")?;
+        let mut buf = Vec::with_capacity(particles.len() * 16);
+        for particle in &particles {
+            buf.extend_from_slice(&(particle.position_kpc.x as f32).to_le_bytes());
+            buf.extend_from_slice(&(particle.position_kpc.y as f32).to_le_bytes());
+            buf.extend_from_slice(&(particle.position_kpc.z as f32).to_le_bytes());
+            buf.extend_from_slice(&(particle.component as u32 as f32).to_le_bytes());
+        }
+        std::fs::write(&path, &buf).with_context(|| format!("write dump {path}"))?;
+        eprintln!("dumped {} particles to {path}", particles.len());
+    }
+
     Ok(())
 }
 
