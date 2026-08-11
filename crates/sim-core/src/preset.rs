@@ -25,7 +25,90 @@ pub fn built_in_presets() -> Vec<MergerPreset> {
         smbh_playground(),
         polar_flyby(),
         minor_merger(),
+        m31_andromeda(),
+        m33_triangulum(),
+        m51_whirlpool(),
+        m81_group(),
+        m87_virgo_giant(),
+        m104_sombrero(),
     ]
+}
+
+/// Place `satellite` at `position_kpc` around a primary pinned at the origin,
+/// moving mostly inward at `speed_fraction_of_escape` of the two-body escape
+/// speed with a `tangential_fraction` sideways component along `tangent_hint`
+/// (projected perpendicular to the radius). Same speed convention as
+/// `set_direct_infall_pair_orbit`, generalized to any direction so several
+/// satellites can share one primary.
+fn place_satellite(
+    primary: &GalaxyConfig,
+    satellite: &mut GalaxyConfig,
+    position_kpc: [f64; 3],
+    speed_fraction_of_escape: f64,
+    tangential_fraction: f64,
+    tangent_hint: [f64; 3],
+) {
+    let radius = (position_kpc[0] * position_kpc[0]
+        + position_kpc[1] * position_kpc[1]
+        + position_kpc[2] * position_kpc[2])
+        .sqrt()
+        .max(1.0e-6);
+    let radial = [
+        position_kpc[0] / radius,
+        position_kpc[1] / radius,
+        position_kpc[2] / radius,
+    ];
+    let hint_dot_r =
+        tangent_hint[0] * radial[0] + tangent_hint[1] * radial[1] + tangent_hint[2] * radial[2];
+    let mut tangent = [
+        tangent_hint[0] - hint_dot_r * radial[0],
+        tangent_hint[1] - hint_dot_r * radial[1],
+        tangent_hint[2] - hint_dot_r * radial[2],
+    ];
+    let tangent_norm =
+        (tangent[0] * tangent[0] + tangent[1] * tangent[1] + tangent[2] * tangent[2])
+            .sqrt()
+            .max(1.0e-6);
+    for axis in &mut tangent {
+        *axis /= tangent_norm;
+    }
+
+    let total_mass = total_galaxy_mass_msun(primary) + total_galaxy_mass_msun(satellite);
+    let escape_speed = (2.0 * GRAV_CONST_KPC_KMS2_PER_MSUN * total_mass / radius).sqrt();
+    let speed = escape_speed * speed_fraction_of_escape.clamp(0.0, 0.999);
+    let tangential_speed = speed * tangential_fraction.clamp(0.0, 0.95);
+    let radial_speed = (speed * speed - tangential_speed * tangential_speed)
+        .max(0.0)
+        .sqrt();
+
+    satellite.position_kpc = position_kpc;
+    satellite.velocity_kms = [
+        -radial_speed * radial[0] + tangential_speed * tangent[0],
+        -radial_speed * radial[1] + tangential_speed * tangent[1],
+        -radial_speed * radial[2] + tangential_speed * tangent[2],
+    ];
+}
+
+/// Zero the system's bulk momentum so multi-satellite scenes don't drift out
+/// of frame over long runs.
+fn remove_com_velocity(galaxies: &mut [GalaxyConfig]) {
+    let mut momentum = [0.0_f64; 3];
+    let mut total_mass = 0.0_f64;
+    for galaxy in galaxies.iter() {
+        let mass = total_galaxy_mass_msun(galaxy) + galaxy.gas_mass_msun;
+        total_mass += mass;
+        for axis in 0..3 {
+            momentum[axis] += mass * galaxy.velocity_kms[axis];
+        }
+    }
+    if total_mass <= 0.0 {
+        return;
+    }
+    for galaxy in galaxies.iter_mut() {
+        for axis in 0..3 {
+            galaxy.velocity_kms[axis] -= momentum[axis] / total_mass;
+        }
+    }
 }
 
 fn gravity_defaults() -> GravityConfig {
@@ -694,5 +777,526 @@ fn minor_merger() -> MergerPreset {
         title: "Minor Merger",
         summary: "A lower-mass companion spirals into a massive disk galaxy.",
         config,
+    }
+}
+
+/// M31, the Andromeda Galaxy, with its two close companions M32 and M110.
+/// Andromeda is the Local Group's largest spiral: more massive than the
+/// Milky Way, a big old bulge, and a comparatively gas-poor disk whose star
+/// formation concentrates in a wide ring — the gas disk here is spread to
+/// ~2.5x the stellar scale radius to echo that. M32 is a dense compact
+/// elliptical skimming the disk; M110 is a diffuse dwarf elliptical further
+/// out. Both are on bound, mildly eccentric orbits.
+fn m31_andromeda() -> MergerPreset {
+    let mut m31 = GalaxyConfig {
+        label: "M31 Andromeda".to_string(),
+        equilibrium_snapshot: None,
+        initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
+        halo_mass_msun: 6.5e12,
+        halo_scale_radius_kpc: 16.0,
+        halo_particle_count: 900_000,
+        disk_mass_msun: 2.2e11,
+        disk_scale_radius_kpc: 5.5,
+        disk_scale_height_kpc: 0.35,
+        disk_particle_count: 460_000,
+        bulge_mass_msun: 6.5e10,
+        bulge_scale_radius_kpc: 1.0,
+        bulge_particle_count: 110_000,
+        gas_mass_msun: 7.0e9,
+        gas_scale_radius_kpc: 13.0,
+        gas_scale_height_kpc: 0.2,
+        gas_particle_count: 240_000,
+        smbh: SmbhConfig {
+            mass_msun: 1.4e8,
+            softening_kpc: 0.03,
+            substeps: 16,
+        },
+        position_kpc: [0.0, 0.0, 0.0],
+        velocity_kms: [0.0, 0.0, 0.0],
+        disk_tilt_deg: [12.0, -20.0, 0.0],
+        color_rgba: [1.0, 0.85, 0.62, 1.0],
+    };
+    let mut m32 = GalaxyConfig {
+        label: "M32".to_string(),
+        equilibrium_snapshot: None,
+        initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
+        halo_mass_msun: 1.5e11,
+        halo_scale_radius_kpc: 3.0,
+        halo_particle_count: 30_000,
+        disk_mass_msun: 0.0,
+        disk_scale_radius_kpc: 1.0,
+        disk_scale_height_kpc: 0.1,
+        disk_particle_count: 0,
+        bulge_mass_msun: 3.0e9,
+        bulge_scale_radius_kpc: 0.25,
+        bulge_particle_count: 20_000,
+        gas_mass_msun: 0.0,
+        gas_scale_radius_kpc: 0.0,
+        gas_scale_height_kpc: 0.0,
+        gas_particle_count: 0,
+        smbh: SmbhConfig {
+            mass_msun: 2.5e6,
+            softening_kpc: 0.01,
+            substeps: 16,
+        },
+        position_kpc: [0.0, 0.0, 0.0],
+        velocity_kms: [0.0, 0.0, 0.0],
+        disk_tilt_deg: [0.0, 0.0, 0.0],
+        color_rgba: [1.0, 0.92, 0.8, 1.0],
+    };
+    let mut m110 = GalaxyConfig {
+        label: "M110".to_string(),
+        equilibrium_snapshot: None,
+        initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
+        halo_mass_msun: 2.5e11,
+        halo_scale_radius_kpc: 4.0,
+        halo_particle_count: 45_000,
+        disk_mass_msun: 0.0,
+        disk_scale_radius_kpc: 1.0,
+        disk_scale_height_kpc: 0.1,
+        disk_particle_count: 0,
+        bulge_mass_msun: 9.0e9,
+        bulge_scale_radius_kpc: 1.3,
+        bulge_particle_count: 36_000,
+        gas_mass_msun: 0.0,
+        gas_scale_radius_kpc: 0.0,
+        gas_scale_height_kpc: 0.0,
+        gas_particle_count: 0,
+        smbh: SmbhConfig {
+            mass_msun: 0.0,
+            softening_kpc: 0.01,
+            substeps: 8,
+        },
+        position_kpc: [0.0, 0.0, 0.0],
+        velocity_kms: [0.0, 0.0, 0.0],
+        disk_tilt_deg: [0.0, 0.0, 0.0],
+        color_rgba: [0.82, 0.86, 1.0, 1.0],
+    };
+    place_satellite(&m31, &mut m32, [20.0, 8.0, 2.5], 0.4, 0.65, [0.0, 1.0, 0.2]);
+    place_satellite(&m31, &mut m110, [-30.0, 26.0, 11.0], 0.35, 0.6, [1.0, 0.4, -0.2]);
+    let mut galaxies = vec![m31, m32, m110];
+    remove_com_velocity(&mut galaxies);
+
+    MergerPreset {
+        id: "m31-andromeda",
+        title: "M31 Andromeda + Companions",
+        summary: "The Local Group's giant spiral with its wide star-forming gas ring, compact M32 skimming the disk, and diffuse M110 further out on a slow bound orbit.",
+        config: SimulationConfig {
+            name: "m31-andromeda".to_string(),
+            gravity: GravityConfig {
+                halo_softening_kpc: 0.12,
+                ..gravity_defaults()
+            },
+            relativity: relativity_defaults(),
+            preview: preview_defaults(),
+            snapshots: snapshot_defaults(),
+            integration: integration_defaults(),
+            initial_separation_kpc: 21.7,
+            initial_relative_velocity_kms: 0.0,
+            output_directory: "output/m31-andromeda".to_string(),
+            gas: GasConfig::default(),
+            galaxies,
+        },
+    }
+}
+
+/// M33, the Triangulum Galaxy: the Local Group's third spiral. Low mass,
+/// essentially bulgeless, no detected central black hole, and very gas-rich
+/// — which is why its flocculent arms sparkle with HII regions. A third of
+/// the baryons here are cold gas, so star formation dots the whole disk.
+fn m33_triangulum() -> MergerPreset {
+    let m33 = GalaxyConfig {
+        label: "M33 Triangulum".to_string(),
+        equilibrium_snapshot: None,
+        initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
+        halo_mass_msun: 5.0e11,
+        halo_scale_radius_kpc: 9.0,
+        halo_particle_count: 600_000,
+        disk_mass_msun: 4.5e9,
+        disk_scale_radius_kpc: 1.7,
+        disk_scale_height_kpc: 0.25,
+        disk_particle_count: 220_000,
+        bulge_mass_msun: 0.0,
+        bulge_scale_radius_kpc: 0.3,
+        bulge_particle_count: 0,
+        gas_mass_msun: 2.0e9,
+        gas_scale_radius_kpc: 3.4,
+        gas_scale_height_kpc: 0.15,
+        gas_particle_count: 300_000,
+        smbh: SmbhConfig {
+            mass_msun: 0.0,
+            softening_kpc: 0.01,
+            substeps: 8,
+        },
+        position_kpc: [0.0, 0.0, 0.0],
+        velocity_kms: [0.0, 0.0, 0.0],
+        disk_tilt_deg: [20.0, 30.0, 0.0],
+        color_rgba: [0.72, 0.86, 1.0, 1.0],
+    };
+
+    MergerPreset {
+        id: "m33-triangulum",
+        title: "M33 Triangulum",
+        summary: "A low-mass, bulgeless, gas-rich flocculent spiral with no central black hole: star formation freckles the whole disk instead of tracing grand-design arms.",
+        config: SimulationConfig {
+            name: "m33-triangulum".to_string(),
+            gravity: gravity_defaults(),
+            relativity: relativity_defaults(),
+            preview: preview_defaults(),
+            snapshots: snapshot_defaults(),
+            integration: integration_defaults(),
+            initial_separation_kpc: 0.0,
+            initial_relative_velocity_kms: 0.0,
+            output_directory: "output/m33-triangulum".to_string(),
+            gas: GasConfig::default(),
+            galaxies: vec![m33],
+        },
+    }
+}
+
+/// M51, the Whirlpool: the textbook interacting pair. NGC 5195 is caught
+/// pre-pericenter on the bound orbit that turns M51's disk into a two-armed
+/// grand-design spiral — watch the arms sharpen as the companion swings
+/// through closest approach and a tidal bridge form between them.
+fn m51_whirlpool() -> MergerPreset {
+    let mut m51 = GalaxyConfig {
+        label: "M51 Whirlpool".to_string(),
+        equilibrium_snapshot: None,
+        initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
+        halo_mass_msun: 2.8e12,
+        halo_scale_radius_kpc: 12.0,
+        halo_particle_count: 700_000,
+        disk_mass_msun: 9.0e10,
+        disk_scale_radius_kpc: 2.6,
+        disk_scale_height_kpc: 0.28,
+        disk_particle_count: 380_000,
+        bulge_mass_msun: 1.6e10,
+        bulge_scale_radius_kpc: 0.5,
+        bulge_particle_count: 48_000,
+        gas_mass_msun: 1.4e10,
+        gas_scale_radius_kpc: 0.0,
+        gas_scale_height_kpc: 0.0,
+        gas_particle_count: 200_000,
+        smbh: SmbhConfig {
+            mass_msun: 1.0e7,
+            softening_kpc: 0.02,
+            substeps: 16,
+        },
+        position_kpc: [0.0, 0.0, 0.0],
+        velocity_kms: [0.0, 0.0, 0.0],
+        disk_tilt_deg: [8.0, 12.0, 0.0],
+        color_rgba: [0.72, 0.84, 1.0, 1.0],
+    };
+    let mut ngc5195 = GalaxyConfig {
+        label: "NGC 5195".to_string(),
+        equilibrium_snapshot: None,
+        initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
+        halo_mass_msun: 9.0e11,
+        halo_scale_radius_kpc: 7.0,
+        halo_particle_count: 220_000,
+        disk_mass_msun: 1.2e10,
+        disk_scale_radius_kpc: 1.5,
+        disk_scale_height_kpc: 0.3,
+        disk_particle_count: 64_000,
+        bulge_mass_msun: 2.2e10,
+        bulge_scale_radius_kpc: 0.7,
+        bulge_particle_count: 56_000,
+        gas_mass_msun: 1.0e9,
+        gas_scale_radius_kpc: 0.0,
+        gas_scale_height_kpc: 0.0,
+        gas_particle_count: 16_000,
+        smbh: SmbhConfig {
+            mass_msun: 2.0e7,
+            softening_kpc: 0.02,
+            substeps: 16,
+        },
+        position_kpc: [0.0, 0.0, 0.0],
+        velocity_kms: [0.0, 0.0, 0.0],
+        disk_tilt_deg: [62.0, 25.0, 10.0],
+        color_rgba: [1.0, 0.82, 0.58, 1.0],
+    };
+    let relative_speed = set_bound_pair_orbit(&mut m51, &mut ngc5195, 26.0, 9.0);
+
+    MergerPreset {
+        id: "m51-whirlpool",
+        title: "M51 Whirlpool + NGC 5195",
+        summary: "The textbook interacting pair: an early-type companion dives past a gas-rich disk, ringing up the two-armed grand-design spiral and a tidal bridge.",
+        config: SimulationConfig {
+            name: "m51-whirlpool".to_string(),
+            gravity: gravity_defaults(),
+            relativity: relativity_defaults(),
+            preview: preview_defaults(),
+            snapshots: snapshot_defaults(),
+            integration: integration_defaults(),
+            initial_separation_kpc: 26.0,
+            initial_relative_velocity_kms: relative_speed,
+            output_directory: "output/m51-whirlpool".to_string(),
+            gas: GasConfig::default(),
+            galaxies: vec![m51, ngc5195],
+        },
+    }
+}
+
+/// The M81 group core: grand-design M81, the edge-on starburst M82, and
+/// little NGC 3077, all within ~60 kpc — the nearest strongly interacting
+/// group. Tides from the two companions' infall strip HI streams and drive
+/// M82's gas inward; its disk here is gas-dominated so the tidally-triggered
+/// central starburst lights up on its own.
+fn m81_group() -> MergerPreset {
+    let m81 = GalaxyConfig {
+        label: "M81".to_string(),
+        equilibrium_snapshot: None,
+        initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
+        halo_mass_msun: 3.2e12,
+        halo_scale_radius_kpc: 13.0,
+        halo_particle_count: 650_000,
+        disk_mass_msun: 1.05e11,
+        disk_scale_radius_kpc: 2.7,
+        disk_scale_height_kpc: 0.3,
+        disk_particle_count: 300_000,
+        bulge_mass_msun: 3.2e10,
+        bulge_scale_radius_kpc: 0.6,
+        bulge_particle_count: 60_000,
+        gas_mass_msun: 6.0e9,
+        gas_scale_radius_kpc: 0.0,
+        gas_scale_height_kpc: 0.0,
+        gas_particle_count: 90_000,
+        smbh: SmbhConfig {
+            mass_msun: 7.0e7,
+            softening_kpc: 0.025,
+            substeps: 16,
+        },
+        position_kpc: [0.0, 0.0, 0.0],
+        velocity_kms: [0.0, 0.0, 0.0],
+        disk_tilt_deg: [15.0, -10.0, 0.0],
+        color_rgba: [1.0, 0.88, 0.68, 1.0],
+    };
+    let mut m82 = GalaxyConfig {
+        label: "M82 Starburst".to_string(),
+        equilibrium_snapshot: None,
+        initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
+        halo_mass_msun: 8.0e11,
+        halo_scale_radius_kpc: 6.0,
+        halo_particle_count: 160_000,
+        disk_mass_msun: 3.0e10,
+        disk_scale_radius_kpc: 1.6,
+        disk_scale_height_kpc: 0.35,
+        disk_particle_count: 140_000,
+        bulge_mass_msun: 6.0e9,
+        bulge_scale_radius_kpc: 0.35,
+        bulge_particle_count: 20_000,
+        gas_mass_msun: 9.0e9,
+        gas_scale_radius_kpc: 1.8,
+        gas_scale_height_kpc: 0.2,
+        gas_particle_count: 220_000,
+        smbh: SmbhConfig {
+            mass_msun: 3.0e7,
+            softening_kpc: 0.02,
+            substeps: 16,
+        },
+        position_kpc: [0.0, 0.0, 0.0],
+        velocity_kms: [0.0, 0.0, 0.0],
+        disk_tilt_deg: [75.0, 20.0, 55.0],
+        color_rgba: [1.0, 0.7, 0.45, 1.0],
+    };
+    let mut ngc3077 = GalaxyConfig {
+        label: "NGC 3077".to_string(),
+        equilibrium_snapshot: None,
+        initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
+        halo_mass_msun: 3.0e11,
+        halo_scale_radius_kpc: 4.0,
+        halo_particle_count: 60_000,
+        disk_mass_msun: 4.0e9,
+        disk_scale_radius_kpc: 1.2,
+        disk_scale_height_kpc: 0.25,
+        disk_particle_count: 30_000,
+        bulge_mass_msun: 6.0e9,
+        bulge_scale_radius_kpc: 0.7,
+        bulge_particle_count: 30_000,
+        gas_mass_msun: 2.0e9,
+        gas_scale_radius_kpc: 0.0,
+        gas_scale_height_kpc: 0.0,
+        gas_particle_count: 40_000,
+        smbh: SmbhConfig {
+            mass_msun: 0.0,
+            softening_kpc: 0.01,
+            substeps: 8,
+        },
+        position_kpc: [0.0, 0.0, 0.0],
+        velocity_kms: [0.0, 0.0, 0.0],
+        disk_tilt_deg: [30.0, -40.0, 0.0],
+        color_rgba: [0.85, 0.95, 1.0, 1.0],
+    };
+    place_satellite(&m81, &mut m82, [10.0, 44.0, 9.0], 0.34, 0.5, [-1.0, 0.15, 0.1]);
+    place_satellite(&m81, &mut ngc3077, [28.0, -20.0, -4.0], 0.3, 0.55, [0.6, 1.0, 0.0]);
+    let mut galaxies = vec![m81, m82, ngc3077];
+    remove_com_velocity(&mut galaxies);
+
+    MergerPreset {
+        id: "m81-group",
+        title: "M81 Group (M81 + M82 + NGC 3077)",
+        summary: "The nearest interacting triple: two companions fall toward grand-design M81, tides strip gas bridges, and gas-dominated M82 ignites its famous starburst.",
+        config: SimulationConfig {
+            name: "m81-group".to_string(),
+            gravity: gravity_defaults(),
+            relativity: relativity_defaults(),
+            preview: preview_defaults(),
+            snapshots: snapshot_defaults(),
+            integration: integration_defaults(),
+            initial_separation_kpc: 46.0,
+            initial_relative_velocity_kms: 0.0,
+            output_directory: "output/m81-group".to_string(),
+            gas: GasConfig::default(),
+            galaxies,
+        },
+    }
+}
+
+/// M87, the giant elliptical at the heart of the Virgo cluster, hosting the
+/// 6.5-billion-solar-mass black hole imaged by the EHT. Ellipticals are what
+/// mergers LEAVE, so the interest here is galactic cannibalism in progress:
+/// two compact dwarf companions plunge in on radial orbits and are shredded
+/// into the tidal shells and streams that real giant ellipticals wear.
+fn m87_virgo_giant() -> MergerPreset {
+    let m87 = GalaxyConfig {
+        label: "M87".to_string(),
+        equilibrium_snapshot: None,
+        initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
+        halo_mass_msun: 1.2e13,
+        halo_scale_radius_kpc: 20.0,
+        halo_particle_count: 800_000,
+        disk_mass_msun: 0.0,
+        disk_scale_radius_kpc: 1.0,
+        disk_scale_height_kpc: 0.1,
+        disk_particle_count: 0,
+        bulge_mass_msun: 5.5e11,
+        bulge_scale_radius_kpc: 6.5,
+        bulge_particle_count: 620_000,
+        gas_mass_msun: 0.0,
+        gas_scale_radius_kpc: 0.0,
+        gas_scale_height_kpc: 0.0,
+        gas_particle_count: 0,
+        smbh: SmbhConfig {
+            mass_msun: 6.5e9,
+            softening_kpc: 0.24,
+            substeps: 16,
+        },
+        position_kpc: [0.0, 0.0, 0.0],
+        velocity_kms: [0.0, 0.0, 0.0],
+        disk_tilt_deg: [0.0, 0.0, 0.0],
+        color_rgba: [1.0, 0.9, 0.72, 1.0],
+    };
+    let dwarf = |label: &str, position: [f64; 3], tilt: [f64; 3]| GalaxyConfig {
+        label: label.to_string(),
+        equilibrium_snapshot: None,
+        initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
+        halo_mass_msun: 1.0e11,
+        halo_scale_radius_kpc: 2.5,
+        halo_particle_count: 20_000,
+        disk_mass_msun: 0.0,
+        disk_scale_radius_kpc: 1.0,
+        disk_scale_height_kpc: 0.1,
+        disk_particle_count: 0,
+        bulge_mass_msun: 1.2e10,
+        bulge_scale_radius_kpc: 0.6,
+        bulge_particle_count: 40_000,
+        gas_mass_msun: 0.0,
+        gas_scale_radius_kpc: 0.0,
+        gas_scale_height_kpc: 0.0,
+        gas_particle_count: 0,
+        smbh: SmbhConfig {
+            mass_msun: 1.0e6,
+            softening_kpc: 0.01,
+            substeps: 16,
+        },
+        position_kpc: position,
+        velocity_kms: [0.0, 0.0, 0.0],
+        disk_tilt_deg: tilt,
+        color_rgba: [0.85, 0.9, 1.0, 1.0],
+    };
+    let mut companion_a = dwarf("NGC 4486A", [36.0, 10.0, 15.0], [0.0, 0.0, 0.0]);
+    let mut companion_b = dwarf("NGC 4486B", [-26.0, -31.0, 8.0], [0.0, 0.0, 0.0]);
+    place_satellite(&m87, &mut companion_a, [36.0, 10.0, 15.0], 0.38, 0.3, [0.0, 1.0, -0.4]);
+    place_satellite(&m87, &mut companion_b, [-26.0, -31.0, 8.0], 0.34, 0.35, [1.0, -0.5, 0.0]);
+    let mut galaxies = vec![m87, companion_a, companion_b];
+    remove_com_velocity(&mut galaxies);
+
+    MergerPreset {
+        id: "m87-virgo-giant",
+        title: "M87 Virgo Giant + Infalling Dwarfs",
+        summary: "The Virgo cluster's giant elliptical around its 6.5-billion-Msun black hole cannibalizes two compact dwarfs, shredding them into tidal shells and streams.",
+        config: SimulationConfig {
+            name: "m87-virgo-giant".to_string(),
+            gravity: GravityConfig {
+                halo_softening_kpc: 0.14,
+                ..gravity_defaults()
+            },
+            relativity: relativity_defaults(),
+            preview: preview_defaults(),
+            snapshots: snapshot_defaults(),
+            integration: integration_defaults(),
+            initial_separation_kpc: 41.0,
+            initial_relative_velocity_kms: 0.0,
+            output_directory: "output/m87-virgo-giant".to_string(),
+            gas: GasConfig::default(),
+            galaxies,
+        },
+    }
+}
+
+/// M104, the Sombrero Galaxy: a fast-rotating disk buried in an enormous
+/// old bulge (bulge outweighs disk ~3:1), a billion-solar-mass black hole,
+/// and a thin gas-and-dust ring at the disk edge. Tilted near edge-on so
+/// the default view echoes the hat.
+fn m104_sombrero() -> MergerPreset {
+    let m104 = GalaxyConfig {
+        label: "M104 Sombrero".to_string(),
+        equilibrium_snapshot: None,
+        initial_profile: GalaxyInitialProfile::AnalyticGalaxy,
+        halo_mass_msun: 5.0e12,
+        halo_scale_radius_kpc: 15.0,
+        halo_particle_count: 800_000,
+        disk_mass_msun: 9.0e10,
+        disk_scale_radius_kpc: 3.4,
+        disk_scale_height_kpc: 0.2,
+        disk_particle_count: 280_000,
+        bulge_mass_msun: 2.6e11,
+        bulge_scale_radius_kpc: 1.6,
+        bulge_particle_count: 400_000,
+        gas_mass_msun: 3.0e9,
+        gas_scale_radius_kpc: 5.0,
+        gas_scale_height_kpc: 0.1,
+        gas_particle_count: 70_000,
+        smbh: SmbhConfig {
+            mass_msun: 1.0e9,
+            softening_kpc: 0.07,
+            substeps: 16,
+        },
+        position_kpc: [0.0, 0.0, 0.0],
+        velocity_kms: [0.0, 0.0, 0.0],
+        disk_tilt_deg: [78.0, 5.0, 0.0],
+        color_rgba: [1.0, 0.9, 0.75, 1.0],
+    };
+
+    MergerPreset {
+        id: "m104-sombrero",
+        title: "M104 Sombrero",
+        summary: "A fast disk buried in a huge old bulge around a billion-Msun black hole, ringed by a thin lane of gas — tilted near edge-on to show the hat.",
+        config: SimulationConfig {
+            name: "m104-sombrero".to_string(),
+            gravity: GravityConfig {
+                halo_softening_kpc: 0.12,
+                ..gravity_defaults()
+            },
+            relativity: relativity_defaults(),
+            preview: preview_defaults(),
+            snapshots: snapshot_defaults(),
+            integration: integration_defaults(),
+            initial_separation_kpc: 0.0,
+            initial_relative_velocity_kms: 0.0,
+            output_directory: "output/m104-sombrero".to_string(),
+            gas: GasConfig::default(),
+            galaxies: vec![m104],
+        },
     }
 }
